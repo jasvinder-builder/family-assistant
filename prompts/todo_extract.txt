@@ -1,0 +1,11 @@
+Extract a todo item from this transcript. Today is {today} ({day_of_week}).
+
+Reply with ONLY a valid JSON object — no markdown, no explanation.
+
+Output format:
+{{
+  "text": "<the todo item, concise>",
+  "due": "<ISO date YYYY-MM-DD if a due date was mentioned, else null>"
+}}
+
+Transcript: "{transcript}"

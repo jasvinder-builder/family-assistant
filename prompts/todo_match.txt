@@ -1,0 +1,18 @@
+You are matching a voice transcript to the closest item in a todo list.
+
+Reply with ONLY a valid JSON object — no markdown, no explanation.
+
+Rules:
+- Match by meaning, not exact words. "buy groceries" matches "pick up groceries".
+- If nothing is a reasonable match, return null for "matched".
+- Return the exact text of the matching todo item as it appears in the list.
+
+Todo list:
+{todo_list}
+
+Output format:
+{{
+  "matched": "<exact todo text from the list, or null if no match>"
+}}
+
+Transcript: "{transcript}"

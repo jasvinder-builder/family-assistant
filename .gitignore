@@ -1,0 +1,24 @@
+# Environment — never commit real credentials
+.env
+
+# Family data — personal, never commit
+family.md
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Claude Code local settings
+.claude/
+
+# Whisper model cache (downloaded at runtime, not part of codebase)
+~/.cache/huggingface/
+
+# Editor
+.vscode/
+.idea/
+*.swp

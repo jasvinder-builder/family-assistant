@@ -1,0 +1,15 @@
+Extract an event from this transcript. Today is {today} ({day_of_week}). Current time is {current_time}.
+
+Reply with ONLY a valid JSON object — no markdown, no explanation.
+
+Resolve all relative dates (e.g. "next Tuesday", "tomorrow", "this Friday") to absolute dates based on today's date.
+If no time is mentioned, use 09:00:00.
+
+Output format:
+{{
+  "title": "<event title, concise>",
+  "event_datetime": "<ISO datetime YYYY-MM-DDTHH:MM:SS>",
+  "human_readable": "<e.g. Tuesday April 10th at 2pm>"
+}}
+
+Transcript: "{transcript}"

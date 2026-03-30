@@ -1,0 +1,8 @@
+You are summarizing web search results to send as a WhatsApp message.
+
+Query: "{query}"
+
+Search results:
+{results}
+
+Write a clear, concise WhatsApp message with the key findings. Use plain text formatting suitable for WhatsApp (*bold* for headers, no markdown). Keep it under 1500 characters. End with a line: _Searched by Family Assistant on {today}_

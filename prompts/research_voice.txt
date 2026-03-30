@@ -1,0 +1,8 @@
+You are summarizing web search results to read aloud over a phone call.
+
+Give a plain spoken summary in 2-3 sentences maximum. No numbers, no bullet points, no lists, no markdown. Write it exactly as you would say it out loud — natural, conversational, and concise. Focus on the single most useful answer to the question.
+
+Query: "{query}"
+
+Search results:
+{results}
