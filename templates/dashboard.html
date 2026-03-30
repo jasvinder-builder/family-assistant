@@ -47,12 +47,17 @@
             <div class="action-btns">
               {% if not todo.completed %}
               <button class="btn btn-outline-success" title="Mark done"
-                      onclick="completeTodo('{{ todo.text | e }}', this)">✓</button>
+                      data-text="{{ todo.text | e }}"
+                      onclick="completeTodo(this)">✓</button>
               <button class="btn btn-outline-secondary" title="Edit"
-                      onclick="openEditTodo('{{ todo.text | e }}', '{{ todo.due or '' }}', '{{ todo.added_by | e }}')">✏️</button>
+                      data-text="{{ todo.text | e }}"
+                      data-due="{{ todo.due or '' }}"
+                      data-added-by="{{ todo.added_by | e }}"
+                      onclick="openEditTodo(this)">✏️</button>
               {% endif %}
               <button class="btn btn-outline-danger" title="Delete"
-                      onclick="deleteTodo('{{ todo.text | e }}', this)">🗑</button>
+                      data-text="{{ todo.text | e }}"
+                      onclick="deleteTodo(this)">🗑</button>
             </div>
           </li>
           {% else %}
@@ -81,9 +86,14 @@
             </div>
             <div class="action-btns">
               <button class="btn btn-outline-secondary" title="Edit"
-                      onclick="openEditEvent('{{ event.title | e }}', '{{ event.event_datetime | e }}', '{{ event.added_by | e }}')">✏️</button>
+                      data-title="{{ event.title | e }}"
+                      data-datetime="{{ event.event_datetime | e }}"
+                      data-added-by="{{ event.added_by | e }}"
+                      onclick="openEditEvent(this)">✏️</button>
               <button class="btn btn-outline-danger" title="Delete"
-                      onclick="deleteEvent('{{ event.title | e }}', '{{ event.event_datetime | e }}', this)">🗑</button>
+                      data-title="{{ event.title | e }}"
+                      data-datetime="{{ event.event_datetime | e }}"
+                      onclick="deleteEvent(this)">🗑</button>
             </div>
           </li>
           {% else %}
@@ -209,7 +219,10 @@ function openAddTodo() {
   setTimeout(() => document.getElementById('todoText').focus(), 300);
 }
 
-function openEditTodo(text, due, addedBy) {
+function openEditTodo(btn) {
+  const text = btn.dataset.text;
+  const due = btn.dataset.due;
+  const addedBy = btn.dataset.addedBy;
   document.getElementById('todoModalTitle').textContent = 'Edit Todo';
   document.getElementById('todoOldText').value = text;
   document.getElementById('todoText').value = text;
@@ -244,7 +257,8 @@ async function saveTodo() {
   }
 }
 
-async function completeTodo(text, btn) {
+async function completeTodo(btn) {
+  const text = btn.dataset.text;
   setLoading(btn, true);
   try {
     await api('/dashboard/complete-todo', {text});
@@ -255,7 +269,8 @@ async function completeTodo(text, btn) {
   }
 }
 
-async function deleteTodo(text, btn) {
+async function deleteTodo(btn) {
+  const text = btn.dataset.text;
   if (!confirm(`Delete todo: "${text}"?`)) return;
   setLoading(btn, true);
   try {
@@ -280,7 +295,10 @@ function openAddEvent() {
   setTimeout(() => document.getElementById('eventTitle').focus(), 300);
 }
 
-function openEditEvent(title, dt, addedBy) {
+function openEditEvent(btn) {
+  const title = btn.dataset.title;
+  const dt = btn.dataset.datetime;
+  const addedBy = btn.dataset.addedBy;
   document.getElementById('eventModalTitle').textContent = 'Edit Event';
   document.getElementById('eventOldTitle').value = title;
   document.getElementById('eventOldDatetime').value = dt;
@@ -319,7 +337,9 @@ async function saveEvent() {
   }
 }
 
-async function deleteEvent(title, dt, btn) {
+async function deleteEvent(btn) {
+  const title = btn.dataset.title;
+  const dt = btn.dataset.datetime;
   if (!confirm(`Delete event: "${title}"?`)) return;
   setLoading(btn, true);
   try {
