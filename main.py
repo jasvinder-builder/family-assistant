@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -9,10 +10,11 @@ import httpx
 from handlers.call_handler import handle_incoming, handle_transcription
 from handlers.research_handler import handle_research_choice, handle_research_whatsapp_choice
 from handlers.response_handler import voice_say_hangup
-from services import whisper_service
+from services import whisper_service, reminder_service
 from config import settings as app_settings
 from services import markdown_service, session_store
 from services.qwen import _chat
+from models.schemas import TodoItem, EventItem
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
 logger = logging.getLogger(__name__)
@@ -27,7 +29,10 @@ async def lifespan(app: FastAPI):
         logger.info("Qwen warm-up done.")
     except Exception:
         logger.warning("Qwen warm-up failed — Ollama may not be running yet.")
+
+    reminder_service.start()
     yield
+    reminder_service.stop()
 
 
 app = FastAPI(title="Family Assistant", lifespan=lifespan)
@@ -126,12 +131,22 @@ async def dashboard(request: Request):
             dt = datetime.fromisoformat(e.event_datetime)
         except ValueError:
             dt = now
-        events.append({"title": e.title, "human_readable": e.human_readable,
-                        "added_by": e.added_by, "is_past": dt < now})
+        events.append({
+            "title": e.title,
+            "event_datetime": e.event_datetime,
+            "human_readable": e.human_readable,
+            "added_by": e.added_by,
+            "is_past": dt < now,
+        })
     events.sort(key=lambda e: (e["is_past"], e["human_readable"]))
 
     pending_count = sum(1 for t in todos if not t.completed)
     upcoming_count = sum(1 for e in events if not e["is_past"])
+
+    try:
+        family_names = sorted(set(json.loads(app_settings.phone_to_name).values()))
+    except Exception:
+        family_names = []
 
     return templates.TemplateResponse(
         request=request,
@@ -141,6 +156,7 @@ async def dashboard(request: Request):
             "events": events,
             "pending_count": pending_count,
             "upcoming_count": upcoming_count,
+            "family_names": family_names,
         },
     )
 
@@ -151,6 +167,66 @@ async def dashboard_complete_todo(payload: dict):
     if not text:
         return JSONResponse({"error": "missing text"}, status_code=400)
     success = markdown_service.complete_todo(text)
+    if success:
+        return JSONResponse({"ok": True})
+    return JSONResponse({"error": "not found"}, status_code=404)
+
+
+@app.post("/dashboard/add-todo")
+async def dashboard_add_todo(payload: dict):
+    text = payload.get("text", "").strip()
+    if not text:
+        return JSONResponse({"error": "missing text"}, status_code=400)
+    item = TodoItem(
+        text=text,
+        due=payload.get("due") or None,
+        added_by=payload.get("added_by", "Family").strip(),
+        added_at=datetime.now().isoformat(timespec="seconds"),
+    )
+    markdown_service.append_todo(item)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/dashboard/delete-todo")
+async def dashboard_delete_todo(payload: dict):
+    text = payload.get("text", "")
+    if not text:
+        return JSONResponse({"error": "missing text"}, status_code=400)
+    success = markdown_service.delete_todo(text)
+    if success:
+        return JSONResponse({"ok": True})
+    return JSONResponse({"error": "not found"}, status_code=404)
+
+
+@app.post("/dashboard/add-event")
+async def dashboard_add_event(payload: dict):
+    title = payload.get("title", "").strip()
+    event_datetime = payload.get("event_datetime", "").strip()
+    if not title or not event_datetime:
+        return JSONResponse({"error": "missing fields"}, status_code=400)
+    try:
+        dt = datetime.fromisoformat(event_datetime)
+    except ValueError:
+        return JSONResponse({"error": "invalid datetime"}, status_code=400)
+    human_readable = f"{dt.strftime('%A %B')} {dt.day} at {dt.strftime('%I:%M %p').lstrip('0')}"
+    item = EventItem(
+        title=title,
+        event_datetime=event_datetime,
+        human_readable=human_readable,
+        added_by=payload.get("added_by", "Family").strip(),
+        added_at=datetime.now().isoformat(timespec="seconds"),
+    )
+    markdown_service.append_event(item)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/dashboard/delete-event")
+async def dashboard_delete_event(payload: dict):
+    title = payload.get("title", "")
+    event_datetime = payload.get("event_datetime", "")
+    if not title or not event_datetime:
+        return JSONResponse({"error": "missing fields"}, status_code=400)
+    success = markdown_service.delete_event(title, event_datetime)
     if success:
         return JSONResponse({"ok": True})
     return JSONResponse({"error": "not found"}, status_code=404)

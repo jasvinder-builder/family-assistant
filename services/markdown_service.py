@@ -144,6 +144,46 @@ def read_events(after: datetime | None = None, before: datetime | None = None) -
     return events
 
 
+def delete_todo(text: str) -> bool:
+    """Remove a todo line matching text (pending or completed). Returns True if found."""
+    with FileLock(_lock_path(), timeout=LOCK_TIMEOUT):
+        content = _read_raw()
+        lines = content.splitlines(keepends=True)
+        new_lines = []
+        found = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("- [ ]") or stripped.startswith("- [x]"):
+                parts = [p.strip() for p in stripped[5:].split("|")]
+                if parts and parts[0].lower() == text.lower():
+                    found = True
+                    continue
+            new_lines.append(line)
+        if found:
+            _write_raw("".join(new_lines))
+        return found
+
+
+def delete_event(title: str, event_datetime: str) -> bool:
+    """Remove an event line matching title and datetime. Returns True if found."""
+    with FileLock(_lock_path(), timeout=LOCK_TIMEOUT):
+        content = _read_raw()
+        lines = content.splitlines(keepends=True)
+        new_lines = []
+        found = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(f"- {event_datetime}"):
+                parts = [p.strip() for p in stripped[2:].split("|")]
+                if len(parts) >= 2 and parts[1].strip().lower() == title.lower():
+                    found = True
+                    continue
+            new_lines.append(line)
+        if found:
+            _write_raw("".join(new_lines))
+        return found
+
+
 def read_all_data() -> dict:
     """Return all todos and events for the dashboard."""
     return {

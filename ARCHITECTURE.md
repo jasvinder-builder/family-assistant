@@ -288,29 +288,62 @@ POST /voice/research-whatsapp-choice/{wid}
 
 ---
 
+## Proactive Reminders
+
+A background scheduler (`APScheduler AsyncIOScheduler`) starts at app startup and scans `family.md` every 30 minutes for upcoming events.
+
+```
+App startup (lifespan)
+        │
+        ▼
+reminder_service.start()
+  Schedules _scan_and_schedule() to run immediately + every 30 min
+        │
+        ▼
+_scan_and_schedule()
+  markdown_service.read_events(after=now, before=now+48h)
+        │
+        ▼
+  For each event in window:
+    For each offset in [24h, 4h]:
+      remind_at = event_datetime - offset
+      if remind_at <= now → skip (already past)
+      job_id = f"reminder_{event_datetime}_{offset_minutes}"
+      if job already exists in scheduler → skip (deduplication)
+      scheduler.add_job(DateTrigger(run_date=remind_at), _send_reminder)
+
+_send_reminder(title, label, event_dt)
+  Formats message: "Reminder: *{title}* is in {label} ({human time})."
+  Sends WhatsApp to every number in PHONE_TO_NAME
+```
+
+**Deduplication:** APScheduler job IDs are deterministic (`reminder_{iso_datetime}_{minutes}`). The 30-minute scan simply skips any job ID that already exists. One-off jobs are removed by APScheduler after they fire, so there is no risk of double-sending within a single server run.
+
+**Restart behaviour:** The in-memory job store is cleared on restart. The scanner runs immediately on startup and reschedules any reminders whose `remind_at` is still in the future. Reminders already sent (whose `remind_at` is in the past) are naturally skipped by the `remind_at <= now` guard.
+
+---
+
 ## Web Dashboard Flow
 
 ```
 Browser → GET /dashboard
-                │
-                ▼
-        markdown_service.read_all_data()
-        Reads family.md → todos + events
-                │
-                ▼
-        Annotate events with is_past (compare event_datetime to now)
-        Sort: todos (pending first), events (upcoming first, past last)
-                │
-                ▼
+        markdown_service.read_all_data() → todos + events
+        Annotate events with is_past, sort (pending/upcoming first)
+        Resolve family_names from PHONE_TO_NAME for name dropdowns
         Jinja2 renders templates/dashboard.html
-        Bootstrap 5 — two-column layout
-        Auto-refreshes every 30s via JS setTimeout
+        Bootstrap 5 two-column layout, auto-refreshes every 30s
 
-Browser → POST /dashboard/complete-todo  { "text": "buy milk" }
-                │
-                ▼
-        markdown_service.complete_todo(text)
-        FileLock → rewrite - [ ] as - [x] in family.md
+Dashboard is fully editable — all mutations are JSON POSTs, reload on success:
+
+  POST /dashboard/add-todo        {text, due?, added_by}  → append_todo()
+  POST /dashboard/complete-todo   {text}                  → complete_todo()
+  POST /dashboard/delete-todo     {text}                  → delete_todo()
+
+  POST /dashboard/add-event       {title, event_datetime, added_by}  → append_event()
+  POST /dashboard/delete-event    {title, event_datetime}            → delete_event()
+
+Edit (todo or event) is handled client-side:
+  delete-old → add-new (two sequential API calls, single page reload)
 ```
 
 ---
