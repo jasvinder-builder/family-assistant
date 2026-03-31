@@ -18,6 +18,9 @@ __pycache__/
 # Whisper model cache (downloaded at runtime, not part of codebase)
 ~/.cache/huggingface/
 
+# Logs
+logs/
+
 # Editor
 .vscode/
 .idea/

@@ -48,7 +48,7 @@ def voice_say_then_gather(
         action=action,
         max_length=RECORD_MAX_LENGTH,
         play_beep=False,
-        timeout=4,
+        timeout=3,
     )
     # Fallback if caller goes silent
     response.say("I didn't hear anything. Take care!", voice=VOICE)
@@ -77,7 +77,7 @@ def voice_research_pending(rid: str) -> str:
         action=f"/voice/research-choice/{rid}",
         max_length=5,
         play_beep=False,
-        timeout=4,
+        timeout=3,
     )
     # Fallback if no speech
     response.say("I didn't catch that — I'll send the results to your WhatsApp.", voice=VOICE)

@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Talk to Bianca</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background: #f0f4f8; }
+    .header { background: linear-gradient(135deg, #4f46e5, #7c3aed); color: white; padding: 1rem 1.5rem; }
+    .header a { color: rgba(255,255,255,0.8); text-decoration: none; font-size: 0.9rem; }
+    #mic-btn {
+      width: 110px; height: 110px; border-radius: 50%; font-size: 2.8rem;
+      border: none; background: #4f46e5; color: white;
+      box-shadow: 0 4px 20px rgba(79,70,229,0.4);
+      transition: transform .1s, background .2s;
+    }
+    #mic-btn.recording { background: #dc2626; animation: pulse 1.2s infinite; }
+    #mic-btn:disabled { background: #9ca3af; box-shadow: none; }
+    @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(220,38,38,0.4); } 50% { box-shadow: 0 0 0 16px rgba(220,38,38,0); } }
+    #status { font-size: 0.9rem; color: #6b7280; min-height: 1.4rem; }
+    .bubble { border-radius: 14px; padding: 0.75rem 1rem; max-width: 85%; }
+    .bubble-user { background: #4f46e5; color: white; align-self: flex-end; }
+    .bubble-bianca { background: white; color: #111; box-shadow: 0 1px 4px rgba(0,0,0,0.1); align-self: flex-start; }
+    .bubble-label { font-size: 0.75rem; color: #9ca3af; margin-bottom: 2px; }
+    #detail-panel { background: white; border-radius: 14px; box-shadow: 0 1px 6px rgba(0,0,0,0.1); white-space: pre-wrap; font-size: 0.9rem; }
+    #conversation { display: flex; flex-direction: column; gap: 12px; max-height: 40vh; overflow-y: auto; }
+  </style>
+</head>
+<body>
+
+<div class="header d-flex align-items-center gap-3">
+  <a href="/">← Home</a>
+  <strong class="text-white ms-1">Talk to Bianca</strong>
+</div>
+
+<div class="container py-4" style="max-width:600px">
+
+  <div class="mb-4 d-flex align-items-center gap-2">
+    <label class="form-label mb-0 fw-semibold">You are:</label>
+    <select class="form-select form-select-sm w-auto" id="caller-name">
+      {% for name in family_names %}
+      <option>{{ name }}</option>
+      {% else %}
+      <option>Family</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div id="conversation" class="mb-4"></div>
+
+  <div id="detail-panel" class="p-3 mb-4 d-none">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <strong>Full Answer</strong>
+      <button class="btn btn-sm btn-outline-secondary" onclick="document.getElementById('detail-panel').classList.add('d-none')">✕</button>
+    </div>
+    <div id="detail-text"></div>
+  </div>
+
+  <div class="text-center">
+    <button id="mic-btn" onclick="toggleRecord()">🎙️</button>
+    <div id="status" class="mt-2">Tap to speak — auto-stops after 2s of silence</div>
+  </div>
+
+</div>
+
+<script>
+let mediaRecorder = null;
+let audioChunks = [];
+let recording = false;
+let stream = null;
+
+async function toggleRecord() {
+  if (recording) {
+    stopRecording();
+  } else {
+    await startRecording();
+  }
+}
+
+async function startRecording() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch(e) {
+    setStatus('Microphone access denied. Please allow mic and reload.');
+    return;
+  }
+
+  audioChunks = [];
+  mediaRecorder = new MediaRecorder(stream);
+
+  mediaRecorder.ondataavailable = (e) => {
+    if (e.data.size > 0) audioChunks.push(e.data);
+  };
+
+  mediaRecorder.onstop = async () => {
+    stream.getTracks().forEach(t => t.stop());
+    const blob = new Blob(audioChunks, { type: 'audio/webm' });
+    await transcribeAndChat(blob);
+  };
+
+  mediaRecorder.start();
+  recording = true;
+  document.getElementById('mic-btn').classList.add('recording');
+  document.getElementById('mic-btn').textContent = '⏹️';
+  setStatus('Recording... tap to stop');
+  startSilenceDetection();
+}
+
+function startSilenceDetection() {
+  const audioCtx = new AudioContext();
+  const source = audioCtx.createMediaStreamSource(stream);
+  const analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 256;
+  source.connect(analyser);
+  const dataArray = new Uint8Array(analyser.fftSize);
+
+  const SILENCE_THRESHOLD = 8;
+  const SILENCE_DURATION  = 2000;
+  let speechDetected = false;
+  let silenceTimer = null;
+
+  function check() {
+    if (!recording) return;
+    analyser.getByteTimeDomainData(dataArray);
+    const volume = Math.max(...Array.from(dataArray).map(v => Math.abs(v - 128)));
+
+    if (volume > SILENCE_THRESHOLD) {
+      speechDetected = true;
+      if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
+    } else if (speechDetected && !silenceTimer) {
+      silenceTimer = setTimeout(() => { if (recording) stopRecording(); }, SILENCE_DURATION);
+    }
+    requestAnimationFrame(check);
+  }
+  requestAnimationFrame(check);
+}
+
+function stopRecording() {
+  if (mediaRecorder && recording) {
+    recording = false;
+    mediaRecorder.stop();
+    document.getElementById('mic-btn').classList.remove('recording');
+    document.getElementById('mic-btn').textContent = '🎙️';
+    document.getElementById('mic-btn').disabled = true;
+    setStatus('Transcribing...');
+  }
+}
+
+async function transcribeAndChat(blob) {
+  // Step 1: send audio to local Whisper
+  let transcript;
+  try {
+    const formData = new FormData();
+    formData.append('audio', blob, 'recording.webm');
+    const resp = await fetch('/transcribe', { method: 'POST', body: formData });
+    const data = await resp.json();
+    transcript = data.transcript;
+  } catch(e) {
+    setStatus('Transcription failed. Please try again.');
+    document.getElementById('mic-btn').disabled = false;
+    return;
+  }
+
+  if (!transcript || transcript.trim().length < 2) {
+    setStatus('Nothing heard. Tap to try again.');
+    document.getElementById('mic-btn').disabled = false;
+    return;
+  }
+
+  // Step 2: send transcript to Bianca
+  addBubble('user', transcript);
+  setStatus('Thinking...');
+
+  try {
+    const resp = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        transcript,
+        caller_name: document.getElementById('caller-name').value,
+      }),
+    });
+    const data = await resp.json();
+
+    addBubble('bianca', data.speech);
+    speak(data.speech);
+
+    if (data.intent === 'research_web' && data.display !== data.speech) {
+      document.getElementById('detail-text').textContent = data.display;
+      document.getElementById('detail-panel').classList.remove('d-none');
+    } else {
+      document.getElementById('detail-panel').classList.add('d-none');
+    }
+
+    if (data.intent === 'goodbye') {
+      setStatus('Goodbye! Refresh to start again.');
+      return;
+    }
+  } catch(e) {
+    addBubble('bianca', 'Sorry, something went wrong. Please try again.');
+  }
+
+  document.getElementById('mic-btn').disabled = false;
+  setStatus('Tap to speak, tap again to stop');
+}
+
+function addBubble(who, text) {
+  const conv = document.getElementById('conversation');
+  const wrap = document.createElement('div');
+  wrap.className = `d-flex flex-column align-items-${who === 'user' ? 'end' : 'start'}`;
+  const label = document.createElement('div');
+  label.className = 'bubble-label';
+  label.textContent = who === 'user' ? document.getElementById('caller-name').value : 'Bianca';
+  const bubble = document.createElement('div');
+  bubble.className = `bubble bubble-${who}`;
+  bubble.textContent = text;
+  wrap.appendChild(label);
+  wrap.appendChild(bubble);
+  conv.appendChild(wrap);
+  conv.scrollTop = conv.scrollHeight;
+}
+
+function speak(text) {
+  if (!window.speechSynthesis) return;
+  window.speechSynthesis.cancel();
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.lang = 'en-US';
+  utt.rate = 1.0;
+  window.speechSynthesis.speak(utt);
+}
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+// Pre-warm speech synthesis so first response plays immediately
+if (window.speechSynthesis) {
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+}
+</script>
+</body>
+</html>

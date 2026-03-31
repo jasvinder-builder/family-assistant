@@ -53,6 +53,11 @@ async def handle_research(intent: IntentResult, caller_number: str) -> str:
         _pending[rid] = {"task": task, "caller_number": caller_number}
         logger.info("Research taking long, asking user preference (rid=%s)", rid)
         return voice_research_pending(rid)
+    except Exception:
+        logger.exception("Research failed for query: %s", intent.query)
+        return voice_say_then_gather(
+            "Sorry, I couldn't reach the search service just now. Please try again in a moment."
+        )
 
 
 async def handle_research_choice(rid: str, transcript: str) -> str:

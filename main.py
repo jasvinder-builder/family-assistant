@@ -1,22 +1,43 @@
 import asyncio
 import json
 import logging
+import logging.handlers
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-from fastapi import FastAPI, Form, Response, Request
+from fastapi import FastAPI, Form, Response, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 import httpx
 from handlers.call_handler import handle_incoming, handle_transcription
 from handlers.research_handler import handle_research_choice, handle_research_whatsapp_choice
 from handlers.response_handler import voice_say_hangup
+from handlers import chat_handler
 from services import whisper_service, reminder_service
+from services import hangman_service
 from config import settings as app_settings
 from services import markdown_service, session_store
 from services.qwen import _chat
 from models.schemas import TodoItem, EventItem
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
+os.makedirs("logs", exist_ok=True)
+_log_fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s — %(message)s")
+
+_file_handler = logging.handlers.TimedRotatingFileHandler(
+    "logs/app.log",
+    when="midnight",
+    interval=1,
+    backupCount=7,
+    encoding="utf-8",
+)
+_file_handler.setFormatter(_log_fmt)
+_file_handler.suffix = "%Y-%m-%d"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    handlers=[logging.StreamHandler(), _file_handler],
+)
 logger = logging.getLogger(__name__)
 
 
@@ -37,6 +58,58 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Family Assistant", lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse(request=request, name="home.html", context={})
+
+
+@app.get("/talk", response_class=HTMLResponse)
+async def talk(request: Request):
+    try:
+        family_names = sorted(set(json.loads(app_settings.phone_to_name).values()))
+    except Exception:
+        family_names = []
+    return templates.TemplateResponse(request=request, name="talk.html", context={"family_names": family_names})
+
+
+@app.post("/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    """Receive browser MediaRecorder audio blob, transcribe via local Whisper."""
+    audio_bytes = await audio.read()
+    transcript, confidence = await asyncio.to_thread(
+        whisper_service.transcribe, audio_bytes, ".webm"
+    )
+    return JSONResponse({"transcript": transcript, "confidence": round(confidence, 2)})
+
+
+@app.post("/chat")
+async def chat(payload: dict):
+    transcript = payload.get("transcript", "").strip()
+    caller_name = payload.get("caller_name", "Family").strip()
+    result = await chat_handler.handle_chat(transcript, caller_name)
+    return JSONResponse(result)
+
+
+@app.get("/games/hangman", response_class=HTMLResponse)
+async def hangman_page(request: Request):
+    return templates.TemplateResponse(request=request, name="hangman.html", context={})
+
+
+@app.post("/games/hangman/new")
+async def hangman_new():
+    game = hangman_service.new_game()
+    intro = f"New game! The word has {len(game.word)} letters. Guess a letter!"
+    return JSONResponse(game.to_dict(speech=intro))
+
+
+@app.post("/games/hangman/guess")
+async def hangman_guess(payload: dict):
+    session_id = payload.get("session_id", "")
+    guess = payload.get("guess", "").strip()
+    result = hangman_service.guess(session_id, guess)
+    return JSONResponse(result)
 
 
 @app.post("/voice/incoming")

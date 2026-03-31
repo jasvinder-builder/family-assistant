@@ -22,11 +22,12 @@ def _get_model() -> WhisperModel:
     return _model
 
 
-def transcribe(audio_bytes: bytes) -> tuple[str, float]:
-    """Transcribe audio bytes. Returns (transcript_text, avg_confidence)."""
+def transcribe(audio_bytes: bytes, suffix: str = ".wav") -> tuple[str, float]:
+    """Transcribe audio bytes. Returns (transcript_text, avg_confidence).
+    Pass suffix='.webm' for browser MediaRecorder output (webm/opus)."""
     model = _get_model()
 
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
         f.write(audio_bytes)
         tmp_path = f.name
 

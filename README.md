@@ -1,20 +1,74 @@
 # Bianca — Voice Family Assistant
 
-A voice-based AI assistant for families. Call a phone number, speak naturally, and Bianca manages your shared todos, events, and answers research questions. Results can be delivered to WhatsApp. Everything runs locally — no cloud AI.
+A voice-based AI assistant for families. Call a phone number, speak naturally, or open the browser interface — Bianca manages todos, events, and answers research questions. All AI runs locally on GPU. No cloud AI services.
 
 **Full architecture and call flow:** see [`ARCHITECTURE.md`](ARCHITECTURE.md)
 
 ---
 
+## UI
+
+```
+┌─────────────────────────────────────────────────────┐
+│  👋 Hi, I'm Bianca                                  │
+│  Your family assistant — voice, todos, events,      │
+│  and games                                          │
+│                                                     │
+│  ┌───────────────┐ ┌───────────────┐ ┌───────────┐ │
+│  │   🎙️          │ │   📋          │ │   🎮      │ │
+│  │ Talk to Bianca│ │   Family      │ │  Hangman  │ │
+│  │               │ │  Dashboard    │ │           │ │
+│  │ Ask questions,│ │ View & manage │ │ Guess the │ │
+│  │ add todos and │ │ todos and     │ │ word with │ │
+│  │ events, search│ │ events        │ │ your voice│ │
+│  └───────────────┘ └───────────────┘ └───────────┘ │
+└─────────────────────────────────────────────────────┘
+
+Talk to Bianca (/talk)          Family Dashboard (/dashboard)
+┌──────────────────────────┐    ┌──────────────────────────────┐
+│ You are: [Jasvinder ▾]   │    │ Todos          │ Events       │
+│                          │    │ ─────────────────────────────│
+│ Jasvinder                │    │ □ Buy groceries│ ✦ Dentist   │
+│ ╔══════════════════════╗ │    │   Due Apr 3    │   Fri Apr 10│
+│ ║ What's the weather   ║ │    │ □ Call plumber │ ✦ Gymnastics│
+│ ║ in Sunnyvale?        ║ │    │ ──────────────────────────── │
+│ ╚══════════════════════╝ │    │ [✓][✏️][🗑]    │   [✏️][🗑]  │
+│                          │    │                │             │
+│ Bianca                   │    │          [+ Add]│       [+Add]│
+│ ╔══════════════════════╗ │    └──────────────────────────────┘
+│ ║ It's partly cloudy   ║ │
+│ ║ and around 62°F...   ║ │    Hangman (/games/hangman)
+│ ╚══════════════════════╝ │    ┌──────────────────────────────┐
+│  ┌─ Full Answer ───────┐ │    │   +---+                      │
+│  │ Sunnyvale, CA today │ │    │   |   |   _ _ _ _ _ _ _ _   │
+│  │ shows partly cloudy │ │    │   O   |                      │
+│  │ skies with a high...│ │    │   |   |   Wrong: X Z         │
+│  └─────────────────────┘ │    │  /|   |                      │
+│                          │    │       |   💬 No X. 4 guesses  │
+│         [ 🎙️ ]           │    │   =========                  │
+│  Auto-stops after 2s     │    │ [ 🎙️ ] say "letter A"        │
+└──────────────────────────┘    └──────────────────────────────┘
+```
+
+---
+
 ## What it does
 
+**Via phone call (Twilio):**
 - **Add todos** — "Add a todo to buy milk"
 - **Complete todos** — "Mark buy milk as done"
 - **Add events** — "Add dentist appointment next Tuesday at 2pm"
-- **Query family data** — "What events do we have this week?", "What's on my list?"
-- **Research** — Answers from Qwen's knowledge, or falls back to web search (Tavily). Short spoken summary on the call, full detail sent to WhatsApp on request.
+- **Query family data** — "What events do we have this week?"
+- **Research** — Short spoken answer, full details sent to WhatsApp on request
 - **Image search** — Results sent to WhatsApp
-- **Web dashboard** — View and complete todos/events at `http://localhost:8000/dashboard`
+
+**Via browser (any device on your network):**
+- **Talk to Bianca** — same features as phone, microphone in the browser, no call needed
+- **Family Dashboard** — view, add, edit, and delete todos and events
+- **Hangman** — voice-controlled word game for kids, runs in the browser
+
+**Proactive:**
+- **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events
 
 ---
 
@@ -36,7 +90,7 @@ A voice-based AI assistant for families. Call a phone number, speak naturally, a
 
 - **Python 3.11+**
 - **[Ollama](https://ollama.com)** — runs the Qwen LLM locally
-- **[ngrok](https://ngrok.com)** — exposes your local server to Twilio's webhooks
+- **[ngrok](https://ngrok.com)** — exposes your local server to Twilio webhooks, and provides HTTPS for browser mic access
 - **NVIDIA GPU** (recommended) — Whisper large-v3 and Qwen 2.5:14b together need ~12GB VRAM. CPU-only works but is significantly slower.
   - If using CPU: set `WHISPER_MODEL_SIZE=base` in `.env` for faster startup
 
@@ -77,7 +131,7 @@ Edit `.env`:
 ```
 TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxx
 TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxx
-TWILIO_PHONE_NUMBER=+15005550006          # your Twilio number
+TWILIO_PHONE_NUMBER=+15005550006           # your Twilio number
 TWILIO_WHATSAPP_FROM=whatsapp:+14155238886 # Twilio sandbox number
 
 TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxx
@@ -86,13 +140,13 @@ OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=qwen2.5:14b
 
 FAMILY_MD_PATH=./family.md
-WHISPER_MODEL_SIZE=large-v3              # use "base" for CPU-only machines
+WHISPER_MODEL_SIZE=large-v3               # use "base" for CPU-only machines
 
 # JSON mapping of E.164 phone numbers to names
 PHONE_TO_NAME={"+447911123456": "Alice", "+447911987654": "Bob"}
 ```
 
-The `PHONE_TO_NAME` map controls who can use the assistant. Only numbers listed here will be answered; all others hear "Not registered" and are disconnected.
+`PHONE_TO_NAME` controls who can call Bianca. Only registered numbers are answered.
 
 ### 4. Create your family data file
 
@@ -105,12 +159,14 @@ Bianca reads from and writes to this file. It is excluded from git — your fami
 ### 5. Start the server
 
 ```bash
-uvicorn main:app --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-On first startup, Whisper and Qwen both load into memory (30–60 seconds). Subsequent calls are fast.
+`--host 0.0.0.0` makes the server reachable from other devices on your network (phones, Portal, etc.).
 
-### 6. Expose to Twilio with ngrok
+On first startup Whisper and Qwen load into GPU memory (30–60 seconds). Subsequent requests are fast.
+
+### 6. Expose to Twilio and get HTTPS with ngrok
 
 ```bash
 ngrok http 8000
@@ -118,18 +174,32 @@ ngrok http 8000
 
 Copy the `https://` forwarding URL (e.g. `https://abc123.ngrok.io`).
 
-In the [Twilio Console](https://console.twilio.com), go to your phone number's Voice configuration and set:
-
-- **A call comes in** → Webhook → `https://abc123.ngrok.io/voice/incoming`
-- Method: `HTTP POST`
+- **Twilio:** set your phone number's Voice webhook to `https://abc123.ngrok.io/voice/incoming` (POST)
+- **Browser mic:** the Talk and Hangman pages require HTTPS — use the ngrok URL, not the local IP
 
 ---
 
 ## Usage
 
-Call your Twilio number. Bianca greets you by name (from `PHONE_TO_NAME`) and listens for a command.
+### Phone
+Call your Twilio number. Bianca greets you by name and listens. Speak naturally — she handles the rest. Research results too long for voice are sent to your WhatsApp.
 
-**Dashboard:** open `http://localhost:8000/dashboard` in a browser to see todos and events, and mark todos as done.
+### Browser (same WiFi network)
+Open on any phone, tablet, or smart display on your network:
+
+| Page | Local (HTTP) | HTTPS required |
+|---|---|---|
+| Home | `http://<your-ip>:8000/` | No |
+| Dashboard | `http://<your-ip>:8000/dashboard` | No |
+| Talk to Bianca | `https://<ngrok-url>/talk` | **Yes** |
+| Hangman | `https://<ngrok-url>/games/hangman` | **Yes** |
+
+Find your local IP: `ip addr show | grep "inet " | grep -v 127.0.0.1`
+
+### Hangman voice commands
+- `"letter A"` — guess a letter
+- `"word elephant"` — guess the whole word
+- `"new game"` — start a fresh game
 
 ---
 
@@ -137,34 +207,38 @@ Call your Twilio number. Bianca greets you by name (from `PHONE_TO_NAME`) and li
 
 ```
 family-assistant/
-├── main.py                   # FastAPI app and route definitions
-├── config.py                 # Settings, env loading, phone→name mapping
-├── family.md                 # Shared storage — created from family.md.example (not in git)
-├── .env                      # Your credentials (not in git)
+├── main.py                   # FastAPI app, all routes, startup warmup, logging
+├── config.py                 # Settings, .env loading, phone→name mapping
+├── family.md                 # Shared storage (not in git — copy from family.md.example)
+├── .env                      # Credentials (not in git)
 ├── .env.example              # Template
 ├── family.md.example         # Template for family.md
 ├── ARCHITECTURE.md           # Full technical architecture and call flow diagrams
+├── logs/                     # Daily rotating log files (not in git)
 │
 ├── handlers/
-│   ├── call_handler.py       # Twilio webhook entry, async filler+compute pattern
-│   ├── intent_handler.py     # Routes intents to sub-handlers
+│   ├── call_handler.py       # Twilio webhooks, async filler+compute pattern
+│   ├── chat_handler.py       # Browser /chat endpoint — text in, structured JSON out
+│   ├── intent_handler.py     # Routes intents to sub-handlers (phone path)
 │   ├── todo_handler.py       # Add and complete todos
 │   ├── event_handler.py      # Add events
 │   ├── research_handler.py   # Web research, voice summary, WhatsApp delivery
 │   └── response_handler.py   # TwiML builder helpers
 │
 ├── services/
-│   ├── qwen.py               # Ollama REST wrapper and prompt runners
-│   ├── whisper_service.py    # faster-whisper STT (loaded at startup)
+│   ├── qwen.py               # Ollama REST wrapper and all LLM prompt runners
+│   ├── whisper_service.py    # faster-whisper STT, loaded at startup on GPU
 │   ├── twilio_service.py     # TwiML and WhatsApp sender
-│   ├── tavily_service.py     # Web and image search
-│   ├── markdown_service.py   # Read/write family.md with filelock
-│   └── session_store.py      # In-memory session state for async call flow
+│   ├── tavily_service.py     # Web and image search with retry
+│   ├── markdown_service.py   # Read/write/parse family.md with filelock
+│   ├── session_store.py      # In-memory sessions for async phone call flow
+│   ├── reminder_service.py   # APScheduler — proactive WhatsApp event reminders
+│   └── hangman_service.py    # Hangman game logic and in-memory game state
 │
 ├── models/
 │   └── schemas.py            # Pydantic models: IntentResult, TodoItem, EventItem
 │
-├── prompts/                  # LLM prompt templates
+├── prompts/                  # LLM prompt templates (plain text, injected at runtime)
 │   ├── intent_classify.txt
 │   ├── todo_extract.txt
 │   ├── todo_match.txt
@@ -175,5 +249,8 @@ family-assistant/
 │   └── research_synthesize.txt
 │
 └── templates/
-    └── dashboard.html        # Bootstrap 5 web dashboard
+    ├── home.html             # Landing page — card grid linking to all features
+    ├── talk.html             # Browser voice interface (MediaRecorder + Whisper)
+    ├── hangman.html          # Voice hangman game
+    └── dashboard.html        # Family todos and events — fully editable
 ```

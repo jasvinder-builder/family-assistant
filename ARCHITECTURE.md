@@ -2,52 +2,81 @@
 
 ## Overview
 
-Bianca is a voice-based family productivity assistant. Family members call a Twilio phone number, speak naturally, and Bianca handles todos, events, research, and general questions. Research results are delivered via WhatsApp. A web dashboard provides a visual view of the family's shared data.
-
-All AI runs locally on GPU. No cloud AI services are used.
+Bianca is a family productivity assistant with two interfaces: phone calls (via Twilio) and a browser interface (any device on the local network). She handles todos, events, research, and games. Research results are delivered via WhatsApp. Proactive event reminders are sent automatically. All AI runs locally on GPU — no cloud AI services.
 
 ---
 
 ## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          CALLER'S PHONE                             │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │ PSTN call
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         TWILIO CLOUD                                │
-│                                                                     │
-│   1. Receives inbound call                                          │
-│   2. Sends webhook → POST /voice/incoming                           │
-│   3. Plays TwiML response (Bianca's greeting via Polly.Joanna TTS)  │
-│   4. Records caller's speech (up to 15s)                            │
-│   5. Sends webhook → POST /voice/transcription  (RecordingUrl)      │
-│   6. Plays TwiML response (Bianca's answer via Polly.Joanna TTS)    │
-│   7. Records next question → back to step 5 (loop)                 │
-│   8. On goodbye intent → plays farewell → hangs up                 │
-└──────────┬───────────────────────────────────────┬──────────────────┘
-           │ webhooks (HTTP POST)                  │ WhatsApp API
-           ▼                                       ▼
-┌──────────────────────────────┐      ┌────────────────────────────────┐
-│     FASTAPI APPLICATION      │      │      CALLER'S WHATSAPP         │
-│     (uvicorn, port 8000)     │      │  (research results delivered   │
-│     exposed via ngrok        │      │   as async background task)    │
-│                              │      └────────────────────────────────┘
-│  Routes:                     │
-│  POST /voice/incoming        │
-│  POST /voice/transcription   │
-│  POST /voice/research-       │
-│       choice/{rid}           │
-│  POST /voice/research-       │
-│       whatsapp-choice/{wid}  │
-│  GET  /voice/answer/{sid}    │
-│  GET  /dashboard             │
-│  POST /dashboard/complete-   │
-│       todo                   │
-│  GET  /health                │
-└──────────┬───────────────────┘
+                    ┌─────────────────┐        ┌──────────────────────┐
+                    │  CALLER'S PHONE │        │  BROWSER (phone /    │
+                    │  (PSTN call)    │        │  Portal / tablet)    │
+                    └────────┬────────┘        └──────────┬───────────┘
+                             │                            │ HTTPS (ngrok)
+                             ▼                            │ MediaRecorder audio
+                    ┌────────────────┐                    │ JSON responses
+                    │  TWILIO CLOUD  │                    │
+                    │  inbound call  │                    │
+                    │  TTS playback  │                    │
+                    └────────┬───────┘                    │
+                             │ webhooks (HTTP POST)       │
+                             ▼                            ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                     FASTAPI APPLICATION  (uvicorn :8000)               │
+│                                                                        │
+│  Phone routes:                    Browser routes:                      │
+│  POST /voice/incoming             GET  /                               │
+│  POST /voice/transcription        GET  /talk                           │
+│  POST /voice/research-choice      GET  /dashboard                      │
+│  POST /voice/research-whatsapp-   POST /dashboard/add-todo             │
+│       choice                      POST /dashboard/complete-todo        │
+│  GET  /voice/answer/{sid}         POST /dashboard/delete-todo          │
+│                                   POST /dashboard/add-event            │
+│                                   POST /dashboard/delete-event         │
+│                                   POST /transcribe  (Whisper STT)      │
+│                                   POST /chat        (text→JSON)        │
+│                                   GET  /games/hangman                  │
+│                                   POST /games/hangman/new              │
+│                                   POST /games/hangman/guess            │
+│                                   GET  /health                         │
+└───────────────┬────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                  LOCAL MACHINE  (RTX 4070 Ti Super, 16GB VRAM)        │
+│                                                                       │
+│  ┌──────────────────────┐    ┌─────────────────────────────────────┐  │
+│  │  faster-whisper      │    │  Ollama  (REST on :11434)           │  │
+│  │  large-v3 / CUDA     │    │  Qwen 2.5:14b  Q4_K_M              │  │
+│  │  int8_float16        │    │  ~9-10GB VRAM                       │  │
+│  │  ~1.5GB VRAM         │    │  Warmed up at startup               │  │
+│  │  Loaded at startup   │    └─────────────────────────────────────┘  │
+│  └──────────────────────┘                                             │
+│                                                                       │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  family.md  (pipe-delimited markdown, filelock protected)        │ │
+│  │  ## Todos    — [ ] / [x] items with due date, added_by, etc     │ │
+│  │  ## Events   — ISO datetime | title | added_by                  │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│                                                                       │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  APScheduler — scans events every 30min                         │ │
+│  │  Sends WhatsApp reminders at 24h and 4h before each event       │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+│                                                                       │
+│  ┌──────────────────────────────────────────────────────────────────┐ │
+│  │  logs/app.log  (daily rotation, 7 days retention)               │ │
+│  └──────────────────────────────────────────────────────────────────┘ │
+└───────────────────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌───────────────────────────┐       ┌──────────────────────────────────┐
+│  TAVILY API (cloud)       │       │  FAMILY WHATSAPP                 │
+│  Web + image search       │       │  Research results, reminders,    │
+│  (research intents only)  │       │  WhatsApp-choice deliveries      │
+└───────────────────────────┘       └──────────────────────────────────┘
+```
            │
            ▼
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -348,30 +377,81 @@ Edit (todo or event) is handled client-side:
 
 ---
 
+## Browser Interface Flow
+
+Family members open the browser interface on any device on the local network. The Talk and Hangman pages require HTTPS (use the ngrok URL) because `MediaRecorder` mic access requires a secure context.
+
+```
+Browser (Portal / phone / tablet)
+        │
+        ├─ GET /          → home.html  (card grid: Talk, Dashboard, Hangman)
+        │
+        ├─ GET /talk       → talk.html
+        │   User taps mic → MediaRecorder captures audio
+        │   User taps stop (or 2s silence auto-stop via AnalyserNode)
+        │        │
+        │        ▼
+        │   POST /transcribe  (audio blob, webm/opus)
+        │     asyncio.to_thread(whisper_service.transcribe, bytes, ".webm")
+        │     → {transcript, confidence}
+        │        │
+        │        ▼
+        │   POST /chat  {transcript, caller_name}
+        │     chat_handler.handle_chat()
+        │       classify_intent → route to handler
+        │       research → Tavily + parallel Qwen summaries
+        │       returns {speech, display, intent}
+        │        │
+        │        ▼
+        │   speechSynthesis.speak(speech)     ← browser reads aloud
+        │   Show display text in Full Answer panel (research only)
+        │
+        ├─ GET /dashboard  → dashboard.html
+        │   Editable todos and events (add / complete / edit / delete)
+        │   All mutations via JSON POST, reload on success
+        │   Auto-refreshes every 30s
+        │
+        └─ GET /games/hangman → hangman.html
+            POST /games/hangman/new    → new HangmanGame (random word)
+            POST /games/hangman/guess  {session_id, guess}
+              hangman_service.guess()
+              Accepts: "letter A", "word elephant", bare single letter
+              Strips punctuation + spoken prefixes before matching
+              → {display_word, wrong_letters, figure, speech, won, lost}
+            speechSynthesis.speak(speech)  ← reads result aloud
+            Mic re-enabled only after speech finishes (onend callback)
+```
+
+---
+
 ## Component Map
 
 ```
 family-assistant/
 │
-├── main.py                    FastAPI app, routes, startup warmup
+├── main.py                    FastAPI app, all routes, startup warmup, log setup
 ├── config.py                  Pydantic settings, .env loading, phone→name map
 ├── family.md                  Shared storage: todos + events (pipe-delimited markdown)
+├── logs/                      Daily rotating logs (app.log, 7 days retention)
 │
 ├── handlers/
 │   ├── call_handler.py        Twilio webhooks → download audio → Whisper → classify
-│   ├── intent_handler.py      Routes IntentResult to correct sub-handler
+│   ├── chat_handler.py        Browser /chat → classify → route → return {speech, display}
+│   ├── intent_handler.py      Routes IntentResult to correct sub-handler (phone path)
 │   ├── todo_handler.py        add_todo, query_todos, complete_todo
 │   ├── event_handler.py       add_event, query_events
-│   ├── research_handler.py    quick_answer check → Tavily search → WhatsApp dispatch
-│   └── response_handler.py    TwiML builders: voice_gather, voice_say_then_gather, voice_say_hangup
+│   ├── research_handler.py    quick_answer → Tavily → parallel voice+WhatsApp summaries
+│   └── response_handler.py    TwiML builders: voice_gather, voice_say_then_gather, etc.
 │
 ├── services/
-│   ├── whisper_service.py     faster-whisper large-v3 on CUDA (loaded at startup)
+│   ├── whisper_service.py     faster-whisper large-v3 CUDA, suffix param for webm/wav
 │   ├── qwen.py                Ollama REST wrapper, all LLM calls, JSON extraction
-│   ├── markdown_service.py    Read/write/parse family.md with FileLock
+│   ├── markdown_service.py    Read/write/parse/delete family.md with FileLock
 │   ├── session_store.py       In-memory sessions (RecordingSid → asyncio.Event + result)
-│   ├── tavily_service.py      Tavily web + image search
-│   └── twilio_service.py      WhatsApp message + image sender
+│   ├── tavily_service.py      Tavily web + image search with retry
+│   ├── twilio_service.py      WhatsApp message + image sender
+│   ├── reminder_service.py    APScheduler — 24h/4h WhatsApp reminders for events
+│   └── hangman_service.py     Hangman game state, word list, guess logic
 │
 ├── models/
 │   └── schemas.py             Pydantic models: IntentResult, TodoItem, EventItem
@@ -382,11 +462,15 @@ family-assistant/
 │   ├── todo_match.txt         Fuzzy-match transcript to existing todo
 │   ├── event_extract.txt      Extract event title + datetime from transcript
 │   ├── family_query.txt       Answer natural language questions about todos/events
-│   ├── quick_answer.txt       Decide if Qwen can answer from knowledge vs needs search
-│   └── research_synthesize.txt  Summarize Tavily results for WhatsApp
+│   ├── quick_answer.txt       Decide if Qwen can answer from knowledge vs web search
+│   ├── research_voice.txt     2-3 sentence spoken summary of search results
+│   └── research_synthesize.txt  Full Markdown summary for WhatsApp / browser display
 │
 └── templates/
-    └── dashboard.html         Bootstrap 5 dashboard, vanilla JS, auto-refresh
+    ├── home.html              Landing page — Bootstrap card grid
+    ├── talk.html              Browser voice interface — MediaRecorder + Whisper STT
+    ├── hangman.html           Voice hangman game — silence detection, prefix enforcement
+    └── dashboard.html         Editable family dashboard — Bootstrap 5, vanilla JS
 ```
 
 ---
@@ -396,16 +480,20 @@ family-assistant/
 | Layer | Technology | Why |
 |---|---|---|
 | Phone calls | Twilio (inbound PSTN) | Handles carrier complexity, webhooks, TTS |
-| Text-to-speech | AWS Polly via Twilio (`Polly.Joanna`) | Natural voice, no extra integration |
-| Speech-to-text | faster-whisper `large-v3` on CUDA | Free, best open-source STT accuracy |
-| LLM | Qwen 2.5:14b via Ollama | Strong multilingual reasoning, runs locally |
-| Web search | Tavily API | Clean search results API, image support |
-| Messaging | Twilio WhatsApp API | Delivers research results asynchronously |
+| Phone TTS | AWS Polly via Twilio (`Polly.Joanna`) | Natural voice, no extra integration |
+| Browser mic | `MediaRecorder` API | Works on all modern browsers, no plugins |
+| Browser TTS | `speechSynthesis` API | Built-in, no server round-trip |
+| Speech-to-text | faster-whisper `large-v3` on CUDA | Free, accurate, used for both phone and browser |
+| LLM | Qwen 2.5:14b via Ollama | Strong reasoning, runs fully locally |
+| Web search | Tavily API | Clean results API, image search support |
+| Messaging | Twilio WhatsApp API | Async research + reminder delivery |
 | Storage | Markdown file (`family.md`) | Human-readable, editable, no DB setup |
 | File locking | `filelock` | Prevents concurrent write corruption |
+| Scheduler | APScheduler `AsyncIOScheduler` | Proactive reminders without Celery/Redis |
 | Backend | FastAPI + uvicorn | Async, fast, minimal boilerplate |
-| Dashboard | Jinja2 + Bootstrap 5 | No build step, zero JS dependencies |
-| Tunnel (dev) | ngrok | Exposes local server to Twilio webhooks |
+| Templates | Jinja2 + Bootstrap 5 | No build step, zero JS framework needed |
+| Logging | `TimedRotatingFileHandler` | Daily log files, 7-day retention |
+| Tunnel (dev) | ngrok | Twilio webhooks + HTTPS for browser mic |
 
 ---
 
