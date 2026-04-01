@@ -265,9 +265,10 @@ function setStatus(msg) {
 function parseSpokenNumber(text) {
   text = text.trim().toLowerCase().replace(/[^a-z0-9 ]/g, '');
 
-  // Try finding any digit sequence first
-  const digits = text.match(/\b(\d+)\b/);
-  if (digits) return parseInt(digits[1]);
+  // Take the LAST digit sequence — the answer is typically spoken last
+  // e.g. "It is 8 times 9. 72." → 72, not 8
+  const allDigits = [...text.matchAll(/\b(\d+)\b/g)];
+  if (allDigits.length > 0) return parseInt(allDigits[allDigits.length - 1][1]);
 
   const ones = {
     zero:0, one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9,
@@ -279,20 +280,25 @@ function parseSpokenNumber(text) {
   if (ones[text] !== undefined) return ones[text];
   if (tens[text] !== undefined) return tens[text];
 
-  // "twenty four", "forty five", etc.
+  // "twenty four", "forty five", etc. — take the LAST match in the phrase
   const parts = text.split(' ');
   if (parts.length >= 2) {
-    // scan for a tens+ones pair anywhere in the phrase
+    // scan for a tens+ones pair — take the last one found
+    let lastPair = null;
     for (let i = 0; i < parts.length - 1; i++) {
       if (tens[parts[i]] !== undefined && ones[parts[i+1]] !== undefined) {
-        return tens[parts[i]] + ones[parts[i+1]];
+        lastPair = tens[parts[i]] + ones[parts[i+1]];
       }
     }
-    // lone tens or ones word anywhere in phrase (e.g. "the answer is eight")
+    if (lastPair !== null) return lastPair;
+
+    // lone tens or ones word — take the last one found in phrase
+    let lastWord = null;
     for (const p of parts) {
-      if (ones[p] !== undefined) return ones[p];
-      if (tens[p] !== undefined) return tens[p];
+      if (tens[p] !== undefined) lastWord = tens[p];
+      else if (ones[p] !== undefined) lastWord = ones[p];
     }
+    if (lastWord !== null) return lastWord;
   }
   return null;
 }
