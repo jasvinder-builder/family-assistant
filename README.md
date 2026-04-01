@@ -66,6 +66,9 @@ Talk to Bianca (/talk)          Family Dashboard (/dashboard)
 - **Talk to Bianca** — same features as phone; mic auto-detects your voice (no tap needed) using Silero VAD running locally in the browser
 - **Family Dashboard** — view, add, edit, and delete todos and events
 - **Hangman** — voice-controlled word game for kids; just speak your guess, no tap required
+- **Times Tables** — voice multiplication practice; Bianca asks, kid answers out loud
+- **Tell the Time** — 4-option clock reading game with pure SVG clock faces
+- **Knowledge Quiz** — pick a subject and grade; Qwen generates 10 tailored questions on the fly
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events

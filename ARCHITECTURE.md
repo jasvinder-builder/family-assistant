@@ -41,6 +41,8 @@ Bianca is a family productivity assistant with two interfaces: phone calls (via 
 │                                   POST /games/hangman/guess            │
 │                                   GET  /games/multiply                 │
 │                                   GET  /games/clock                    │
+│                                   GET  /games/quiz                     │
+│                                   POST /games/quiz/generate            │
 │                                   GET  /health                         │
 └───────────────┬────────────────────────────────────────────────────────┘
                 │
@@ -437,18 +439,35 @@ Browser (Portal / phone / tablet)
         │     Handles digits ("24") and English words ("twenty four", "eight")
         │   Tracks correct / answered score; Fresh Start resets
         │
-        └─ GET /games/clock → clock.html
-            Tell the Time game — 4-option multiple choice
-            All logic client-side — no new backend endpoints
-            Generates random time (hour 1–12, minute in multiples of 5)
-            Renders 4 SVG analogue clock faces (pure JS, no images/libraries):
-              white face, 12 tick marks, hour numbers at 12/3/6/9,
-              short thick dark hour hand, long thin purple minute hand
-            Distractors differ by ≥15 min or different hour (visually distinct)
-            VAD captures "A"/"B"/"C"/"D" → /transcribe → parseOption()
-            Tapping a clock card also accepted as answer
-            Speaks human-friendly time: "half past 3", "quarter to 6", "3 o'clock"
-            Tracks correct / answered score; Fresh Start resets
+        ├─ GET /games/clock → clock.html
+        │   Tell the Time game — 4-option multiple choice
+        │   All logic client-side — no new backend endpoints
+        │   Generates random time (hour 1–12, minute in multiples of 5)
+        │   Renders 4 SVG analogue clock faces (pure JS, no images/libraries):
+        │     white face, 12 tick marks, hour numbers at 12/3/6/9,
+        │     short thick dark hour hand, long thin purple minute hand
+        │   Distractors differ by ≥15 min or different hour (visually distinct)
+        │   VAD captures "A"/"B"/"C"/"D" → /transcribe → parseOption()
+        │   Tapping a clock card also accepted as answer
+        │   Speaks human-friendly time: "half past 3", "quarter to 6", "3 o'clock"
+        │   Tracks correct / answered score; Fresh Start resets
+        │
+        └─ GET /games/quiz → quiz.html
+            Knowledge Quiz — subject + grade selection → Qwen-generated questions
+            POST /games/quiz/generate  {subject, grade}
+              asyncio.to_thread(qwen.generate_quiz)
+              Prompt: prompts/quiz_generate.txt — enforces kid-safe content,
+                grade-appropriate difficulty, structured JSON output
+              qwen.generate_quiz() validates each question (4 options, correct index 0-3)
+              Requires ≥5 valid questions or raises error
+              Returns JSON array of up to 10 questions
+            Client flow:
+              Setup screen → pick subject (8 options) + grade (1–8)
+              Loading screen — cycling messages while Qwen generates (~15-25s)
+              Question screen — progress bar, 4 option cards, VAD or tap
+              Funny response phrases (8 correct, 8 wrong) picked at random
+              Final score screen — message scaled to performance, Play Again or New Quiz
+            VAD initialised after questions load (not during setup/loading)
 ```
 
 ---
@@ -493,7 +512,8 @@ family-assistant/
 │   ├── family_query.txt       Answer natural language questions about todos/events
 │   ├── quick_answer.txt       Decide if Qwen can answer from knowledge vs web search
 │   ├── research_voice.txt     2-3 sentence spoken summary of search results
-│   └── research_synthesize.txt  Full Markdown summary for WhatsApp / browser display
+│   ├── research_synthesize.txt  Full Markdown summary for WhatsApp / browser display
+│   └── quiz_generate.txt      Generate 10 kid-safe MCQ questions for subject + grade
 │
 └── templates/
     ├── home.html              Landing page — games section (top) + assistant section (bottom)
@@ -501,6 +521,7 @@ family-assistant/
     ├── hangman.html           Voice hangman — VAD, hint letters pre-revealed at start
     ├── multiply.html          Times Tables game — VAD, spoken number parsing, score tracking
     ├── clock.html             Tell the Time game — SVG clocks, 4-option MCQ, VAD
+    ├── quiz.html              Knowledge Quiz — subject/grade setup, Qwen questions, VAD
     └── dashboard.html         Editable family dashboard — Bootstrap 5, vanilla JS
 ```
 

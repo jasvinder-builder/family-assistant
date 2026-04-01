@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Knowledge Quiz — Bianca</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/bundle.min.js"></script>
+  <style>
+    body { background: #fff7ed; }
+    .header { background: #ea580c; color: white; padding: 1rem 1.5rem; }
+    .header a { color: rgba(255,255,255,0.85); text-decoration: none; font-size: 0.9rem; }
+
+    /* ── Setup phase ── */
+    .subject-btn {
+      border: 2.5px solid transparent; border-radius: 14px;
+      padding: 0.9rem 0.5rem; cursor: pointer; background: white;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.07);
+      transition: border-color .15s, transform .1s, box-shadow .15s;
+      width: 100%; text-align: center;
+    }
+    .subject-btn:hover  { transform: translateY(-2px); box-shadow: 0 5px 14px rgba(0,0,0,0.12); }
+    .subject-btn.active { border-color: #ea580c; background: #fff7ed; }
+    .subject-icon { font-size: 2rem; display: block; margin-bottom: 0.3rem; }
+    .subject-name { font-size: 0.85rem; font-weight: 600; color: #374151; }
+
+    .grade-btn {
+      width: 44px; height: 44px; border-radius: 50%; border: 2.5px solid #e5e7eb;
+      background: white; font-weight: 700; font-size: 0.95rem; color: #374151;
+      cursor: pointer; transition: border-color .15s, background .15s;
+    }
+    .grade-btn:hover  { border-color: #ea580c; }
+    .grade-btn.active { border-color: #ea580c; background: #ea580c; color: white; }
+
+    /* ── Loading phase ── */
+    #phase-loading { min-height: 60vh; }
+    .spinner-ring {
+      width: 70px; height: 70px; border-radius: 50%;
+      border: 6px solid #fed7aa; border-top-color: #ea580c;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #loading-msg { font-size: 1.1rem; color: #6b7280; min-height: 1.6rem; }
+
+    /* ── Question phase ── */
+    #question-text {
+      font-size: 1.35rem; font-weight: 600; color: #1f2937; line-height: 1.4;
+    }
+    .opt-card {
+      background: white; border-radius: 14px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.07);
+      padding: 0.9rem 1rem; cursor: pointer;
+      border: 3px solid transparent;
+      transition: transform .12s, box-shadow .12s, border-color .15s;
+      display: flex; align-items: center; gap: 0.75rem;
+    }
+    .opt-card:hover  { transform: translateY(-2px); box-shadow: 0 5px 16px rgba(0,0,0,0.11); }
+    .opt-label {
+      width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+      background: #fed7aa; color: #ea580c; font-weight: 700; font-size: 0.9rem;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .opt-text { font-size: 1rem; color: #1f2937; font-weight: 500; }
+    .opt-card.correct { border-color: #16a34a; background: #f0fdf4; }
+    .opt-card.correct .opt-label { background: #16a34a; color: white; }
+    .opt-card.wrong   { border-color: #dc2626; background: #fef2f2; }
+    .opt-card.wrong .opt-label { background: #dc2626; color: white; }
+    .opt-card.reveal  { border-color: #16a34a; background: #f0fdf4; }
+    .opt-card.reveal .opt-label { background: #16a34a; color: white; }
+
+    #feedback-text { font-size: 1.15rem; font-weight: 600; min-height: 1.8rem; }
+    .feedback-correct { color: #16a34a; }
+    .feedback-wrong   { color: #dc2626; }
+
+    /* ── Score bar ── */
+    #score-box { background: white; border-radius: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.07); padding: 0.75rem 1.25rem; }
+    .score-num   { font-size: 1.6rem; font-weight: 700; color: #ea580c; }
+    .score-label { font-size: 0.72rem; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.05rem; }
+
+    /* ── Final phase ── */
+    #final-score-big { font-size: 5rem; font-weight: 800; color: #ea580c; }
+    #final-msg { font-size: 1.3rem; color: #374151; }
+
+    /* ── VAD ring ── */
+    #voice-ring {
+      width: 60px; height: 60px; border-radius: 50%;
+      background: #fed7aa; display: inline-flex;
+      align-items: center; justify-content: center; font-size: 1.5rem;
+      transition: background .3s, box-shadow .3s;
+    }
+    #voice-ring.loading    { background: #f3f4f6; }
+    #voice-ring.ready      { background: #fed7aa; }
+    #voice-ring.speech     { background: #ea580c; animation: ripple 1s infinite; }
+    #voice-ring.processing { background: #9ca3af; }
+    @keyframes ripple {
+      0%,100% { box-shadow: 0 0 0 0 rgba(234,88,12,0.35); }
+      50%      { box-shadow: 0 0 0 12px rgba(234,88,12,0); }
+    }
+    #vad-status { font-size: 0.78rem; color: #9ca3af; }
+  </style>
+</head>
+<body>
+
+<div class="header d-flex align-items-center gap-3">
+  <a href="/">← Home</a>
+  <strong class="text-white ms-1">Knowledge Quiz</strong>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ PHASE 1: SETUP -->
+<div id="phase-setup" class="container py-4" style="max-width:540px">
+
+  <p class="fw-semibold text-secondary mb-2" style="font-size:0.8rem;text-transform:uppercase;letter-spacing:.06rem">Choose a subject</p>
+  <div class="row g-2 mb-4" id="subject-grid">
+    <div class="col-3"><button class="subject-btn" onclick="selectSubject(this,'Science')"><span class="subject-icon">🔬</span><span class="subject-name">Science</span></button></div>
+    <div class="col-3"><button class="subject-btn" onclick="selectSubject(this,'Geography')"><span class="subject-icon">🌍</span><span class="subject-name">Geography</span></button></div>
+    <div class="col-3"><button class="subject-btn" onclick="selectSubject(this,'Music')"><span class="subject-icon">🎵</span><span class="subject-name">Music</span></button></div>
+    <div class="col-3"><button class="subject-btn" onclick="selectSubject(this,'Arts')"><span class="subject-icon">🎨</span><span class="subject-name">Arts</span></button></div>
+    <div class="col-3"><button class="subject-btn" onclick="selectSubject(this,'Sports')"><span class="subject-icon">⚽</span><span class="subject-name">Sports</span></button></div>
+    <div class="col-3"><button class="subject-btn" onclick="selectSubject(this,'Maths')"><span class="subject-icon">➕</span><span class="subject-name">Maths</span></button></div>
+    <div class="col-3"><button class="subject-btn" onclick="selectSubject(this,'Nature')"><span class="subject-icon">🌿</span><span class="subject-name">Nature</span></button></div>
+    <div class="col-3"><button class="subject-btn" onclick="selectSubject(this,'Space')"><span class="subject-icon">🚀</span><span class="subject-name">Space</span></button></div>
+  </div>
+
+  <p class="fw-semibold text-secondary mb-2" style="font-size:0.8rem;text-transform:uppercase;letter-spacing:.06rem">What grade are you in?</p>
+  <div class="d-flex gap-2 flex-wrap mb-4">
+    <button class="grade-btn" onclick="selectGrade(this,1)">1</button>
+    <button class="grade-btn" onclick="selectGrade(this,2)">2</button>
+    <button class="grade-btn" onclick="selectGrade(this,3)">3</button>
+    <button class="grade-btn" onclick="selectGrade(this,4)">4</button>
+    <button class="grade-btn" onclick="selectGrade(this,5)">5</button>
+    <button class="grade-btn" onclick="selectGrade(this,6)">6</button>
+    <button class="grade-btn" onclick="selectGrade(this,7)">7</button>
+    <button class="grade-btn" onclick="selectGrade(this,8)">8</button>
+  </div>
+
+  <button id="start-quiz-btn" class="btn w-100 py-3 fw-bold"
+          style="background:#ea580c;color:white;border-radius:14px;border:none;font-size:1.1rem;opacity:0.4;pointer-events:none;"
+          onclick="startQuiz()">Let's Go! 🚀</button>
+  <div class="text-muted text-center small mt-2">Allows mic and voice responses</div>
+
+</div>
+
+<!-- ══════════════════════════════════════════════════════ PHASE 2: LOADING -->
+<div id="phase-loading" class="container d-none d-flex flex-column align-items-center justify-content-center py-5" style="max-width:400px">
+  <div class="spinner-ring mb-4"></div>
+  <div class="fw-bold mb-2" style="font-size:1.2rem;color:#ea580c" id="loading-subject-label"></div>
+  <div id="loading-msg" class="text-center">Bianca is cooking up your questions...</div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ PHASE 3: QUESTION -->
+<div id="phase-question" class="container d-none py-3" style="max-width:540px">
+
+  <!-- Top bar -->
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <div id="score-box" class="d-flex gap-3 text-center">
+      <div><div class="score-num" id="q-correct">0</div><div class="score-label">Correct</div></div>
+      <div><div class="score-num" id="q-index">1/10</div><div class="score-label">Question</div></div>
+    </div>
+    <div id="quiz-label" class="badge" style="background:#fed7aa;color:#9a3412;font-size:0.8rem;padding:0.4rem 0.8rem;border-radius:20px"></div>
+  </div>
+
+  <!-- Progress bar -->
+  <div class="progress mb-3" style="height:6px;border-radius:4px">
+    <div id="progress-bar" class="progress-bar" role="progressbar"
+         style="width:0%;background:#ea580c;border-radius:4px" aria-valuenow="0" aria-valuemax="100"></div>
+  </div>
+
+  <!-- Question -->
+  <div class="bg-white rounded-4 p-3 mb-3 shadow-sm">
+    <div id="question-text" class="text-center">—</div>
+  </div>
+
+  <!-- Options -->
+  <div class="d-flex flex-column gap-2 mb-3" id="options-list">
+    <div class="opt-card" id="opt-0" onclick="submitAnswer(0)">
+      <div class="opt-label">A</div><div class="opt-text" id="opt-text-0"></div>
+    </div>
+    <div class="opt-card" id="opt-1" onclick="submitAnswer(1)">
+      <div class="opt-label">B</div><div class="opt-text" id="opt-text-1"></div>
+    </div>
+    <div class="opt-card" id="opt-2" onclick="submitAnswer(2)">
+      <div class="opt-label">C</div><div class="opt-text" id="opt-text-2"></div>
+    </div>
+    <div class="opt-card" id="opt-3" onclick="submitAnswer(3)">
+      <div class="opt-label">D</div><div class="opt-text" id="opt-text-3"></div>
+    </div>
+  </div>
+
+  <!-- Feedback -->
+  <div class="text-center mb-3">
+    <div id="feedback-text"></div>
+  </div>
+
+  <!-- VAD -->
+  <div class="text-center">
+    <div id="voice-ring" class="loading">🎙️</div>
+    <div id="vad-status" class="mt-1">Loading voice engine...</div>
+    <div class="text-muted small">Say A, B, C, or D — or tap an option</div>
+  </div>
+
+</div>
+
+<!-- ══════════════════════════════════════════════════════ PHASE 4: FINAL -->
+<div id="phase-final" class="container d-none text-center py-5" style="max-width:400px">
+  <div id="final-score-big"></div>
+  <div class="text-muted mb-2" style="font-size:1rem">out of <span id="final-total"></span></div>
+  <div id="final-msg" class="mb-4"></div>
+  <button class="btn me-2 px-4 py-2 fw-semibold"
+          style="background:#ea580c;color:white;border-radius:12px;border:none"
+          onclick="replayQuiz()">Play Again 🔄</button>
+  <button class="btn px-4 py-2 fw-semibold"
+          style="background:white;color:#ea580c;border:2px solid #ea580c;border-radius:12px"
+          onclick="newSetup()">New Quiz 🎯</button>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────────
+let selectedSubject = '';
+let selectedGrade   = 0;
+let questions       = [];
+let qIndex          = 0;
+let correctCount    = 0;
+let answered        = false;
+let micVAD          = null;
+let isProcessing    = false;
+
+const CORRECT_PHRASES = [
+  "Brilliant! 🌟", "You're on fire! 🔥", "Quiz genius! 🧠",
+  "Nailed it! 💪", "Superstar! ⭐", "Woohoo! That's right!",
+  "Amazing brain power! 🎉", "Spot on! Fantastic! 🎯"
+];
+const WRONG_PHRASES = [
+  "Oops! Good try though! 🙈", "Not quite — keep going! 💪",
+  "Tricky one! Almost!", "Nice try! You'll get the next one!",
+  "So close! Keep it up! 🌟", "Don't worry, learning is fun!",
+  "Good effort! Nearly there! 🤔", "Ooh, that was a tough one!"
+];
+const LOADING_MSGS = [
+  "Bianca is cooking up your questions... 🧠",
+  "Making sure they're just right for you...",
+  "Picking the most interesting ones...",
+  "Almost ready — just a few more seconds! ✨"
+];
+
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+
+// ── Setup phase ───────────────────────────────────────────────────────────────
+function selectSubject(btn, name) {
+  document.querySelectorAll('.subject-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  selectedSubject = name;
+  updateStartBtn();
+}
+
+function selectGrade(btn, grade) {
+  document.querySelectorAll('.grade-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  selectedGrade = grade;
+  updateStartBtn();
+}
+
+function updateStartBtn() {
+  const btn = document.getElementById('start-quiz-btn');
+  const ready = selectedSubject && selectedGrade;
+  btn.style.opacity = ready ? '1' : '0.4';
+  btn.style.pointerEvents = ready ? 'auto' : 'none';
+}
+
+async function startQuiz() {
+  // Unlock speechSynthesis from this gesture
+  if (window.speechSynthesis) {
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(''));
+    window.speechSynthesis.getVoices();
+    window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+  }
+
+  showPhase('loading');
+  document.getElementById('loading-subject-label').textContent =
+    `${selectedSubject} — Grade ${selectedGrade}`;
+
+  // Cycle loading messages while waiting
+  let msgIdx = 0;
+  const msgEl = document.getElementById('loading-msg');
+  msgEl.textContent = LOADING_MSGS[0];
+  const msgTimer = setInterval(() => {
+    msgIdx = (msgIdx + 1) % LOADING_MSGS.length;
+    msgEl.textContent = LOADING_MSGS[msgIdx];
+  }, 4000);
+
+  try {
+    const resp = await fetch('/games/quiz/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject: selectedSubject, grade: selectedGrade }),
+    });
+    const data = await resp.json();
+    clearInterval(msgTimer);
+
+    if (data.error || !data.questions) {
+      msgEl.textContent = '❌ ' + (data.error || 'Something went wrong. Please try again.');
+      setTimeout(newSetup, 3000);
+      return;
+    }
+
+    questions    = data.questions;
+    qIndex       = 0;
+    correctCount = 0;
+    showPhase('question');
+    document.getElementById('quiz-label').textContent =
+      `${selectedSubject} · Grade ${selectedGrade}`;
+    await initVAD();
+    showQuestion();
+  } catch (e) {
+    clearInterval(msgTimer);
+    msgEl.textContent = '❌ Network error. Please try again.';
+    setTimeout(newSetup, 3000);
+  }
+}
+
+// ── Question phase ────────────────────────────────────────────────────────────
+function showQuestion() {
+  const q = questions[qIndex];
+  answered = false;
+  isProcessing = false;
+
+  // Reset options
+  for (let i = 0; i < 4; i++) {
+    const card = document.getElementById(`opt-${i}`);
+    card.className = 'opt-card';
+    document.getElementById(`opt-text-${i}`).textContent = q.options[i];
+  }
+  setFeedback('', '');
+
+  document.getElementById('question-text').textContent = q.question;
+  document.getElementById('q-index').textContent = `${qIndex + 1}/${questions.length}`;
+  document.getElementById('q-correct').textContent = correctCount;
+  document.getElementById('progress-bar').style.width = `${(qIndex / questions.length) * 100}%`;
+
+  // Speak the question + options
+  const labels = ['A', 'B', 'C', 'D'];
+  const optText = q.options.map((o, i) => `${labels[i]}: ${o}`).join('. ');
+  speak(`Question ${qIndex + 1}. ${q.question}. ${optText}.`);
+}
+
+function submitAnswer(optionIndex) {
+  if (answered || isProcessing) return;
+  answered = true;
+  isProcessing = true;
+  if (micVAD) micVAD.pause();
+
+  const q = questions[qIndex];
+  const isCorrect = optionIndex === q.correct;
+  if (isCorrect) correctCount++;
+
+  // Highlight cards
+  for (let i = 0; i < 4; i++) {
+    const card = document.getElementById(`opt-${i}`);
+    if (i === q.correct && i === optionIndex) card.classList.add('correct');
+    else if (i === optionIndex)               card.classList.add('wrong');
+    else if (i === q.correct)                 card.classList.add('reveal');
+  }
+
+  document.getElementById('q-correct').textContent = correctCount;
+
+  const phrase = isCorrect
+    ? CORRECT_PHRASES[Math.floor(Math.random() * CORRECT_PHRASES.length)]
+    : WRONG_PHRASES[Math.floor(Math.random() * WRONG_PHRASES.length)];
+
+  const correctText = `The correct answer was ${['A','B','C','D'][q.correct]}: ${q.options[q.correct]}.`;
+
+  if (isCorrect) {
+    setFeedback(phrase, 'correct');
+    speak(phrase, () => setTimeout(nextQuestion, 400));
+  } else {
+    setFeedback(`${phrase} ${correctText}`, 'wrong');
+    speak(`${phrase} ${correctText}`, () => setTimeout(nextQuestion, 500));
+  }
+}
+
+function nextQuestion() {
+  qIndex++;
+  if (qIndex >= questions.length) {
+    showFinalScore();
+  } else {
+    isProcessing = false;
+    showQuestion();
+    if (micVAD) micVAD.start();
+    setVADRing('ready');
+    setVADStatus('Say A, B, C, or D — or tap an option');
+  }
+}
+
+// ── Final score ───────────────────────────────────────────────────────────────
+function showFinalScore() {
+  if (micVAD) micVAD.pause();
+  showPhase('final');
+  const total = questions.length;
+  document.getElementById('final-score-big').textContent = correctCount;
+  document.getElementById('final-total').textContent = total;
+
+  let msg, speechMsg;
+  const pct = correctCount / total;
+  if (pct === 1)       { msg = "Perfect score! You're a genius! 🏆"; speechMsg = "Perfect score! You are a genius!"; }
+  else if (pct >= 0.8) { msg = "Excellent work! Almost perfect! ⭐"; speechMsg = "Excellent work! Almost perfect!"; }
+  else if (pct >= 0.6) { msg = "Great job! Keep practising! 👍";    speechMsg = "Great job! Keep practising!"; }
+  else if (pct >= 0.4) { msg = "Good effort! You're learning! 💪";  speechMsg = "Good effort! You are learning!"; }
+  else                  { msg = "Nice try! Have another go! 🌱";     speechMsg = "Nice try! Have another go!"; }
+
+  document.getElementById('final-msg').textContent = msg;
+  speak(`Quiz finished! You got ${correctCount} out of ${total}. ${speechMsg}`);
+}
+
+function replayQuiz() {
+  qIndex       = 0;
+  correctCount = 0;
+  // Shuffle questions for variety
+  questions = questions.slice().sort(() => Math.random() - 0.5);
+  showPhase('question');
+  isProcessing = false;
+  if (micVAD) { micVAD.start(); setVADRing('ready'); }
+  showQuestion();
+}
+
+function newSetup() {
+  if (micVAD) { micVAD.pause(); }
+  showPhase('setup');
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function showPhase(name) {
+  ['setup','loading','question','final'].forEach(p => {
+    const el = document.getElementById(`phase-${p}`);
+    el.classList.toggle('d-none', p !== name);
+    // loading uses d-flex so needs special handling
+    if (p === 'loading') el.classList.toggle('d-flex', p === name);
+  });
+}
+
+function setFeedback(text, type) {
+  const el = document.getElementById('feedback-text');
+  el.textContent = text;
+  el.className = type === 'correct' ? 'feedback-correct' : type === 'wrong' ? 'feedback-wrong' : '';
+}
+
+function setVADRing(state)  { document.getElementById('voice-ring').className = state; }
+function setVADStatus(msg)  { document.getElementById('vad-status').textContent = msg; }
+
+// ── VAD ───────────────────────────────────────────────────────────────────────
+async function initVAD() {
+  try {
+    micVAD = await vad.MicVAD.new({
+      baseAssetPath:    'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/',
+      onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
+      model: 'v5',
+      positiveSpeechThreshold: 0.8,
+      negativeSpeechThreshold: 0.3,
+      minSpeechMs: 200,
+      onSpeechStart: () => { if (!isProcessing) { setVADRing('speech'); setVADStatus('Listening...'); } },
+      onSpeechEnd: async (audio) => {
+        if (isProcessing || answered) return;
+        micVAD.pause();
+        setVADRing('processing');
+        await transcribeAndAnswer(float32ToWav(audio, 16000));
+      },
+    });
+    micVAD.start();
+    setVADRing('ready');
+    setVADStatus('Say A, B, C, or D — or tap an option');
+  } catch (e) {
+    setVADRing('loading');
+    setVADStatus('Voice unavailable — tap an option to answer.');
+    console.error('VAD init failed:', e);
+  }
+}
+
+async function transcribeAndAnswer(blob) {
+  try {
+    const form = new FormData();
+    form.append('audio', blob, 'recording.wav');
+    const resp = await fetch('/transcribe', { method: 'POST', body: form });
+    const data = await resp.json();
+    const idx  = data.transcript ? parseOption(data.transcript) : null;
+    if (idx !== null) {
+      submitAnswer(idx);
+    } else {
+      isProcessing = false;
+      if (micVAD) micVAD.start();
+      setVADRing('ready');
+      setVADStatus("Didn't catch that — say A, B, C, or D");
+    }
+  } catch (e) {
+    isProcessing = false;
+    if (micVAD) micVAD.start();
+    setVADRing('ready');
+    setVADStatus('Error — tap an option or try again.');
+  }
+}
+
+function parseOption(text) {
+  const t = text.toUpperCase();
+  const map = { A: 0, B: 1, C: 2, D: 3 };
+  for (const [letter, idx] of Object.entries(map)) {
+    if (new RegExp(`\\b${letter}\\b`).test(t)) return idx;
+  }
+  // Spoken letter names
+  if (/\bAY\b/.test(t))          return 0;
+  if (/\bBEE\b/.test(t))         return 1;
+  if (/\bSEE\b|\bCEE\b/.test(t)) return 2;
+  if (/\bDEE\b/.test(t))         return 3;
+  return null;
+}
+
+// ── Speech ────────────────────────────────────────────────────────────────────
+function speak(text, onDone) {
+  if (!window.speechSynthesis) { if (onDone) onDone(); return; }
+  if (micVAD) micVAD.pause();
+  window.speechSynthesis.cancel();
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.lang = 'en-US'; utt.rate = 0.95;
+  utt.onend  = () => { if (onDone) onDone(); else { if (micVAD && !answered) { micVAD.start(); setVADRing('ready'); } } };
+  utt.onerror = () => { if (onDone) onDone(); };
+  window.speechSynthesis.speak(utt);
+}
+
+// ── WAV encoder ───────────────────────────────────────────────────────────────
+function float32ToWav(samples, sampleRate) {
+  const len = samples.length;
+  const buf = new ArrayBuffer(44 + len * 2);
+  const view = new DataView(buf);
+  const w = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  w(0,'RIFF'); view.setUint32(4,36+len*2,true);
+  w(8,'WAVE'); w(12,'fmt ');
+  view.setUint32(16,16,true); view.setUint16(20,1,true);
+  view.setUint16(22,1,true);  view.setUint32(24,sampleRate,true);
+  view.setUint32(28,sampleRate*2,true); view.setUint16(32,2,true);
+  view.setUint16(34,16,true); w(36,'data');
+  view.setUint32(40,len*2,true);
+  let off = 44;
+  for (let i = 0; i < len; i++) {
+    const s = Math.max(-1,Math.min(1,samples[i]));
+    view.setInt16(off, s<0?s*0x8000:s*0x7FFF, true); off+=2;
+  }
+  return new Blob([buf], { type:'audio/wav' });
+}
+</script>
+</body>
+</html>

@@ -17,6 +17,7 @@ from services import whisper_service, reminder_service
 from services import hangman_service
 from config import settings as app_settings
 from services import markdown_service, session_store
+from services import qwen
 from services.qwen import _chat
 from models.schemas import TodoItem, EventItem
 
@@ -109,6 +110,31 @@ async def multiply_page(request: Request):
 @app.get("/games/clock", response_class=HTMLResponse)
 async def clock_page(request: Request):
     return templates.TemplateResponse(request=request, name="clock.html", context={})
+
+
+@app.get("/games/quiz", response_class=HTMLResponse)
+async def quiz_page(request: Request):
+    return templates.TemplateResponse(request=request, name="quiz.html", context={})
+
+
+@app.post("/games/quiz/generate")
+async def quiz_generate(payload: dict):
+    subject = payload.get("subject", "").strip()
+    grade = payload.get("grade")
+    if not subject or grade is None:
+        return JSONResponse({"error": "subject and grade are required"}, status_code=400)
+    try:
+        grade = int(grade)
+        if not 1 <= grade <= 8:
+            raise ValueError
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "grade must be 1–8"}, status_code=400)
+    try:
+        questions = await asyncio.to_thread(qwen.generate_quiz, subject, grade)
+        return JSONResponse({"questions": questions})
+    except Exception as e:
+        logger.error("Quiz generation failed: %s", e)
+        return JSONResponse({"error": "Could not generate quiz. Please try again."}, status_code=500)
 
 
 @app.post("/games/hangman/new")

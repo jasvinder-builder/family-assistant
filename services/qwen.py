@@ -36,6 +36,20 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"No JSON found in response: {text!r}")
 
 
+def _extract_json_array(text: str) -> list:
+    """Extract first valid JSON array from LLM response, tolerating surrounding prose."""
+    decoder = json.JSONDecoder()
+    for i, char in enumerate(text):
+        if char == '[':
+            try:
+                arr, _ = decoder.raw_decode(text, i)
+                if isinstance(arr, list):
+                    return arr
+            except json.JSONDecodeError:
+                continue
+    raise ValueError(f"No JSON array found in response: {text!r}")
+
+
 def _chat(prompt: str) -> str:
     response = httpx.post(
         f"{settings.ollama_base_url}/api/chat",
@@ -137,6 +151,47 @@ def voice_summarize_research(query: str, results: list) -> str:
         results=results_text,
     )
     return _chat(prompt)
+
+
+def generate_quiz(subject: str, grade: int) -> list[dict]:
+    """Generate 10 quiz questions for the given subject and grade level."""
+    age_map = {1: "6", 2: "7", 3: "8", 4: "9", 5: "10", 6: "11", 7: "12", 8: "13"}
+    age = age_map.get(grade, str(grade + 5))
+    prompt = _load_prompt("quiz_generate.txt").format(
+        subject=subject,
+        grade=grade,
+        age_range=f"{age} years old",
+    )
+    response = httpx.post(
+        f"{settings.ollama_base_url}/api/chat",
+        json={
+            "model": settings.ollama_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    raw = response.json()["message"]["content"]
+    questions = _extract_json_array(raw)
+    validated = []
+    for q in questions:
+        if (
+            isinstance(q, dict)
+            and isinstance(q.get("question"), str)
+            and isinstance(q.get("options"), list)
+            and len(q["options"]) == 4
+            and isinstance(q.get("correct"), int)
+            and 0 <= q["correct"] <= 3
+        ):
+            validated.append({
+                "question": q["question"],
+                "options": [str(o) for o in q["options"]],
+                "correct": q["correct"],
+            })
+    if len(validated) < 5:
+        raise ValueError(f"Too few valid questions: {len(validated)}")
+    return validated[:10]
 
 
 def synthesize_research(query: str, results: list) -> str:

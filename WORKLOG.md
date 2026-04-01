@@ -177,6 +177,19 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-03-31 — Session 5
+- Added **Knowledge Quiz** game (`/games/quiz`):
+  - Setup screen: 8 subject tiles (Science, Geography, Music, Arts, Sports, Maths, Nature, Space) + grade buttons 1–8
+  - "Let's Go!" tap unlocks speechSynthesis and triggers Qwen question generation
+  - Loading screen with cycling messages while Qwen runs (~15–25s)
+  - New prompt `prompts/quiz_generate.txt`: enforces kid-safe content, grade-appropriate difficulty, JSON-only output
+  - New `qwen.generate_quiz(subject, grade)` with `_extract_json_array()` helper; validates each question, requires ≥5 valid questions
+  - New `POST /games/quiz/generate` endpoint with grade validation (1–8)
+  - Quiz screen: progress bar, 4 option cards (tap or say A/B/C/D via VAD), random funny correct/wrong phrases (8 variants each)
+  - Final score screen with performance-scaled message; Play Again (reshuffled) or New Quiz
+  - Fixed missing `import qwen` in main.py (was only importing `_chat`)
+- Home page: Knowledge Quiz card added to Games section
+
 ### 2026-03-31 — Session 4
 - Added **Times Tables** game (`/games/multiply`): random A×B questions (1–9), VAD captures spoken answer, spoken number parser handles digits and English words up to 81, score tracking, Fresh Start button
 - Added **Tell the Time** game (`/games/clock`): 4-option multiple choice, 4 SVG analogue clock faces drawn in pure JS (no images/libraries), distractors guaranteed visually distinct, VAD captures A/B/C/D, tapping a clock also accepted, Bianca speaks human-friendly time ("half past 3"), score tracking
