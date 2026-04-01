@@ -455,7 +455,7 @@ async function initVAD() {
       model: 'v5',
       positiveSpeechThreshold: 0.8,
       negativeSpeechThreshold: 0.3,
-      minSpeechMs: 200,
+      minSpeechMs: 600,
       onSpeechStart: () => { if (!isProcessing) { setVADRing('speech'); setVADStatus('Listening...'); } },
       onSpeechEnd: async (audio) => {
         if (isProcessing || answered) return;
@@ -480,7 +480,14 @@ async function transcribeAndAnswer(blob) {
     form.append('audio', blob, 'recording.wav');
     const resp = await fetch('/transcribe', { method: 'POST', body: form });
     const data = await resp.json();
-    const idx  = data.transcript ? parseOption(data.transcript) : null;
+    if (!data.transcript || (data.confidence !== undefined && data.confidence < 0.45)) {
+      isProcessing = false;
+      if (micVAD) micVAD.start();
+      setVADRing('ready');
+      setVADStatus("Didn't catch that — say A, B, C, or D");
+      return;
+    }
+    const idx = parseAnswer(data.transcript, questions[qIndex].options);
     if (idx !== null) {
       submitAnswer(idx);
     } else {
@@ -497,17 +504,36 @@ async function transcribeAndAnswer(blob) {
   }
 }
 
-function parseOption(text) {
-  const t = text.toUpperCase();
-  const map = { A: 0, B: 1, C: 2, D: 3 };
-  for (const [letter, idx] of Object.entries(map)) {
-    if (new RegExp(`\\b${letter}\\b`).test(t)) return idx;
+// Smart answer parser: option text first, then letter matching with filler stripping
+function parseAnswer(text, options) {
+  const t = text.toLowerCase().trim();
+
+  // 1. Option text matching — check if any option text appears in transcript
+  for (let i = 0; i < options.length; i++) {
+    if (t.includes(options[i].toLowerCase())) return i;
   }
+
+  // 2. Strip common filler phrases, then match lone letter or spoken name
+  const stripped = t
+    .replace(/\b(i think|i choose|i pick|i say|the answer is|my answer is|it is|i believe|option|letter|number)\b/gi, '')
+    .trim();
+
   // Spoken letter names
-  if (/\bAY\b/.test(t))          return 0;
-  if (/\bBEE\b/.test(t))         return 1;
-  if (/\bSEE\b|\bCEE\b/.test(t)) return 2;
-  if (/\bDEE\b/.test(t))         return 3;
+  if (/\bay\b/.test(stripped)) return 0;
+  if (/\bbee\b/.test(stripped)) return 1;
+  if (/\b(see|cee)\b/.test(stripped)) return 2;
+  if (/\bdee\b/.test(stripped)) return 3;
+
+  // Single letter A/B/C/D after stripping (require short or boundary match)
+  const letters = ['a', 'b', 'c', 'd'];
+  for (let i = 0; i < letters.length; i++) {
+    if (new RegExp(`\\b${letters[i]}\\b`).test(stripped)) {
+      // For "a", only accept if there's no other content that could be a sentence
+      if (letters[i] === 'a' && stripped.replace(/\ba\b/g, '').trim().length > 3) continue;
+      return i;
+    }
+  }
+
   return null;
 }
 

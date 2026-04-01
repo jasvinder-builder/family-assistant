@@ -437,6 +437,8 @@ Browser (Portal / phone / tablet)
         │   Generates random A×B (A,B ∈ 1–9), speaks question via speechSynthesis
         │   VAD captures spoken answer → /transcribe → parseSpokenNumber()
         │     Handles digits ("24") and English words ("twenty four", "eight")
+        │   Confidence check: transcripts with confidence < 0.45 silently ignored
+        │   minSpeechMs: 600ms to avoid triggering on brief noises
         │   Tracks correct / answered score; Fresh Start resets
         │
         ├─ GET /games/clock → clock.html
@@ -447,7 +449,12 @@ Browser (Portal / phone / tablet)
         │     white face, 12 tick marks, hour numbers at 12/3/6/9,
         │     short thick dark hour hand, long thin purple minute hand
         │   Distractors differ by ≥15 min or different hour (visually distinct)
-        │   VAD captures "A"/"B"/"C"/"D" → /transcribe → parseOption()
+        │   VAD captures spoken answer → /transcribe → parseOption()
+        │     Strips filler phrases ("I think", "the answer is", "letter", etc.)
+        │     Matches: bare letter (A/B/C/D), spoken names (ay/bee/see/dee)
+        │     Conservative "A" guard: only accepts "a" when little other content
+        │   Confidence check: transcripts with confidence < 0.45 silently ignored
+        │   minSpeechMs: 600ms
         │   Tapping a clock card also accepted as answer
         │   Speaks human-friendly time: "half past 3", "quarter to 6", "3 o'clock"
         │   Tracks correct / answered score; Fresh Start resets
@@ -468,6 +475,13 @@ Browser (Portal / phone / tablet)
               Funny response phrases (8 correct, 8 wrong) picked at random
               Final score screen — message scaled to performance, Play Again or New Quiz
             VAD initialised after questions load (not during setup/loading)
+            Voice answer matching — parseAnswer(transcript, options):
+              1. Option text match: if transcript contains any option text, use it
+              2. Filler stripping: removes "I think", "the answer is", "I choose", etc.
+              3. Spoken letter names: ay→A, bee→B, see/cee→C, dee→D
+              4. Single letter match with conservative "A" guard
+            Confidence check: transcripts with confidence < 0.45 silently ignored
+            minSpeechMs: 600ms to prevent accidental triggering
 ```
 
 ---

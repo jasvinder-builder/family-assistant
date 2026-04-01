@@ -340,15 +340,28 @@ function setFeedback(text, type) {
 // ── Voice answer parsing ──────────────────────────────────────────────────────
 
 function parseOption(text) {
-  const t = text.toUpperCase();
-  for (const opt of ['A', 'B', 'C', 'D']) {
-    if (new RegExp(`\\b${opt}\\b`).test(t)) return opt;
+  const t = text.toLowerCase().trim();
+
+  // Strip common filler phrases
+  const stripped = t
+    .replace(/\b(i think|i choose|i pick|i say|the answer is|my answer is|it is|i believe|option|letter)\b/gi, '')
+    .trim();
+
+  // Spoken letter names
+  if (/\bay\b/.test(stripped)) return 'A';
+  if (/\bbee\b/.test(stripped)) return 'B';
+  if (/\b(see|cee)\b/.test(stripped)) return 'C';
+  if (/\bdee\b/.test(stripped)) return 'D';
+
+  // Single letter after stripping
+  const letters = ['a', 'b', 'c', 'd'];
+  for (const l of letters) {
+    if (new RegExp(`\\b${l}\\b`).test(stripped)) {
+      if (l === 'a' && stripped.replace(/\ba\b/g, '').trim().length > 3) continue;
+      return l.toUpperCase();
+    }
   }
-  // Handle spoken words: "ay"→A, "bee"→B, "see"→C, "dee"→D
-  const words = { AY:'A', BEE:'B', SEE:'C', CEE:'C', DEE:'D' };
-  for (const [w, l] of Object.entries(words)) {
-    if (new RegExp(`\\b${w}\\b`).test(t)) return l;
-  }
+
   return null;
 }
 
@@ -362,7 +375,7 @@ async function initVAD() {
       model: 'v5',
       positiveSpeechThreshold: 0.8,
       negativeSpeechThreshold: 0.3,
-      minSpeechMs: 200,
+      minSpeechMs: 600,
       onSpeechStart: () => { if (!isProcessing) { setRing('speech'); setStatus('Listening...'); } },
       onSpeechEnd: async (audio) => {
         if (isProcessing) return;
@@ -388,7 +401,12 @@ async function transcribeAndAnswer(blob) {
     setStatus('Checking...');
     const resp = await fetch('/transcribe', { method: 'POST', body: form });
     const data = await resp.json();
-    const option = data.transcript ? parseOption(data.transcript) : null;
+    if (!data.transcript || (data.confidence !== undefined && data.confidence < 0.45)) {
+      resumeListening();
+      setStatus("Didn't catch that — say A, B, C, or D");
+      return;
+    }
+    const option = parseOption(data.transcript);
     if (option) {
       submitAnswer(option);
     } else {

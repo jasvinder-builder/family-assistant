@@ -188,7 +188,7 @@ async function initVAD() {
       model: 'v5',
       positiveSpeechThreshold: 0.8,
       negativeSpeechThreshold: 0.3,
-      minSpeechMs: 250,
+      minSpeechMs: 600,
       onSpeechStart: () => {
         if (!isProcessing) { setRing('speech'); setStatus('Listening...'); }
       },
@@ -217,16 +217,16 @@ async function transcribeAndCheck(blob) {
     setStatus('Checking...');
     const resp = await fetch('/transcribe', { method: 'POST', body: formData });
     const data = await resp.json();
-    if (data.transcript) {
-      const n = parseSpokenNumber(data.transcript);
-      if (n !== null) {
-        checkAnswer(n);
-      } else {
-        setStatus("Didn't catch a number — try again");
-        resumeListening();
-      }
-    } else {
+    if (!data.transcript || (data.confidence !== undefined && data.confidence < 0.45)) {
       setStatus("Didn't catch that — try again");
+      resumeListening();
+      return;
+    }
+    const n = parseSpokenNumber(data.transcript);
+    if (n !== null) {
+      checkAnswer(n);
+    } else {
+      setStatus("Didn't catch a number — try again");
       resumeListening();
     }
   } catch (e) {

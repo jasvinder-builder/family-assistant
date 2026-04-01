@@ -177,6 +177,18 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-03-31 — Session 6
+- Improved voice answer detection across all three kids' games:
+  - `minSpeechMs` raised to 600ms in quiz.html, clock.html, multiply.html — prevents accidental triggering on brief noises or background sounds
+  - Whisper confidence check added (threshold 0.45): low-confidence transcripts silently discarded; VAD resumes listening instead of acting on noise
+  - **quiz.html** — replaced `parseOption()` with `parseAnswer(transcript, options)`:
+    1. Option text matching first: if any option text appears in the transcript, match it directly (e.g. "I think Paris" → selects Paris option)
+    2. Filler stripping: removes "I think", "the answer is", "I choose", "I pick", "letter", "option", etc.
+    3. Spoken letter names: ay→A, bee→B, see/cee→C, dee→D
+    4. Conservative "A" guard: bare "a" only accepted when minimal other content (avoids false matches on sentences containing "a")
+  - **clock.html** — `parseOption()` updated with same filler stripping and conservative "A" guard
+  - **multiply.html** — confidence check added; `parseSpokenNumber()` already robust
+
 ### 2026-03-31 — Session 5
 - Added **Knowledge Quiz** game (`/games/quiz`):
   - Setup screen: 8 subject tiles (Science, Geography, Music, Arts, Sports, Maths, Nature, Space) + grade buttons 1–8
