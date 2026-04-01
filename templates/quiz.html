@@ -508,10 +508,15 @@ async function transcribeAndAnswer(blob) {
 function parseAnswer(text, options) {
   const t = text.toLowerCase().trim();
 
-  // 1. Option text matching — check if any option text appears in transcript
+  // 1. Option text matching — find the option whose text appears LAST in the
+  //    transcript (rightmost position). The answer is always spoken at the end;
+  //    earlier occurrences are likely Whisper echoing the question being read aloud.
+  let bestIdx = null, bestPos = -1;
   for (let i = 0; i < options.length; i++) {
-    if (t.includes(options[i].toLowerCase())) return i;
+    const pos = t.lastIndexOf(options[i].toLowerCase());
+    if (pos !== -1 && pos > bestPos) { bestPos = pos; bestIdx = i; }
   }
+  if (bestIdx !== null) return bestIdx;
 
   // 2. Strip common filler phrases, then match lone letter or spoken name
   const stripped = t
