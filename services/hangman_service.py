@@ -122,9 +122,19 @@ class HangmanGame:
         }
 
 
+def _hint_count(length: int) -> int:
+    """Letters to reveal upfront: 0 for ≤4, then +1 per letter, capped at 3."""
+    return max(0, min(length - 4, 3))
+
+
 def new_game() -> HangmanGame:
     sid = str(uuid.uuid4())
-    game = HangmanGame(session_id=sid, word=random.choice(WORDS))
+    word = random.choice(WORDS)
+    game = HangmanGame(session_id=sid, word=word)
+    n = _hint_count(len(word))
+    if n > 0:
+        hints = random.sample(list(set(word)), min(n, len(set(word))))
+        game.guessed.update(hints)
     _games[sid] = game
     return game
 
@@ -206,4 +216,7 @@ def _guess_word(game: HangmanGame, word: str) -> dict:
 
 def _intro(game: HangmanGame) -> str:
     length = len(game.word)
+    revealed = sorted(c.upper() for c in game.guessed if c in game.word)
+    if revealed:
+        return f"The word has {length} letters. I've revealed {', '.join(revealed)} to help you start. Guess a letter!"
     return f"The word has {length} letters. Guess a letter!"

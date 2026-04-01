@@ -45,8 +45,8 @@ Talk to Bianca (/talk)          Family Dashboard (/dashboard)
 │  │ skies with a high...│ │    │   |   |   Wrong: X Z         │
 │  └─────────────────────┘ │    │  /|   |                      │
 │                          │    │       |   💬 No X. 4 guesses  │
-│         [ 🎙️ ]           │    │   =========                  │
-│  Auto-stops after 2s     │    │ [ 🎙️ ] say "letter A"        │
+│  Auto-stops after 2s     │    │ say "letter A" or "word X"   │
+│  Just speak — no tap     │    │ Just speak — no tap          │
 └──────────────────────────┘    └──────────────────────────────┘
 ```
 
@@ -63,9 +63,9 @@ Talk to Bianca (/talk)          Family Dashboard (/dashboard)
 - **Image search** — Results sent to WhatsApp
 
 **Via browser (any device on your network):**
-- **Talk to Bianca** — same features as phone, microphone in the browser, no call needed
+- **Talk to Bianca** — same features as phone; mic auto-detects your voice (no tap needed) using Silero VAD running locally in the browser
 - **Family Dashboard** — view, add, edit, and delete todos and events
-- **Hangman** — voice-controlled word game for kids, runs in the browser
+- **Hangman** — voice-controlled word game for kids; just speak your guess, no tap required
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events

@@ -76,10 +76,14 @@ async def talk(request: Request):
 
 @app.post("/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):
-    """Receive browser MediaRecorder audio blob, transcribe via local Whisper."""
+    """Receive browser audio blob (webm or wav), transcribe via local Whisper."""
     audio_bytes = await audio.read()
+    filename = audio.filename or "recording.webm"
+    suffix = os.path.splitext(filename)[1].lower()
+    if suffix not in (".webm", ".wav", ".mp3", ".ogg", ".m4a"):
+        suffix = ".webm"
     transcript, confidence = await asyncio.to_thread(
-        whisper_service.transcribe, audio_bytes, ".webm"
+        whisper_service.transcribe, audio_bytes, suffix
     )
     return JSONResponse({"transcript": transcript, "confidence": round(confidence, 2)})
 
@@ -95,6 +99,16 @@ async def chat(payload: dict):
 @app.get("/games/hangman", response_class=HTMLResponse)
 async def hangman_page(request: Request):
     return templates.TemplateResponse(request=request, name="hangman.html", context={})
+
+
+@app.get("/games/multiply", response_class=HTMLResponse)
+async def multiply_page(request: Request):
+    return templates.TemplateResponse(request=request, name="multiply.html", context={})
+
+
+@app.get("/games/clock", response_class=HTMLResponse)
+async def clock_page(request: Request):
+    return templates.TemplateResponse(request=request, name="clock.html", context={})
 
 
 @app.post("/games/hangman/new")

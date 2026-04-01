@@ -177,6 +177,23 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-03-31 — Session 4
+- Added **Times Tables** game (`/games/multiply`): random A×B questions (1–9), VAD captures spoken answer, spoken number parser handles digits and English words up to 81, score tracking, Fresh Start button
+- Added **Tell the Time** game (`/games/clock`): 4-option multiple choice, 4 SVG analogue clock faces drawn in pure JS (no images/libraries), distractors guaranteed visually distinct, VAD captures A/B/C/D, tapping a clock also accepted, Bianca speaks human-friendly time ("half past 3"), score tracking
+- Hangman: pre-reveal hint letters at game start — 0 hints for ≤4-letter words, +1 per letter above 4, capped at 3; `_hint_count()` added to `hangman_service.py`
+- Home page: games section moved to top, assistant cards moved to bottom; hero header made compact (1.5rem, reduced padding); Games/Assistant section labels added
+- All new games follow same VAD + speech-unlock pattern as Talk to Bianca and Hangman
+
+### 2026-03-31 — Session 3
+- Replaced tap-to-record + manual `AnalyserNode` silence detection with `@ricky0123/vad-web` (Silero VAD via ONNX Runtime Web)
+- VAD runs entirely on the client device (phone/tablet CPU via WASM) — no audio sent to server until speech detected
+- Removed mic button from `talk.html` and `hangman.html`; voice is always listening after page load
+- Added animated ring indicator showing loading / listening / speech-detected / processing states
+- VAD paused during TTS playback to prevent Bianca's voice feeding back into Whisper
+- Hangman: VAD stays active after game over so players can say "new game" without tapping
+- Updated `/transcribe` endpoint in `main.py` to detect audio format from filename (`.wav` or `.webm`) instead of hardcoding `.webm`; VAD delivers Float32Array encoded to WAV client-side
+- CDN versions pinned: `@ricky0123/vad-web@0.0.30`, `onnxruntime-web@1.22.0` (must match — 1.22.0 is the ORT version bundled inside vad-web 0.0.30)
+
 ---
 
 ## Open Questions / Future Ideas

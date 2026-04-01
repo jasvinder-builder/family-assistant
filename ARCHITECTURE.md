@@ -39,6 +39,8 @@ Bianca is a family productivity assistant with two interfaces: phone calls (via 
 │                                   GET  /games/hangman                  │
 │                                   POST /games/hangman/new              │
 │                                   POST /games/hangman/guess            │
+│                                   GET  /games/multiply                 │
+│                                   GET  /games/clock                    │
 │                                   GET  /health                         │
 └───────────────┬────────────────────────────────────────────────────────┘
                 │
@@ -379,7 +381,7 @@ Edit (todo or event) is handled client-side:
 
 ## Browser Interface Flow
 
-Family members open the browser interface on any device on the local network. The Talk and Hangman pages require HTTPS (use the ngrok URL) because `MediaRecorder` mic access requires a secure context.
+Family members open the browser interface on any device on the local network. The Talk and Hangman pages require HTTPS (use the ngrok URL) because mic access and WASM require a secure context.
 
 ```
 Browser (Portal / phone / tablet)
@@ -387,12 +389,16 @@ Browser (Portal / phone / tablet)
         ├─ GET /          → home.html  (card grid: Talk, Dashboard, Hangman)
         │
         ├─ GET /talk       → talk.html
-        │   User taps mic → MediaRecorder captures audio
-        │   User taps stop (or 2s silence auto-stop via AnalyserNode)
+        │   Page loads → Silero VAD initialises (ONNX model downloaded from CDN,
+        │                 cached after first load, runs on device CPU via WASM)
+        │   VAD listens continuously — no tap required
+        │   User speaks → onSpeechEnd(Float32Array @ 16kHz)
+        │     VAD paused while processing (prevents feedback loop with TTS)
         │        │
         │        ▼
-        │   POST /transcribe  (audio blob, webm/opus)
-        │     asyncio.to_thread(whisper_service.transcribe, bytes, ".webm")
+        │   Float32Array encoded to WAV in browser (float32ToWav)
+        │   POST /transcribe  (audio/wav blob)
+        │     asyncio.to_thread(whisper_service.transcribe, bytes, ".wav")
         │     → {transcript, confidence}
         │        │
         │        ▼
@@ -404,6 +410,7 @@ Browser (Portal / phone / tablet)
         │        │
         │        ▼
         │   speechSynthesis.speak(speech)     ← browser reads aloud
+        │   VAD resumes after TTS finishes (onend callback)
         │   Show display text in Full Answer panel (research only)
         │
         ├─ GET /dashboard  → dashboard.html
@@ -411,15 +418,37 @@ Browser (Portal / phone / tablet)
         │   All mutations via JSON POST, reload on success
         │   Auto-refreshes every 30s
         │
-        └─ GET /games/hangman → hangman.html
-            POST /games/hangman/new    → new HangmanGame (random word)
-            POST /games/hangman/guess  {session_id, guess}
-              hangman_service.guess()
-              Accepts: "letter A", "word elephant", bare single letter
-              Strips punctuation + spoken prefixes before matching
-              → {display_word, wrong_letters, figure, speech, won, lost}
-            speechSynthesis.speak(speech)  ← reads result aloud
-            Mic re-enabled only after speech finishes (onend callback)
+        ├─ GET /games/hangman → hangman.html
+        │   Same VAD auto-detection as /talk
+        │   POST /games/hangman/new    → new HangmanGame (random word)
+        │     hangman_service.new_game() pre-reveals hint letters based on word length:
+        │       ≤4 letters → 0 hints, 5→1, 6→2, 7+→3 (randomly chosen distinct letters)
+        │   POST /games/hangman/guess  {session_id, guess}
+        │     hangman_service.guess()
+        │     Accepts: "letter A", "word elephant", bare single letter
+        │     → {display_word, wrong_letters, figure, speech, won, lost}
+        │   VAD stays active after game over — player can say "new game"
+        │
+        ├─ GET /games/multiply → multiply.html
+        │   Times Tables practice game for kids
+        │   All logic client-side — no new backend endpoints
+        │   Generates random A×B (A,B ∈ 1–9), speaks question via speechSynthesis
+        │   VAD captures spoken answer → /transcribe → parseSpokenNumber()
+        │     Handles digits ("24") and English words ("twenty four", "eight")
+        │   Tracks correct / answered score; Fresh Start resets
+        │
+        └─ GET /games/clock → clock.html
+            Tell the Time game — 4-option multiple choice
+            All logic client-side — no new backend endpoints
+            Generates random time (hour 1–12, minute in multiples of 5)
+            Renders 4 SVG analogue clock faces (pure JS, no images/libraries):
+              white face, 12 tick marks, hour numbers at 12/3/6/9,
+              short thick dark hour hand, long thin purple minute hand
+            Distractors differ by ≥15 min or different hour (visually distinct)
+            VAD captures "A"/"B"/"C"/"D" → /transcribe → parseOption()
+            Tapping a clock card also accepted as answer
+            Speaks human-friendly time: "half past 3", "quarter to 6", "3 o'clock"
+            Tracks correct / answered score; Fresh Start resets
 ```
 
 ---
@@ -467,9 +496,11 @@ family-assistant/
 │   └── research_synthesize.txt  Full Markdown summary for WhatsApp / browser display
 │
 └── templates/
-    ├── home.html              Landing page — Bootstrap card grid
-    ├── talk.html              Browser voice interface — MediaRecorder + Whisper STT
-    ├── hangman.html           Voice hangman game — silence detection, prefix enforcement
+    ├── home.html              Landing page — games section (top) + assistant section (bottom)
+    ├── talk.html              Browser voice interface — Silero VAD + Whisper STT, no tap needed
+    ├── hangman.html           Voice hangman — VAD, hint letters pre-revealed at start
+    ├── multiply.html          Times Tables game — VAD, spoken number parsing, score tracking
+    ├── clock.html             Tell the Time game — SVG clocks, 4-option MCQ, VAD
     └── dashboard.html         Editable family dashboard — Bootstrap 5, vanilla JS
 ```
 
@@ -481,7 +512,7 @@ family-assistant/
 |---|---|---|
 | Phone calls | Twilio (inbound PSTN) | Handles carrier complexity, webhooks, TTS |
 | Phone TTS | AWS Polly via Twilio (`Polly.Joanna`) | Natural voice, no extra integration |
-| Browser mic | `MediaRecorder` API | Works on all modern browsers, no plugins |
+| Browser mic + VAD | `@ricky0123/vad-web` (Silero VAD, ONNX Runtime Web) | ML-based voice detection, runs on device, no tap needed |
 | Browser TTS | `speechSynthesis` API | Built-in, no server round-trip |
 | Speech-to-text | faster-whisper `large-v3` on CUDA | Free, accurate, used for both phone and browser |
 | LLM | Qwen 2.5:14b via Ollama | Strong reasoning, runs fully locally |
