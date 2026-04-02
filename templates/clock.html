@@ -56,8 +56,10 @@
     }
     #voice-ring.loading    { background: #f3f4f6; }
     #voice-ring.ready      { background: #ede9fe; }
+    #voice-ring.speaking   { background: #dbeafe; }
     #voice-ring.speech     { background: #7c3aed; animation: ripple 1s infinite; }
     #voice-ring.processing { background: #9ca3af; }
+    #heard { font-size: 0.75rem; color: #9ca3af; min-height: 1rem; font-style: italic; }
     @keyframes ripple {
       0%,100% { box-shadow: 0 0 0 0 rgba(124,58,237,0.35); }
       50%      { box-shadow: 0 0 0 14px rgba(124,58,237,0); }
@@ -128,7 +130,7 @@
   <div id="voice-section" class="text-center mb-2 d-none">
     <div id="voice-ring" class="loading">🎙️</div>
     <div id="status" class="mt-1">Loading voice engine...</div>
-    <div class="text-muted small mt-1">Say A, B, C, or D — or tap a clock</div>
+    <div id="heard" class="mt-1"></div>
   </div>
 
 </div>
@@ -408,6 +410,7 @@ async function transcribeAndAnswer(blob) {
       setStatus("Didn't catch that — say A, B, C, or D");
       return;
     }
+    document.getElementById('heard').textContent = `Heard: "${data.transcript}"`;
     const option = parseOption(data.transcript);
     if (option) {
       submitAnswer(option);
@@ -423,6 +426,7 @@ async function transcribeAndAnswer(blob) {
 
 function resumeListening() {
   isProcessing = false;
+  document.getElementById('heard').textContent = '';
   if (micVAD) micVAD.start();
   setRing('ready');
   setStatus('Say A, B, C, or D — or tap a clock');
@@ -432,10 +436,22 @@ function speak(text, onDone) {
   if (!window.speechSynthesis) { if (onDone) onDone(); return; }
   if (micVAD) micVAD.pause();
   window.speechSynthesis.cancel();
+  setRing('speaking');
+  setStatus('Bianca is speaking...');
   const utt = new SpeechSynthesisUtterance(text);
   utt.lang = 'en-US'; utt.rate = 0.92;
-  utt.onend  = () => { if (onDone) onDone(); else resumeListening(); };
-  utt.onerror = () => { if (onDone) onDone(); else resumeListening(); };
+  // Watchdog: speechSynthesis.onend is unreliable on mobile browsers.
+  // If it never fires, force resume after estimated duration + 3s buffer.
+  let fired = false;
+  const watchdog = setTimeout(() => {
+    if (!fired) { fired = true; if (onDone) onDone(); else resumeListening(); }
+  }, Math.ceil(text.length / 15) * 1000 + 3000);
+  utt.onend = () => {
+    if (!fired) { fired = true; clearTimeout(watchdog); if (onDone) onDone(); else resumeListening(); }
+  };
+  utt.onerror = () => {
+    if (!fired) { fired = true; clearTimeout(watchdog); if (onDone) onDone(); else resumeListening(); }
+  };
   window.speechSynthesis.speak(utt);
 }
 

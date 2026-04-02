@@ -91,8 +91,10 @@
     }
     #voice-ring.loading    { background: #f3f4f6; }
     #voice-ring.ready      { background: #fed7aa; }
+    #voice-ring.speaking   { background: #dbeafe; }
     #voice-ring.speech     { background: #ea580c; animation: ripple 1s infinite; }
     #voice-ring.processing { background: #9ca3af; }
+    #heard { font-size: 0.75rem; color: #9ca3af; min-height: 1rem; font-style: italic; }
     @keyframes ripple {
       0%,100% { box-shadow: 0 0 0 0 rgba(234,88,12,0.35); }
       50%      { box-shadow: 0 0 0 12px rgba(234,88,12,0); }
@@ -196,7 +198,7 @@
   <div class="text-center">
     <div id="voice-ring" class="loading">🎙️</div>
     <div id="vad-status" class="mt-1">Loading voice engine...</div>
-    <div class="text-muted small">Say A, B, C, or D — or tap an option</div>
+    <div id="heard" class="mt-1"></div>
   </div>
 
 </div>
@@ -477,6 +479,7 @@ async function initVAD() {
 
 function resumeListening(msg) {
   isProcessing = false;
+  document.getElementById('heard').textContent = '';
   if (micVAD) micVAD.start();
   setVADRing('ready');
   setVADStatus(msg || 'Say A, B, C, or D — or tap an option');
@@ -492,6 +495,7 @@ async function transcribeAndAnswer(blob) {
       resumeListening("Didn't catch that — say A, B, C, or D");
       return;
     }
+    document.getElementById('heard').textContent = `Heard: "${data.transcript}"`;
 
     // Fast local parse first
     let idx = parseAnswer(data.transcript, questions[qIndex].options);
@@ -563,10 +567,22 @@ function speak(text, onDone) {
   if (!window.speechSynthesis) { if (onDone) onDone(); return; }
   if (micVAD) micVAD.pause();
   window.speechSynthesis.cancel();
+  setVADRing('speaking');
+  setVADStatus('Bianca is speaking...');
   const utt = new SpeechSynthesisUtterance(text);
   utt.lang = 'en-US'; utt.rate = 0.95;
-  utt.onend  = () => { if (onDone) onDone(); else { if (micVAD && !answered) { micVAD.start(); setVADRing('ready'); setVADStatus('Say A, B, C, or D — or tap an option'); } } };
-  utt.onerror = () => { if (onDone) onDone(); };
+  // Watchdog: speechSynthesis.onend is unreliable on mobile browsers.
+  // If it never fires, force resume after estimated duration + 3s buffer.
+  let fired = false;
+  const watchdog = setTimeout(() => {
+    if (!fired) { fired = true; if (onDone) onDone(); else if (micVAD && !answered) { micVAD.start(); setVADRing('ready'); setVADStatus('Say A, B, C, or D — or tap an option'); } }
+  }, Math.ceil(text.length / 15) * 1000 + 3000);
+  utt.onend = () => {
+    if (!fired) { fired = true; clearTimeout(watchdog); if (onDone) onDone(); else { if (micVAD && !answered) { micVAD.start(); setVADRing('ready'); setVADStatus('Say A, B, C, or D — or tap an option'); } } }
+  };
+  utt.onerror = () => {
+    if (!fired) { fired = true; clearTimeout(watchdog); if (onDone) onDone(); else { if (micVAD && !answered) { micVAD.start(); setVADRing('ready'); setVADStatus('Say A, B, C, or D — or tap an option'); } } }
+  };
   window.speechSynthesis.speak(utt);
 }
 
