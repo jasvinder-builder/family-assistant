@@ -40,16 +40,33 @@ def _extract_json(text: str) -> dict:
 
 
 def _extract_json_array(text: str) -> list:
-    """Extract first valid JSON array from LLM response, tolerating surrounding prose."""
+    """Extract first valid JSON array from LLM response, tolerating surrounding prose.
+
+    Handles two common Qwen output patterns:
+    1. Proper array:  [ {...}, {...} ]
+    2. Bare objects:  {...}, {...}   (missing surrounding brackets)
+    """
     decoder = json.JSONDecoder()
+    # Pattern 1: find a [ and parse from there — must contain at least one dict
+    # (skips option sub-arrays like ["A", "B", "C", "D"])
     for i, char in enumerate(text):
         if char == '[':
             try:
                 arr, _ = decoder.raw_decode(text, i)
-                if isinstance(arr, list):
+                if isinstance(arr, list) and any(isinstance(x, dict) for x in arr):
                     return arr
             except json.JSONDecodeError:
                 continue
+    # Pattern 2: no brackets — find from first { to last } and wrap
+    first = text.find('{')
+    last = text.rfind('}')
+    if first != -1 and last != -1 and last > first:
+        try:
+            arr = json.loads('[' + text[first:last + 1] + ']')
+            if isinstance(arr, list):
+                return arr
+        except json.JSONDecodeError:
+            pass
     raise ValueError(f"No JSON array found in response: {text!r}")
 
 
