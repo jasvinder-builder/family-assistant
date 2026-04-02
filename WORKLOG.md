@@ -177,6 +177,14 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-01 — Session 8
+- **Root cause: `speechSynthesis.onend` unreliable on mobile browsers** — when TTS finishes but `onend` silently never fires, `resumeListening()` is never called, VAD stays paused, ring shows "ready" but nothing is actually listening. This was the main cause of "stuck in listening state" in clock and quiz games.
+- **Fix: TTS watchdog timer** added to `speak()` in clock.html and quiz.html — estimates TTS duration (`text.length / 15` seconds) + 3s buffer, then force-calls the resume logic if `onend` hasn't fired. Clears itself if `onend` fires normally.
+- **Fix: "Bianca is speaking" ring state** — light blue ring + "Bianca is speaking..." status text while TTS plays, so user knows not to speak yet. Previously ring showed "ready" during TTS which was misleading.
+- **Fix: show heard transcript** — after Whisper transcribes, show `Heard: "..."` below the ring so user can see exactly what was detected. Cleared when next listening cycle begins. Gives users immediate feedback to self-correct ("I heard: see you later" → user understands why and tries "letter C").
+- **Key learning — production voice robustness:** production apps don't have smarter VAD — they treat every async operation as potentially failing silently. Rule: *if a state can be entered, a timer or fallback must be able to exit it*, not just an event that might never fire. Apply this to any future async state transitions.
+- **Key learning — `speechSynthesis.onend` on mobile:** cannot be relied on. Always pair with a watchdog timer. Estimate duration as `(text.length / 15) * 1000 + 3000ms`.
+
 ### 2026-04-01 — Session 7
 - **Root cause fix: VAD capturing TTS audio in games** (diagnosed from logs)
   - quiz.html: `nextQuestion()` was calling `micVAD.start()` immediately after `showQuestion()` (which calls `speak()` → pauses VAD), re-enabling VAD while TTS was still playing. Whisper was then transcribing the full 10–16s question as user speech. Fixed by removing `micVAD.start()` from `nextQuestion()` — `speak()`'s `onend` callback already calls `resumeListening()`.
