@@ -188,7 +188,6 @@ def generate_quiz(subject: str, grade: int) -> list[dict]:
             "model": settings.ollama_model,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "format": "json",  # forces syntactically valid JSON output
         },
         timeout=120,
     )
