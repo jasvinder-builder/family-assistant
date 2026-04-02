@@ -1,23 +1,34 @@
-You are a friendly quiz generator for children. Create a quiz for a child in Grade {grade} ({age_range}) about {subject}.
+Generate exactly 10 multiple-choice quiz questions for a child in Grade {grade} ({age_range}) about {subject}.
 
-Generate exactly 10 multiple-choice questions. Return ONLY a valid JSON array — no introduction, no explanation, no markdown, no code blocks. Start your response with [ and end with ].
+Return ONLY a JSON array. No introduction, no explanation, no markdown, no code blocks. Your entire response must start with [ and end with ].
 
-Each question must use this exact structure:
-{{"question": "question text", "options": ["option A", "option B", "option C", "option D"], "correct": 0}}
+Here is the exact format — follow it precisely:
 
-"correct" is the index (0, 1, 2, or 3) of the correct answer in the options array.
+[
+  {{
+    "question": "What colour is the sky on a clear day?",
+    "options": ["Red", "Blue", "Green", "Yellow"],
+    "correct": 1
+  }},
+  {{
+    "question": "How many legs does a dog have?",
+    "options": ["2", "4", "6", "8"],
+    "correct": 1
+  }}
+]
 
-Requirements:
-- All content must be 100% safe for children — no violence, no scary content, no adult themes, no profanity
-- Questions should be fun, educational, and interesting for the age group
-- Make all 4 options plausible, but only one clearly correct
-- Vary which position (0, 1, 2, or 3) holds the correct answer across questions
-- Use simple, clear language appropriate for Grade {grade}
+Rules:
+- "correct" must always be an integer: 0, 1, 2, or 3. Never a letter (not "A"), never a string (not "2").
+- "options" must always be an array of exactly 4 strings.
+- All 4 options must be plausible — only one is correct.
+- Vary which position (0, 1, 2, or 3) holds the correct answer across the 10 questions.
+- All content must be 100% safe and appropriate for children.
+- Use simple, clear language suitable for Grade {grade}.
 
 Grade level guidance:
-- Grade 1-2: very basic facts, familiar everyday topics, simple single-syllable words where possible
-- Grade 3-4: general knowledge, slightly more detail, common facts a child would know
-- Grade 5-6: broader knowledge, some reasoning, topics from school curriculum
+- Grade 1-2: very basic facts, familiar everyday topics
+- Grade 3-4: general knowledge, common facts a child would know
+- Grade 5-6: broader knowledge, some reasoning, school curriculum topics
 - Grade 7-8: more depth, abstract concepts, topics requiring study
 
-Return ONLY the JSON array. No other text.
+Now generate 10 questions about {subject} for Grade {grade}. Start your response with [
