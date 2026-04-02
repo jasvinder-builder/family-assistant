@@ -177,6 +177,25 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-01 — Session 7
+- **Root cause fix: VAD capturing TTS audio in games** (diagnosed from logs)
+  - quiz.html: `nextQuestion()` was calling `micVAD.start()` immediately after `showQuestion()` (which calls `speak()` → pauses VAD), re-enabling VAD while TTS was still playing. Whisper was then transcribing the full 10–16s question as user speech. Fixed by removing `micVAD.start()` from `nextQuestion()` — `speak()`'s `onend` callback already calls `resumeListening()`.
+  - clock.html: `initVAD()` is async but wasn't awaited in `startGame()`, so the first question's TTS started before VAD was initialised; VAD came up mid-TTS. Fixed by `await initVAD()`.
+  - All three games: added audio duration guard in `onSpeechEnd` — reject clips > 5s (quiz), > 4s (clock), > 3s (multiply). TTS echo is always long; real answers are always short.
+- **Qwen fallback for quiz answer matching** — new `POST /games/resolve-answer` endpoint; if client-side `parseAnswer()` returns null, Qwen resolves the transcript against the 4 options. Handles natural language like "I think it's the blue whale". Fast path stays local; Qwen only activates when needed.
+- **Fixed multiply game parsing wrong answer** — `parseSpokenNumber` was taking the first digit match. "It is 8 times 9. 72." → returned 8 instead of 72 (Whisper hallucinated the question into the transcript). Fixed to take the last digit/word match.
+- **Quiz generation failures diagnosed and fixed:**
+  - Qwen returning `"correct": "2"` (string) or `"correct": "B"` (letter) instead of integer — strict `isinstance(correct, int)` check dropped every question → "Too few valid questions: 0". Fixed with coercion for string digits and letter answers.
+  - Qwen omitting surrounding `[ ]` brackets — outputting bare comma-separated objects. Fixed `_extract_json_array()` with a fallback that wraps first-`{` to last-`}` in brackets. Also tightened pattern 1 to require at least one dict (prevents matching option sub-arrays like `["A","B","C","D"]`).
+  - Added logging of raw Qwen output when validation fails, making future failures diagnosable without guessing.
+  - Rewrote `quiz_generate.txt` prompt with a concrete 2-question array example and explicit `"correct" must be an integer, never a string or letter"` rule — addresses both failure modes at source.
+  - `format:"json"` Ollama parameter tried and reverted — caused Qwen to return only 1 question instead of 10.
+- **Replaced Maths with US Geography and World Geography** — Maths generates ambiguous questions (e.g. both 29 and 31 are prime in the same question). Geography facts are unambiguous, single-answer, and Qwen handles them reliably.
+- **Confidence threshold lowered to 0.30 for clock and quiz** — single-letter answers (A/B/C/D) consistently score 0.33–0.44 confidence; the 0.45 threshold was silently rejecting real answers. Duration guard handles TTS echo; 0.30 still blocks pure silence/noise.
+- **Key learning — VAD + speechSynthesis interaction:** always `await initVAD()` before first TTS call; never call `micVAD.start()` after a `speak()` call — `speak()` owns the resume cycle via its `onend` callback.
+- **Key learning — Whisper confidence on short answers:** single letters score 0.33–0.44 by design; a high confidence threshold blocks legitimate short answers. Duration guard is a better primary filter than confidence for these games.
+- **Key learning — Qwen JSON output:** never rely on `format:"json"` for array output from Qwen (breaks generation length). Use a concrete example in the prompt + code-level coercion as defence-in-depth.
+
 ### 2026-03-31 — Session 6
 - Improved voice answer detection across all three kids' games:
   - `minSpeechMs` raised to 600ms in quiz.html, clock.html, multiply.html — prevents accidental triggering on brief noises or background sounds
