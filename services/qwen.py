@@ -1,8 +1,11 @@
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 from config import settings
 from models.schemas import IntentResult, TodoItem, EventItem
@@ -175,21 +178,35 @@ def generate_quiz(subject: str, grade: int) -> list[dict]:
     raw = response.json()["message"]["content"]
     questions = _extract_json_array(raw)
     validated = []
+    letter_to_idx = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
     for q in questions:
-        if (
-            isinstance(q, dict)
-            and isinstance(q.get("question"), str)
-            and isinstance(q.get("options"), list)
-            and len(q["options"]) == 4
-            and isinstance(q.get("correct"), int)
-            and 0 <= q["correct"] <= 3
-        ):
-            validated.append({
-                "question": q["question"],
-                "options": [str(o) for o in q["options"]],
-                "correct": q["correct"],
-            })
+        if not isinstance(q, dict):
+            continue
+        if not isinstance(q.get("question"), str):
+            continue
+        opts = q.get("options")
+        if not isinstance(opts, list) or len(opts) != 4:
+            continue
+        # Coerce "correct" — Qwen sometimes returns "2" (string) or "B" (letter) instead of 2 (int)
+        raw_correct = q.get("correct")
+        correct_idx = None
+        if isinstance(raw_correct, int):
+            correct_idx = raw_correct
+        elif isinstance(raw_correct, str):
+            if raw_correct.strip() in letter_to_idx:
+                correct_idx = letter_to_idx[raw_correct.strip()]
+            elif raw_correct.strip().isdigit():
+                correct_idx = int(raw_correct.strip())
+        if correct_idx is None or not (0 <= correct_idx <= 3):
+            logger.warning("quiz: dropping question with invalid correct=%r: %s", raw_correct, q.get("question", "")[:60])
+            continue
+        validated.append({
+            "question": q["question"],
+            "options": [str(o) for o in opts],
+            "correct": correct_idx,
+        })
     if len(validated) < 5:
+        logger.error("quiz: too few valid questions (%d). Raw output:\n%s", len(validated), raw[:500])
         raise ValueError(f"Too few valid questions: {len(validated)}")
     return validated[:10]
 
