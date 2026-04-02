@@ -488,7 +488,7 @@ async function transcribeAndAnswer(blob) {
     form.append('audio', blob, 'recording.wav');
     const resp = await fetch('/transcribe', { method: 'POST', body: form });
     const data = await resp.json();
-    if (!data.transcript || (data.confidence !== undefined && data.confidence < 0.45)) {
+    if (!data.transcript || (data.confidence !== undefined && data.confidence < 0.30)) {
       resumeListening("Didn't catch that — say A, B, C, or D");
       return;
     }
