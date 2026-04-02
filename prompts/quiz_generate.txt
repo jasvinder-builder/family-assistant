@@ -31,4 +31,9 @@ Grade level guidance:
 - Grade 5-6: broader knowledge, some reasoning, school curriculum topics
 - Grade 7-8: more depth, abstract concepts, topics requiring study
 
+Subject guidance:
+- US Geography: US states, capitals, rivers, landmarks, regions, presidents, US history facts
+- World Geography: countries, capitals, continents, oceans, mountains, flags, world landmarks
+- For geography questions: always ask about a single clear fact with one unambiguous correct answer
+
 Now generate 10 questions about {subject} for Grade {grade}. Start your response with [
