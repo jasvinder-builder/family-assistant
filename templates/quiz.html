@@ -385,9 +385,8 @@ function nextQuestion() {
   } else {
     isProcessing = false;
     showQuestion();
-    if (micVAD) micVAD.start();
-    setVADRing('ready');
-    setVADStatus('Say A, B, C, or D — or tap an option');
+    // DO NOT start VAD here — speak() inside showQuestion() already pauses it,
+    // and its onend callback restarts it after TTS finishes.
   }
 }
 
@@ -459,6 +458,8 @@ async function initVAD() {
       onSpeechStart: () => { if (!isProcessing) { setVADRing('speech'); setVADStatus('Listening...'); } },
       onSpeechEnd: async (audio) => {
         if (isProcessing || answered) return;
+        // Reject long audio — TTS echo is typically 8-16s; a real answer is < 5s
+        if (audio.length / 16000 > 5) return;
         micVAD.pause();
         setVADRing('processing');
         await transcribeAndAnswer(float32ToWav(audio, 16000));
@@ -474,6 +475,13 @@ async function initVAD() {
   }
 }
 
+function resumeListening(msg) {
+  isProcessing = false;
+  if (micVAD) micVAD.start();
+  setVADRing('ready');
+  setVADStatus(msg || 'Say A, B, C, or D — or tap an option');
+}
+
 async function transcribeAndAnswer(blob) {
   try {
     const form = new FormData();
@@ -481,26 +489,34 @@ async function transcribeAndAnswer(blob) {
     const resp = await fetch('/transcribe', { method: 'POST', body: form });
     const data = await resp.json();
     if (!data.transcript || (data.confidence !== undefined && data.confidence < 0.45)) {
-      isProcessing = false;
-      if (micVAD) micVAD.start();
-      setVADRing('ready');
-      setVADStatus("Didn't catch that — say A, B, C, or D");
+      resumeListening("Didn't catch that — say A, B, C, or D");
       return;
     }
-    const idx = parseAnswer(data.transcript, questions[qIndex].options);
+
+    // Fast local parse first
+    let idx = parseAnswer(data.transcript, questions[qIndex].options);
+
+    // Fallback to Qwen if local parse fails
+    if (idx === null) {
+      setVADStatus('Thinking...');
+      try {
+        const qResp = await fetch('/games/resolve-answer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ transcript: data.transcript, options: questions[qIndex].options }),
+        });
+        const qData = await qResp.json();
+        if (qData.index !== null && qData.index !== undefined) idx = qData.index;
+      } catch (_) { /* Qwen fallback failed, proceed without */ }
+    }
+
     if (idx !== null) {
       submitAnswer(idx);
     } else {
-      isProcessing = false;
-      if (micVAD) micVAD.start();
-      setVADRing('ready');
-      setVADStatus("Didn't catch that — say A, B, C, or D");
+      resumeListening("Didn't catch that — say A, B, C, or D");
     }
   } catch (e) {
-    isProcessing = false;
-    if (micVAD) micVAD.start();
-    setVADRing('ready');
-    setVADStatus('Error — tap an option or try again.');
+    resumeListening('Error — tap an option or try again.');
   }
 }
 
@@ -549,7 +565,7 @@ function speak(text, onDone) {
   window.speechSynthesis.cancel();
   const utt = new SpeechSynthesisUtterance(text);
   utt.lang = 'en-US'; utt.rate = 0.95;
-  utt.onend  = () => { if (onDone) onDone(); else { if (micVAD && !answered) { micVAD.start(); setVADRing('ready'); } } };
+  utt.onend  = () => { if (onDone) onDone(); else { if (micVAD && !answered) { micVAD.start(); setVADRing('ready'); setVADStatus('Say A, B, C, or D — or tap an option'); } } };
   utt.onerror = () => { if (onDone) onDone(); };
   window.speechSynthesis.speak(utt);
 }

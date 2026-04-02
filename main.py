@@ -117,6 +117,20 @@ async def quiz_page(request: Request):
     return templates.TemplateResponse(request=request, name="quiz.html", context={})
 
 
+@app.post("/games/resolve-answer")
+async def resolve_answer(payload: dict):
+    transcript = payload.get("transcript", "").strip()
+    options = payload.get("options", [])
+    if not transcript or len(options) != 4:
+        return JSONResponse({"index": None})
+    try:
+        idx = await asyncio.to_thread(qwen.resolve_answer, transcript, options)
+        return JSONResponse({"index": idx})
+    except Exception as e:
+        logger.error("resolve_answer failed: %s", e)
+        return JSONResponse({"index": None})
+
+
 @app.post("/games/quiz/generate")
 async def quiz_generate(payload: dict):
     subject = payload.get("subject", "").strip()

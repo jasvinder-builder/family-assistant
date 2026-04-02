@@ -194,6 +194,21 @@ def generate_quiz(subject: str, grade: int) -> list[dict]:
     return validated[:10]
 
 
+def resolve_answer(transcript: str, options: list[str]) -> int | None:
+    """Use Qwen to match a spoken transcript to one of 4 quiz options. Returns 0–3 or None."""
+    labels = ['A', 'B', 'C', 'D']
+    options_text = '\n'.join(f"{labels[i]}: {opt}" for i, opt in enumerate(options))
+    prompt = (
+        f"Answer options:\n{options_text}\n\n"
+        f"The person said: \"{transcript}\"\n\n"
+        f"Which option (A, B, C, or D) did they choose? "
+        f"Reply with a single letter only — no punctuation, no explanation."
+    )
+    raw = _chat(prompt).strip().upper()
+    idx_map = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+    return idx_map.get(raw[0]) if raw else None
+
+
 def synthesize_research(query: str, results: list) -> str:
     ctx = _today_context()
     results_text = json.dumps(results, indent=2)

@@ -194,6 +194,8 @@ async function initVAD() {
       },
       onSpeechEnd: async (audio) => {
         if (isProcessing) return;
+        // Reject long audio — a spoken number is always < 3s
+        if (audio.length / 16000 > 3) return;
         isProcessing = true;
         micVAD.pause();
         setRing('processing');

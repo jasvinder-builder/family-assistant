@@ -242,7 +242,7 @@ function generateOptions(correct) {
 
 // ── Game logic ────────────────────────────────────────────────────────────────
 
-function startGame() {
+async function startGame() {
   if (window.speechSynthesis) {
     window.speechSynthesis.speak(new SpeechSynthesisUtterance(''));
     window.speechSynthesis.getVoices();
@@ -251,7 +251,7 @@ function startGame() {
   document.getElementById('start-section').classList.add('d-none');
   document.getElementById('voice-section').classList.remove('d-none');
   gameStarted = true;
-  initVAD();
+  await initVAD();  // wait for VAD to be ready before starting TTS
   nextQuestion();
 }
 
@@ -379,6 +379,8 @@ async function initVAD() {
       onSpeechStart: () => { if (!isProcessing) { setRing('speech'); setStatus('Listening...'); } },
       onSpeechEnd: async (audio) => {
         if (isProcessing) return;
+        // Reject long audio — TTS question is ~5s; a real answer is < 4s
+        if (audio.length / 16000 > 4) return;
         micVAD.pause();
         setRing('processing');
         await transcribeAndAnswer(float32ToWav(audio, 16000));
