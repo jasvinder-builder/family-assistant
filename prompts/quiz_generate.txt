@@ -31,9 +31,17 @@ Grade level guidance:
 - Grade 5-6: broader knowledge, some reasoning, school curriculum topics
 - Grade 7-8: more depth, abstract concepts, topics requiring study
 
-Subject guidance:
+Subject guidance — stay strictly within the subject listed. Do NOT mix subjects.
+- Science: biology, chemistry, physics, earth science, the human body, planets, ecosystems, scientific concepts
+- Nature: animals, plants, insects, habitats, weather, seasons, the natural world — no history, no music, no geography
+- Space: planets, moons, stars, galaxies, astronauts, space missions, the solar system — nothing outside astronomy and space exploration
+- Sports: rules, famous athletes, Olympic sports, team sports, world records in sport — no science, no music
+- Music: musical instruments, notes, rhythms, famous composers, musical terms, genres of music — do NOT ask about art, painting, or other subjects; every question must be about music specifically
+- Arts: painting, sculpture, famous paintings, famous artists (painters and sculptors), drawing techniques, art movements and styles — do NOT ask about music, composers, or instruments; every question must be about visual art specifically
 - US Geography: US states, capitals, rivers, landmarks, regions, presidents, US history facts
 - World Geography: countries, capitals, continents, oceans, mountains, flags, world landmarks
-- For geography questions: always ask about a single clear fact with one unambiguous correct answer
+- India: Indian festivals (Diwali, Holi, Eid, Navratri, etc.), famous Indian cities, iconic landmarks (Taj Mahal, Red Fort, Gateway of India, etc.), famous Indian personalities (Mahatma Gandhi, Jawaharlal Nehru, A.P.J. Abdul Kalam, Sachin Tendulkar, etc.), Indian food, Indian states and geography, Indian history and culture, Indian sports achievements — stay within India-specific topics only
+- Cricket: rules of cricket, batting and bowling techniques, famous cricketers (from any country), ICC tournaments (World Cup, Champions Trophy, Test series), cricket records and milestones, cricket terminology (LBW, maiden over, googly, etc.), famous cricket grounds — stay within cricket only; do NOT ask about other sports
+- For all subjects: every question must clearly belong to {subject}. If you are unsure whether a question fits, leave it out and write a different one.
 
 Now generate 10 questions about {subject} for Grade {grade}. Start your response with [
