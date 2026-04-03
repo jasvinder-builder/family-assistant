@@ -243,7 +243,8 @@ def _get_text_embeddings(queries: list[str]):
             truncation=True, max_length=77,
         ).to(_device)
         with torch.no_grad():
-            feats = _clip_model.get_text_features(**txt_inputs)
+            text_out = _clip_model.text_model(**txt_inputs)
+            feats = _clip_model.text_projection(text_out.pooler_output)
             feats = feats / feats.norm(dim=-1, keepdim=True)
         # Average over templates per query and re-normalize
         feats = feats.view(len(uncached), n_tmpl, -1).mean(dim=1)
@@ -267,7 +268,8 @@ def _clip_similarities(crop_bgr: np.ndarray, queries: list[str]) -> list[float]:
 
     img_inputs = _clip_processor(images=pil_img, return_tensors="pt").to(_device)
     with torch.no_grad():
-        img_emb = _clip_model.get_image_features(**img_inputs)
+        vision_out = _clip_model.vision_model(pixel_values=img_inputs["pixel_values"])
+        img_emb = _clip_model.visual_projection(vision_out.pooler_output)
         img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
 
     txt_emb = _get_text_embeddings(queries)
