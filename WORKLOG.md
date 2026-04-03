@@ -177,6 +177,18 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-03 — Session 13
+- **Switched tunnel from ngrok to Cloudflare Tunnel** — ngrok free tier hit bandwidth limits. Installed `cloudflared` (v2026.3.0) as a replacement.
+  - Quick tunnel started with `cloudflared tunnel --url http://localhost:8000` — no account required, no bandwidth limits on free tier.
+  - HTTPS provided automatically (required for browser mic access and Twilio webhooks).
+  - Twilio voice webhook updated to the new `trycloudflare.com` URL.
+  - Note: quick tunnel URLs change on each restart. A named tunnel (requires free Cloudflare account + `cloudflared tunnel login`) gives a stable persistent URL if needed in future.
+- **Added quiz subjects: India, Cricket, Cooking**
+  - India: festivals, cities, landmarks, famous personalities, history, culture, sports achievements
+  - Cricket: rules, players, ICC tournaments, cricket terminology, records, famous grounds
+  - Cooking: ingredients, cooking methods, kitchen tools, famous dishes by country, food science, cooking terms
+  - Tightened subject-boundary rules in `quiz_generate.txt` for all subjects — each now has an explicit "stay within this subject only" guard to prevent cross-subject bleed (e.g. Arts generating music questions)
+
 ### 2026-04-02 — Session 12
 - **Fixed debug overlay bounding boxes not tracking with moving persons** — root cause: two independent `VideoCapture` instances (one in camera_service for MJPEG display, one in scene_service for AI analysis) reading the same file at different frame positions. Boxes were stamped from the analysis thread's position onto the display thread's frame → appeared frozen/misaligned.
   - **Fix: single-reader frame sharing.** Removed the separate VideoCapture from `scene_service`. Camera_service's `_reader()` now calls `scene_service.push_frame(frame)` on every decoded frame. Scene service stores the latest frame in `_shared_frame` (protected by a lock + `threading.Event`). Analysis loop waits for the event and samples from the shared frame at 3fps — bounding boxes now perfectly align with what's shown in the live view.

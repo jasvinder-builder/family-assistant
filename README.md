@@ -94,7 +94,7 @@ Talk to Bianca (/talk)          Family Dashboard (/dashboard)
 
 - **Python 3.11+**
 - **[Ollama](https://ollama.com)** — runs the Qwen LLM locally
-- **[ngrok](https://ngrok.com)** — exposes your local server to Twilio webhooks, and provides HTTPS for browser mic access
+- **[cloudflared](https://github.com/cloudflare/cloudflared)** — Cloudflare Tunnel; exposes your local server to Twilio webhooks and provides HTTPS for browser mic access. Free with no bandwidth limits.
 - **NVIDIA GPU** (recommended) — Whisper large-v3 and Qwen 2.5:14b together need ~12GB VRAM. CPU-only works but is significantly slower.
   - If using CPU: set `WHISPER_MODEL_SIZE=base` in `.env` for faster startup
 
@@ -170,16 +170,17 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 On first startup Whisper and Qwen load into GPU memory (30–60 seconds). Subsequent requests are fast.
 
-### 6. Expose to Twilio and get HTTPS with ngrok
+### 6. Expose to Twilio and get HTTPS with Cloudflare Tunnel
 
 ```bash
-ngrok http 8000
+cloudflared tunnel --url http://localhost:8000
 ```
 
-Copy the `https://` forwarding URL (e.g. `https://abc123.ngrok.io`).
+Copy the `https://` forwarding URL printed in the output (e.g. `https://some-name.trycloudflare.com`).
 
-- **Twilio:** set your phone number's Voice webhook to `https://abc123.ngrok.io/voice/incoming` (POST)
-- **Browser mic:** the Talk and Hangman pages require HTTPS — use the ngrok URL, not the local IP
+- **Twilio:** set your phone number's Voice webhook to `https://some-name.trycloudflare.com/voice/incoming` (POST)
+- **Browser mic:** the Talk and Hangman pages require HTTPS — use the cloudflared URL, not the local IP
+- **Note:** quick tunnel URLs change on each restart. For a stable persistent URL, log in with `cloudflared tunnel login` and create a named tunnel.
 
 ---
 
@@ -195,8 +196,8 @@ Open on any phone, tablet, or smart display on your network:
 |---|---|---|
 | Home | `http://<your-ip>:8000/` | No |
 | Dashboard | `http://<your-ip>:8000/dashboard` | No |
-| Talk to Bianca | `https://<ngrok-url>/talk` | **Yes** |
-| Hangman | `https://<ngrok-url>/games/hangman` | **Yes** |
+| Talk to Bianca | `https://<cloudflared-url>/talk` | **Yes** |
+| Hangman | `https://<cloudflared-url>/games/hangman` | **Yes** |
 
 Find your local IP: `ip addr show | grep "inet " | grep -v 127.0.0.1`
 

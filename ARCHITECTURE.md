@@ -13,7 +13,7 @@ Bianca is a family productivity assistant with two interfaces: phone calls (via 
                     │  CALLER'S PHONE │        │  BROWSER (phone /    │
                     │  (PSTN call)    │        │  Portal / tablet)    │
                     └────────┬────────┘        └──────────┬───────────┘
-                             │                            │ HTTPS (ngrok)
+                             │                            │ HTTPS (cloudflared)
                              ▼                            │ MediaRecorder audio
                     ┌────────────────┐                    │ JSON responses
                     │  TWILIO CLOUD  │                    │
@@ -387,7 +387,7 @@ Edit (todo or event) is handled client-side:
 
 ## Browser Interface Flow
 
-Family members open the browser interface on any device on the local network. The Talk and Hangman pages require HTTPS (use the ngrok URL) because mic access and WASM require a secure context.
+Family members open the browser interface on any device on the local network. The Talk and Hangman pages require HTTPS (use the cloudflared URL) because mic access and WASM require a secure context.
 
 ```
 Browser (Portal / phone / tablet)
@@ -615,7 +615,7 @@ family-assistant/
 | Backend | FastAPI + uvicorn | Async, fast, minimal boilerplate |
 | Templates | Jinja2 + Bootstrap 5 | No build step, zero JS framework needed |
 | Logging | `TimedRotatingFileHandler` | Daily log files, 7-day retention |
-| Tunnel (dev) | ngrok | Twilio webhooks + HTTPS for browser mic |
+| Tunnel (dev) | Cloudflare Tunnel (`cloudflared`) | Twilio webhooks + HTTPS for browser mic; no bandwidth limits |
 
 ---
 
