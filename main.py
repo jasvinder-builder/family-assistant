@@ -5,7 +5,7 @@ import logging.handlers
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-from fastapi import FastAPI, Form, Response, Request, UploadFile, File
+from fastapi import FastAPI, Form, Response, Request, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 import httpx
@@ -116,6 +116,16 @@ async def cameras_stream():
         camera_service.mjpeg_generator(url),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.websocket("/cameras/ws")
+async def cameras_ws(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        async for jpeg_bytes in camera_service.ws_frame_generator():
+            await websocket.send_bytes(jpeg_bytes)
+    except WebSocketDisconnect:
+        pass
 
 
 @app.get("/cameras/queries")

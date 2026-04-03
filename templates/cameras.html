@@ -11,7 +11,7 @@
     .hero-text h1 { font-size: 1.4rem; font-weight: 700; margin: 0; }
     .hero-text p  { opacity: 0.85; font-size: 0.85rem; margin: 0.15rem 0 0; }
     .card { border: none; border-radius: 16px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
-    #videoFeed { width: 100%; max-height: 480px; object-fit: contain; border-radius: 10px; background: #0f172a; display: block; }
+    #videoFeed { width: 100%; max-height: 480px; border-radius: 10px; background: #0f172a; display: block; }
     .query-badge {
       display: flex; align-items: center; gap: 0.5rem;
       background: #eff6ff; border: 1px solid #bfdbfe;
@@ -66,7 +66,7 @@
           <label class="form-check-label small" for="debugToggle">Debug overlay</label>
         </div>
       </div>
-      <img id="videoFeed" src="{% if current_url %}/cameras/stream{% endif %}" alt="Camera feed">
+      <canvas id="videoFeed"></canvas>
       <div id="streamError" class="stream-error">
         Stream unavailable — check the RTSP URL and camera connectivity.
       </div>
@@ -117,15 +117,48 @@
 </div><!-- /container -->
 
 <script>
-  const videoFeed    = document.getElementById('videoFeed');
+  const canvas       = document.getElementById('videoFeed');
+  const ctx          = canvas.getContext('2d');
   const videoSection = document.getElementById('videoSection');
   const statusMsg    = document.getElementById('statusMsg');
   const streamError  = document.getElementById('streamError');
 
-  // ── Stream connection ────────────────────────────────────────────────────
+  // ── WebSocket stream ─────────────────────────────────────────────────────
 
-  videoFeed.onerror = () => { streamError.style.display = 'block'; };
-  videoFeed.onload  = () => { streamError.style.display = 'none';  };
+  let ws = null;
+
+  function startWebSocket() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/cameras/ws`);
+    ws.binaryType = 'blob';
+
+    ws.onopen = () => {
+      streamError.style.display = 'none';
+    };
+
+    ws.onmessage = async (e) => {
+      try {
+        const bitmap = await createImageBitmap(e.data);
+        // Size the canvas buffer to the video resolution on first frame
+        if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+          canvas.width  = bitmap.width;
+          canvas.height = bitmap.height;
+        }
+        ctx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+      } catch (_) {}
+    };
+
+    ws.onerror = () => { streamError.style.display = 'block'; };
+
+    ws.onclose = () => { ws = null; };
+  }
+
+  function stopWebSocket() {
+    if (ws) { ws.close(); ws = null; }
+  }
+
+  // ── Stream connection ────────────────────────────────────────────────────
 
   async function connectStream() {
     const url = document.getElementById('rtspUrl').value.trim();
@@ -134,7 +167,7 @@
     showStatus('Connecting…', 'muted');
     setConnectBtns(true);
 
-    const res  = await fetch('/cameras/set-stream', {
+    const res = await fetch('/cameras/set-stream', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({url}),
     }).catch(() => null);
@@ -146,15 +179,15 @@
     }
 
     streamError.style.display = 'none';
-    videoFeed.src = '/cameras/stream?' + Date.now();
     videoSection.classList.remove('d-none');
     document.getElementById('connectBtn').classList.add('d-none');
     document.getElementById('disconnectBtn').classList.remove('d-none');
     showStatus('Connected — AI analysis starting in background.', 'success');
+    startWebSocket();
   }
 
   async function disconnectStream() {
-    videoFeed.src = '';
+    stopWebSocket();
     videoSection.classList.add('d-none');
     streamError.style.display = 'none';
     document.getElementById('connectBtn').classList.remove('d-none');
@@ -310,6 +343,7 @@
   document.getElementById('connectBtn').classList.add('d-none');
   document.getElementById('disconnectBtn').classList.remove('d-none');
   showStatus('Stream active — AI analysis running.', 'success');
+  startWebSocket();
   {% endif %}
 </script>
 

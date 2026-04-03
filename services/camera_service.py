@@ -14,6 +14,93 @@ os.environ.setdefault(
 _stream_url: str | None = None
 _debug_overlay: bool = False
 
+# ── Singleton reader + subscriber broadcast ───────────────────────────────────
+
+_subscribers: set[queue.Queue] = set()
+_subscribers_lock = threading.Lock()
+_reader_thread: threading.Thread | None = None
+_reader_stop = threading.Event()
+
+
+def _broadcast(jpeg_bytes: bytes) -> None:
+    """Push a JPEG frame to every subscribed consumer queue, dropping if full."""
+    with _subscribers_lock:
+        for q in _subscribers:
+            try:
+                q.put_nowait(jpeg_bytes)
+            except queue.Full:
+                pass  # slow consumer — drop frame
+
+
+def subscribe_frames() -> queue.Queue:
+    """Register a new consumer and return its dedicated frame queue."""
+    q: queue.Queue = queue.Queue(maxsize=4)
+    with _subscribers_lock:
+        _subscribers.add(q)
+    return q
+
+
+def unsubscribe_frames(q: queue.Queue) -> None:
+    """Deregister a consumer queue and signal it with a None sentinel."""
+    with _subscribers_lock:
+        _subscribers.discard(q)
+    try:
+        q.put_nowait(None)
+    except queue.Full:
+        pass
+
+
+def _reader_loop(rtsp_url: str) -> None:
+    """Singleton background thread: reads frames and broadcasts JPEG bytes."""
+    import cv2
+
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        frame_interval = 1.0 / fps
+        while not _reader_stop.is_set():
+            t0 = time.monotonic()
+            ret, frame = cap.read()
+            if not ret:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+
+            # Share frame with scene analysis (single source of truth)
+            from services import scene_service as _ss
+            _ss.push_frame(frame)
+
+            if _debug_overlay:
+                from services import scene_service
+                for det in scene_service.get_latest_detections():
+                    x1, y1, x2, y2 = det.box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    label = f"#{det.track_id}"
+                    cv2.putText(frame, label, (x1, y1 - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    for row, (query, sim) in enumerate(det.scores.items()):
+                        color = (0, 255, 0) if sim >= scene_service.get_threshold() else (0, 165, 255)
+                        text = f"{query[:20]}: {sim:.2f}"
+                        cv2.putText(frame, text, (x1, y1 + 20 + row * 20),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+            ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                _broadcast(jpeg.tobytes())
+
+            elapsed = time.monotonic() - t0
+            time.sleep(max(0.0, frame_interval - elapsed))
+    finally:
+        cap.release()
+        # Signal all waiting subscribers that the stream has ended
+        with _subscribers_lock:
+            for q in _subscribers:
+                try:
+                    q.put_nowait(None)
+                except queue.Full:
+                    pass
+
+
+# ── Public control ────────────────────────────────────────────────────────────
 
 def set_debug_overlay(enabled: bool) -> None:
     global _debug_overlay
@@ -27,12 +114,27 @@ def get_debug_overlay() -> bool:
 
 
 def set_stream_url(url: str) -> None:
-    global _stream_url
+    global _stream_url, _reader_thread
     from services import scene_service
 
     _stream_url = url.strip() if url.strip() else None
+
+    # Stop existing singleton reader
+    _reader_stop.set()
+    if _reader_thread and _reader_thread.is_alive():
+        _reader_thread.join(timeout=3)
+    _reader_stop.clear()
+    _reader_thread = None
+
     if _stream_url:
         scene_service.start_analysis(_stream_url)
+        _reader_thread = threading.Thread(
+            target=_reader_loop,
+            args=(_stream_url,),
+            daemon=True,
+            name="camera-reader",
+        )
+        _reader_thread.start()
     else:
         scene_service.stop_analysis()
 
@@ -41,68 +143,15 @@ def get_stream_url() -> str | None:
     return _stream_url
 
 
+# ── Frame generators ──────────────────────────────────────────────────────────
+
 async def mjpeg_generator(rtsp_url: str):
-    """Async generator that yields MJPEG multipart frames from an RTSP URL."""
-    import cv2
-
-    frame_q: queue.Queue = queue.Queue(maxsize=4)
-    stop_event = threading.Event()
-
-    def _reader():
-        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-        try:
-            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-            frame_interval = 1.0 / fps
-            while not stop_event.is_set():
-                t0 = time.monotonic()
-                ret, frame = cap.read()
-                if not ret:
-                    # End of file — loop back to start
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    continue
-                # Share frame with scene analysis (single source of truth)
-                from services import scene_service as _ss
-                _ss.push_frame(frame)
-                if _debug_overlay:
-                    from services import scene_service
-                    for det in scene_service.get_latest_detections():
-                        x1, y1, x2, y2 = det.box
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        label = f"#{det.track_id}"
-                        cv2.putText(frame, label, (x1, y1 - 8),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                        for row, (query, sim) in enumerate(det.scores.items()):
-                            color = (0, 255, 0) if sim >= scene_service.get_threshold() else (0, 165, 255)
-                            text = f"{query[:20]}: {sim:.2f}"
-                            cv2.putText(frame, text, (x1, y1 + 20 + row * 20),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-                ok, jpeg = cv2.imencode(
-                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70]
-                )
-                if not ok:
-                    continue
-                try:
-                    frame_q.put_nowait(jpeg.tobytes())
-                except queue.Full:
-                    pass  # drop frame — client is slow
-                # Throttle to native FPS (no-op for live RTSP which self-paces)
-                elapsed = time.monotonic() - t0
-                time.sleep(max(0.0, frame_interval - elapsed))
-        finally:
-            cap.release()
-            try:
-                frame_q.put_nowait(None)  # sentinel
-            except queue.Full:
-                pass
-
-    t = threading.Thread(target=_reader, daemon=True)
-    t.start()
-
+    """Async generator yielding MJPEG multipart chunks (for local HTTP fallback)."""
+    q = subscribe_frames()
     try:
         while True:
             try:
-                chunk = frame_q.get_nowait()
+                chunk = q.get_nowait()
             except queue.Empty:
                 await asyncio.sleep(0.02)
                 continue
@@ -113,4 +162,21 @@ async def mjpeg_generator(rtsp_url: str):
                 b"Content-Type: image/jpeg\r\n\r\n" + chunk + b"\r\n"
             )
     finally:
-        stop_event.set()
+        unsubscribe_frames(q)
+
+
+async def ws_frame_generator():
+    """Async generator yielding raw JPEG bytes for WebSocket streaming."""
+    q = subscribe_frames()
+    try:
+        while True:
+            try:
+                chunk = q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.02)
+                continue
+            if chunk is None:
+                break
+            yield chunk
+    finally:
+        unsubscribe_frames(q)
