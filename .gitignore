@@ -18,6 +18,10 @@ __pycache__/
 # Whisper model cache (downloaded at runtime, not part of codebase)
 ~/.cache/huggingface/
 
+# Ultralytics — config and model weights downloaded at runtime
+.ultralytics/
+*.pt
+
 # Logs
 logs/
 

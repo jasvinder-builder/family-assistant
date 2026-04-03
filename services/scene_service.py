@@ -10,14 +10,21 @@ unaffected when the cameras page is not in use.
 """
 
 import logging
+import os
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import cv2
+
+# Keep ultralytics config and weights inside the project directory rather than
+# writing to ~/.config/Ultralytics — set before any ultralytics import.
+_project_root = Path(__file__).parent.parent
+os.environ.setdefault("YOLO_CONFIG_DIR", str(_project_root / ".ultralytics"))
 import numpy as np
 
 logger = logging.getLogger(__name__)
