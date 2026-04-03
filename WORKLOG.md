@@ -330,6 +330,24 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 
 ---
 
+### 2026-04-02 — Session 4 (continued) — CLIP/YOLO detection quality improvements
+
+Six improvements applied to `services/scene_service.py` to reduce false positives, missed detections, and noisy one-frame events:
+
+**YOLO improvements:**
+- Upgraded model from `yolov8n` (nano) to `yolov8s` (small) — better recall on partially occluded and distant objects at the cost of slightly more VRAM (~100MB vs ~50MB)
+- Lowered detection confidence threshold from default 0.25 to 0.15 to catch more borderline detections
+- Increased analysis FPS from 3 to 5 — more frames analysed per second reduces the chance of missing a fast-moving subject
+
+**CLIP improvements:**
+- Upgraded model from `clip-vit-base-patch32` to `clip-vit-large-patch14` — 3× more parameters, sharper, more discriminative embeddings (~1.7GB vs ~600MB VRAM)
+- Added prompt template ensembling (from the original CLIP paper): each query is expanded into 4 templates (`"{}"`, `"a photo of {}"`, `"a picture of {}"`, `"an image of {}"`) whose embeddings are averaged and re-normalized; produces more robust text representations than a bare label
+- Added module-level `_text_emb_cache` (CPU tensors keyed by query string) — text embeddings are static and computed once per query, eliminating redundant GPU work on every frame
+- Added multi-frame voting: a `score_buffer` deque accumulates the last 3 per-frame similarity scores per `(track_id, query_idx)` pair; an event only fires when the rolling mean meets the threshold — eliminates false positives from single-frame noise
+- Added minimum crop size guard: CLIP is skipped for bounding boxes with crop area < 3000 px² (upscaling a 40×60 px crop to 224×224 produces blurry, unreliable embeddings)
+
+---
+
 ## Open Questions / Future Ideas
 - Add a "complete todo" voice command ("mark buy groceries as done")
 - Scheduled reminders: outbound WhatsApp at event time

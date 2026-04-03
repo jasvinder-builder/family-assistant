@@ -79,8 +79,19 @@ def set_pad_factor(value: float) -> None:
 
 
 RECHECK_INTERVAL_S   = 30     # seconds before re-checking same (track, query)
-ANALYSIS_FPS         = 3      # frames per second to analyse
+ANALYSIS_FPS         = 5      # frames per second to analyse (up from 3)
 TRACK_PRUNE_AGE_S    = 300    # prune fired-cache entries older than this
+VOTE_FRAMES          = 3      # frames to average before firing an event (multi-frame voting)
+MIN_CROP_PIXELS      = 3000   # skip CLIP for detections smaller than this (px²)
+
+# Prompt templates for ensemble — averaged to form each query's text embedding.
+# CLIP was trained on captions, so descriptive templates outperform bare labels.
+_PROMPT_TEMPLATES = [
+    "{}",
+    "a photo of {}",
+    "a picture of {}",
+    "an image of {}",
+]
 
 # ── Latest detections (shared with camera_service for debug overlay) ──────────
 
@@ -174,12 +185,16 @@ def remove_query(index: int) -> bool:
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
-_models_lock   = threading.Lock()
-_models_loaded = False
-_yolo          = None
-_clip_model    = None
+_models_lock    = threading.Lock()
+_models_loaded  = False
+_yolo           = None
+_clip_model     = None
 _clip_processor = None
-_device        = "cpu"  # resolved at load time
+_device         = "cpu"  # resolved at load time
+
+# Text embedding cache: query string → averaged, normalized CPU tensor.
+# Populated on first use; reused until the server restarts.
+_text_emb_cache: dict = {}
 
 
 def _load_models() -> None:
@@ -194,40 +209,69 @@ def _load_models() -> None:
         logger.info("Loading scene analysis models on %s", _device)
 
         from ultralytics import YOLO
-        _yolo = YOLO("yolov8n.pt")  # ~6 MB, auto-downloads on first use
-        logger.info("YOLOv8n loaded")
+        _yolo = YOLO("yolov8s.pt")  # small model — better recall than nano
+        logger.info("YOLOv8s loaded")
 
         from transformers import CLIPModel, CLIPProcessor
-        _clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(_device)
-        _clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        logger.info("CLIP ViT-B/32 loaded on %s", _device)
+        _clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(_device)
+        _clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+        logger.info("CLIP ViT-L/14 loaded on %s", _device)
 
         _models_loaded = True
 
 
 # ── CLIP inference ────────────────────────────────────────────────────────────
 
+def _get_text_embeddings(queries: list[str]):
+    """Return stacked normalized text embeddings for queries, using cache.
+
+    Each query is expanded into _PROMPT_TEMPLATES variants; their embeddings
+    are averaged and re-normalized (prompt ensembling from the CLIP paper).
+    Computed embeddings are stored in _text_emb_cache (CPU tensors) so
+    repeated calls for the same queries are free.
+
+    Returns a tensor of shape [len(queries), dim] on _device.
+    """
+    import torch
+
+    uncached = [q for q in queries if q not in _text_emb_cache]
+    if uncached:
+        all_texts = [tmpl.format(q) for q in uncached for tmpl in _PROMPT_TEMPLATES]
+        n_tmpl = len(_PROMPT_TEMPLATES)
+        txt_inputs = _clip_processor(
+            text=all_texts, return_tensors="pt", padding=True,
+            truncation=True, max_length=77,
+        ).to(_device)
+        with torch.no_grad():
+            feats = _clip_model.get_text_features(**txt_inputs)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+        # Average over templates per query and re-normalize
+        feats = feats.view(len(uncached), n_tmpl, -1).mean(dim=1)
+        feats = feats / feats.norm(dim=-1, keepdim=True)
+        for i, q in enumerate(uncached):
+            _text_emb_cache[q] = feats[i].cpu()
+
+    return torch.stack([_text_emb_cache[q] for q in queries]).to(_device)
+
+
 def _clip_similarities(crop_bgr: np.ndarray, queries: list[str]) -> list[float]:
-    """Return cosine similarity of a BGR crop against each query string."""
+    """Return cosine similarity of a BGR crop against each query string.
+
+    Uses cached + ensembled text embeddings (see _get_text_embeddings).
+    """
     from PIL import Image
     import torch
 
     crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
     pil_img  = Image.fromarray(crop_rgb)
 
-    inputs = _clip_processor(
-        text=queries,
-        images=pil_img,
-        return_tensors="pt",
-        padding=True,
-    ).to(_device)
-
+    img_inputs = _clip_processor(images=pil_img, return_tensors="pt").to(_device)
     with torch.no_grad():
-        out     = _clip_model(**inputs)
-        img_emb = out.image_embeds / out.image_embeds.norm(dim=-1, keepdim=True)
-        txt_emb = out.text_embeds  / out.text_embeds.norm(dim=-1, keepdim=True)
-        sims    = (img_emb @ txt_emb.T).squeeze(0)
+        img_emb = _clip_model.get_image_features(**img_inputs)
+        img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
 
+    txt_emb = _get_text_embeddings(queries)
+    sims = (img_emb @ txt_emb.T).squeeze(0)
     return sims.tolist() if sims.dim() > 0 else [sims.item()]
 
 
@@ -267,7 +311,11 @@ def _analysis_loop() -> None:
 
     # (track_id, query_index) → monotonic time of last event fired
     fired: dict[tuple[int, int], float] = {}
+    # (track_id, query_index) → deque of recent per-frame similarity scores
+    score_buffer: dict[tuple[int, int], deque] = {}
     frame_interval = 1.0 / ANALYSIS_FPS
+
+    import base64
 
     while not _stop_event.is_set():
         t0 = time.monotonic()
@@ -286,12 +334,15 @@ def _analysis_loop() -> None:
             time.sleep(max(0.0, frame_interval - (time.monotonic() - t0)))
             continue
 
-        # YOLOv8 + ByteTrack — persons, vehicles, and animals
+        # YOLOv8s + ByteTrack — persons, vehicles, and animals
+        # conf=0.15 lowers the detection threshold vs the default 0.25,
+        # improving recall for partially occluded or distant objects.
         results = _yolo.track(
             frame,
             persist=True,
             tracker="bytetrack.yaml",
             classes=_DETECT_CLASSES,
+            conf=0.15,
             verbose=False,
             device=_device,
         )
@@ -301,11 +352,13 @@ def _analysis_loop() -> None:
             h, w = frame.shape[:2]
             frame_detections: list[Detection] = []
             pad_factor = get_pad_factor()
+            seen_track_ids: set[int] = set()
 
             for box in results[0].boxes:
                 if box.id is None:
                     continue
                 track_id = int(box.id.item())
+                seen_track_ids.add(track_id)
                 cls_id = int(box.cls[0].item())
                 label = _CLASS_LABELS.get(cls_id, "object")
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
@@ -327,6 +380,16 @@ def _analysis_loop() -> None:
 
                 scores: dict[str, float] = {}
                 if queries:
+                    # Skip CLIP on tiny detections — upscaling a 40×60px crop
+                    # to 224×224 produces blurry embeddings that hurt accuracy.
+                    crop_px = (cx2 - cx1) * (cy2 - cy1)
+                    if crop_px < MIN_CROP_PIXELS:
+                        frame_detections.append(Detection(
+                            track_id=track_id, box=(x1, y1, x2, y2),
+                            scores={}, label=label,
+                        ))
+                        continue
+
                     pending = [
                         i for i, _ in enumerate(queries)
                         if now - fired.get((track_id, i), 0.0) > RECHECK_INTERVAL_S
@@ -337,11 +400,24 @@ def _analysis_loop() -> None:
                         except Exception:
                             logger.exception("CLIP inference failed for track %d", track_id)
                             sims = []
+
                         for q_idx, sim in zip(pending, sims):
                             scores[queries[q_idx]] = sim
-                            if sim >= _similarity_threshold:
-                                fired[(track_id, q_idx)] = now
-                                import base64
+
+                            # Multi-frame voting: accumulate scores in a rolling
+                            # window; only fire when the window mean >= threshold.
+                            key = (track_id, q_idx)
+                            if key not in score_buffer:
+                                score_buffer[key] = deque(maxlen=VOTE_FRAMES)
+                            score_buffer[key].append(sim)
+
+                            if len(score_buffer[key]) < VOTE_FRAMES:
+                                continue  # not enough frames yet
+
+                            mean_sim = sum(score_buffer[key]) / len(score_buffer[key])
+                            if mean_sim >= _similarity_threshold:
+                                fired[key] = now
+                                score_buffer.pop(key, None)
                                 ok_jpg, jpg_buf = cv2.imencode(
                                     ".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 80]
                                 )
@@ -350,12 +426,12 @@ def _analysis_loop() -> None:
                                     timestamp=datetime.now().isoformat(timespec="seconds"),
                                     query=queries[q_idx],
                                     track_id=track_id,
-                                    confidence=sim,
+                                    confidence=round(mean_sim, 3),
                                     image_b64=img_b64,
                                 ))
                                 logger.info(
-                                    "Camera event: track=%d label=%s query=%r sim=%.3f",
-                                    track_id, label, queries[q_idx], sim,
+                                    "Camera event: track=%d label=%s query=%r mean_sim=%.3f",
+                                    track_id, label, queries[q_idx], mean_sim,
                                 )
 
                 frame_detections.append(Detection(
@@ -366,6 +442,11 @@ def _analysis_loop() -> None:
                 ))
 
             _set_latest_detections(frame_detections)
+
+            # Prune score_buffer for tracks no longer visible (they'll reset
+            # when the track reappears and ByteTrack reassigns an ID).
+            score_buffer = {k: v for k, v in score_buffer.items()
+                            if k[0] in seen_track_ids}
 
             # Prune stale fired-cache entries
             cutoff = now - TRACK_PRUNE_AGE_S

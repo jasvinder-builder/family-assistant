@@ -72,7 +72,7 @@ Talk to Bianca (/talk)          Family Dashboard (/dashboard)
 - **Bulls and Cows** — crack Bianca's secret 4-digit code; say each digit aloud; bulls = right digit right place, cows = right digit wrong place
 - **Word Ladder** — change one letter at a time to climb from the start word to the target; BFS-powered hints; Qwen generates kid-friendly puzzles
 - **20 Questions** — think of an animal, food, object, or place; Bianca asks up to 20 yes/no questions and tries to guess it using Qwen
-- **Cameras** — live view of any RTSP stream or local video file streamed via WebSocket (works through Cloudflare Tunnel); YOLOv8 + ByteTrack detects and tracks persons, vehicles (bicycle, car, motorcycle, bus, truck), and animals (bird, cat, dog); CLIP matches them against user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa"); configurable crop padding expands the bounding box to give CLIP surrounding context for relational queries; matched events are logged with a thumbnail crop
+- **Cameras** — live view of any RTSP stream or local video file streamed via WebSocket (works through Cloudflare Tunnel); YOLOv8s + ByteTrack detects and tracks persons, vehicles (bicycle, car, motorcycle, bus, truck), and animals (bird, cat, dog); CLIP ViT-L/14 matches them against user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa") using prompt-ensemble text embeddings and multi-frame voting to suppress false positives; configurable crop padding expands the bounding box for relational queries; matched events are logged with a thumbnail crop
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events
@@ -243,7 +243,7 @@ family-assistant/
 │   ├── reminder_service.py   # APScheduler — proactive WhatsApp event reminders
 │   ├── hangman_service.py    # Hangman game logic and in-memory game state
 │   ├── camera_service.py     # RTSP/file VideoCapture → MJPEG generator; shares frames with scene_service
-│   ├── scene_service.py      # YOLOv8n + ByteTrack + CLIP — person/vehicle/animal detection, tracking, query matching, event log
+│   ├── scene_service.py      # YOLOv8s + ByteTrack + CLIP ViT-L/14 — detection, tracking, prompt ensembling, multi-frame voting, event log
 │   ├── bulls_cows_service.py # Bulls and Cows game state and spoken-digit parser
 │   ├── word_ladder_service.py # Word Ladder — BFS validation, system dictionary word set, hint generation
 │   └── twenty_questions_service.py # 20 Questions — multi-turn Qwen session, phase management

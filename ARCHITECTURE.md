@@ -443,15 +443,19 @@ Browser (Portal / phone / tablet)
         │
         │   Scene analysis pipeline (scene_service.py — background thread):
         │     Receives frames via push_frame() / _shared_frame — no separate VideoCapture
-        │     Samples at 3 fps (waits on threading.Event, sleeps remainder of interval)
-        │       → YOLOv8n: detect persons (0), vehicles (1,2,3,5,7), animals (14,15,16)
+        │     Samples at 5 fps (waits on threading.Event, sleeps remainder of interval)
+        │       → YOLOv8s (small): detect persons (0), vehicles (1,2,3,5,7), animals (14,15,16)
+        │           conf=0.15 (lower than default 0.25 for better recall)
         │       → ByteTrack: assign persistent track IDs across frames
         │       → _set_latest_detections() updates shared Detection list (used by overlay)
         │       → For each tracked object:
         │           crop = frame[bounding_box expanded by pad_factor on each side]
-        │           CLIP ViT-B/32: cosine_similarity(crop, each query text)
-        │           if sim ≥ threshold → CameraEvent logged (with JPEG crop as base64)
-        │           dedup: same (track_id, query_idx) suppressed for 30s
+        │           Skip CLIP if crop area < 3000 px² (tiny/distant objects)
+        │           CLIP ViT-L/14: cosine_similarity(crop, each query text)
+        │             Text embeddings: prompt-ensembled (4 templates), cached per query
+        │             Multi-frame voting: mean of last 3 frames must meet threshold
+        │           if mean_sim ≥ threshold → CameraEvent logged (with JPEG crop as base64)
+        │           dedup: same (track_id, query_idx) suppressed for 30s after firing
         │       → Rolling event log: deque(maxlen=500), filtered to last 1h on read
         │     Runs YOLO even when no queries are defined if debug overlay is enabled
         │     Models loaded lazily on first start_analysis() call
@@ -627,7 +631,7 @@ family-assistant/
 │
 ├── services/
 │   ├── camera_service.py      RTSP URL storage; mjpeg_generator() — OpenCV frames → MJPEG stream; triggers scene analysis
-│   ├── scene_service.py       YOLOv8n + ByteTrack + CLIP pipeline; query management; event log
+│   ├── scene_service.py       YOLOv8s + ByteTrack + CLIP ViT-L/14 pipeline; prompt ensembling; multi-frame voting; query management; event log
 │   ├── whisper_service.py     faster-whisper large-v3 CUDA, suffix param for webm/wav
 │   ├── qwen.py                Ollama REST wrapper, all LLM calls, JSON extraction
 │   ├── markdown_service.py    Read/write/parse/delete family.md with FileLock
@@ -686,9 +690,9 @@ family-assistant/
 | Storage | Markdown file (`family.md`) | Human-readable, editable, no DB setup |
 | File locking | `filelock` | Prevents concurrent write corruption |
 | RTSP streaming | OpenCV `VideoCapture` + MJPEG | Server-side decode; browser displays in `<img>` tag |
-| Object detection | YOLOv8n (ultralytics) | Fast person detection at 3 fps; ~50MB VRAM |
+| Object detection | YOLOv8s (ultralytics) | Person/vehicle/animal detection at 5 fps, conf=0.15; ~100MB VRAM |
 | Object tracking | ByteTrack (built into ultralytics) | Persistent track IDs across frames, deduplication |
-| Scene matching | CLIP ViT-B/32 (HuggingFace transformers) | Open-vocabulary query matching; ~600MB VRAM |
+| Scene matching | CLIP ViT-L/14 (HuggingFace transformers) | Open-vocabulary query matching; prompt ensembling + multi-frame voting; ~1.7GB VRAM |
 | Scheduler | APScheduler `AsyncIOScheduler` | Proactive reminders without Celery/Redis |
 | Backend | FastAPI + uvicorn | Async, fast, minimal boilerplate |
 | Templates | Jinja2 + Bootstrap 5 | No build step, zero JS framework needed |
@@ -713,21 +717,21 @@ family-assistant/
 │  │  int8_float16│   during Qwen inference)       │
 │  └──────────────┘                                │
 │  ┌──────────────┐                                │
-│  │  YOLOv8n     │  ~0.05 GB                      │
+│  │  YOLOv8s     │  ~0.1 GB                       │
 │  │  + ByteTrack │  (CPU tracker)                 │
 │  └──────────────┘                                │
 │  ┌──────────────┐                                │
-│  │  CLIP        │  ~0.6 GB                       │
-│  │  ViT-B/32    │  (scene matching)              │
+│  │  CLIP        │  ~1.7 GB                       │
+│  │  ViT-L/14    │  (scene matching)              │
 │  └──────────────┘                                │
 │  ┌──────────────────────────────┐                │
-│  │  Free headroom  ~3.85 GB    │                │
+│  │  Free headroom  ~2.7 GB     │                │
 │  └──────────────────────────────┘                │
 └──────────────────────────────────────────────────┘
 
 Note: Whisper and Qwen never run at the same time —
 Whisper transcribes first, then Qwen processes.
-YOLOv8 + CLIP run continuously at 3 fps in a background
+YOLOv8s + CLIP run continuously at 5 fps in a background
 thread when a camera stream is active.
 ```
 
