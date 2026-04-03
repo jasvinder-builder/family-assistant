@@ -100,6 +100,13 @@ async def cameras_set_stream(payload: dict):
     return JSONResponse({"ok": True})
 
 
+@app.post("/cameras/debug-overlay")
+async def cameras_debug_overlay(payload: dict):
+    enabled = bool(payload.get("enabled", False))
+    camera_service.set_debug_overlay(enabled)
+    return JSONResponse({"ok": True, "enabled": enabled})
+
+
 @app.get("/cameras/stream")
 async def cameras_stream():
     url = camera_service.get_stream_url()

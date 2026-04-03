@@ -53,6 +53,30 @@ RECHECK_INTERVAL_S   = 30     # seconds before re-checking same (track, query)
 ANALYSIS_FPS         = 3      # frames per second to analyse
 TRACK_PRUNE_AGE_S    = 300    # prune fired-cache entries older than this
 
+# ── Latest detections (shared with camera_service for debug overlay) ──────────
+
+@dataclass
+class Detection:
+    track_id: int
+    box: tuple        # (x1, y1, x2, y2)
+    scores: dict      # {query: similarity}
+
+
+_latest_detections: list[Detection] = []
+_detections_lock = threading.Lock()
+
+
+def get_latest_detections() -> list[Detection]:
+    with _detections_lock:
+        return list(_latest_detections)
+
+
+def _set_latest_detections(detections: list[Detection]) -> None:
+    with _detections_lock:
+        _latest_detections.clear()
+        _latest_detections.extend(detections)
+
+
 # ── Event log ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -232,6 +256,7 @@ def _analysis_loop(rtsp_url: str) -> None:
             if results and results[0].boxes is not None:
                 now = time.monotonic()
                 h, w = frame.shape[:2]
+                frame_detections: list[Detection] = []
 
                 for box in results[0].boxes:
                     if box.id is None:
@@ -247,38 +272,46 @@ def _analysis_loop(rtsp_url: str) -> None:
                     if crop.size == 0:
                         continue
 
-                    # Only check queries not recently fired for this track
-                    pending = [
-                        i for i, _ in enumerate(queries)
-                        if now - fired.get((track_id, i), 0.0) > RECHECK_INTERVAL_S
-                    ]
-                    if not pending:
-                        continue
+                    scores: dict[str, float] = {}
+                    if queries:
+                        pending = [
+                            i for i, _ in enumerate(queries)
+                            if now - fired.get((track_id, i), 0.0) > RECHECK_INTERVAL_S
+                        ]
+                        if pending:
+                            try:
+                                sims = _clip_similarities(crop, [queries[i] for i in pending])
+                            except Exception:
+                                logger.exception("CLIP inference failed for track %d", track_id)
+                                sims = []
+                            for q_idx, sim in zip(pending, sims):
+                                scores[queries[q_idx]] = sim
+                                if sim >= _similarity_threshold:
+                                    fired[(track_id, q_idx)] = now
+                                    _append_event(CameraEvent(
+                                        timestamp=datetime.now().isoformat(timespec="seconds"),
+                                        query=queries[q_idx],
+                                        track_id=track_id,
+                                        confidence=sim,
+                                    ))
+                                    logger.info(
+                                        "Camera event: track=%d query=%r sim=%.3f",
+                                        track_id, queries[q_idx], sim,
+                                    )
 
-                    try:
-                        sims = _clip_similarities(crop, [queries[i] for i in pending])
-                    except Exception:
-                        logger.exception("CLIP inference failed for track %d", track_id)
-                        continue
+                    frame_detections.append(Detection(
+                        track_id=track_id,
+                        box=(x1, y1, x2, y2),
+                        scores=scores,
+                    ))
 
-                    for local_i, (q_idx, sim) in enumerate(zip(pending, sims)):
-                        if sim >= _similarity_threshold:
-                            fired[(track_id, q_idx)] = now
-                            ev = CameraEvent(
-                                timestamp=datetime.now().isoformat(timespec="seconds"),
-                                query=queries[q_idx],
-                                track_id=track_id,
-                                confidence=sim,
-                            )
-                            _append_event(ev)
-                            logger.info(
-                                "Camera event: track=%d query=%r sim=%.3f",
-                                track_id, queries[q_idx], sim,
-                            )
+                _set_latest_detections(frame_detections)
 
                 # Prune stale fired-cache entries
                 cutoff = now - TRACK_PRUNE_AGE_S
                 fired = {k: v for k, v in fired.items() if v > cutoff}
+            else:
+                _set_latest_detections([])
 
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, frame_interval - elapsed))

@@ -12,6 +12,16 @@ os.environ.setdefault(
 )
 
 _stream_url: str | None = None
+_debug_overlay: bool = False
+
+
+def set_debug_overlay(enabled: bool) -> None:
+    global _debug_overlay
+    _debug_overlay = enabled
+
+
+def get_debug_overlay() -> bool:
+    return _debug_overlay
 
 
 def set_stream_url(url: str) -> None:
@@ -48,6 +58,20 @@ async def mjpeg_generator(rtsp_url: str):
                     # End of file — loop back to start
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
+                if _debug_overlay:
+                    from services import scene_service
+                    for det in scene_service.get_latest_detections():
+                        x1, y1, x2, y2 = det.box
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        label = f"#{det.track_id}"
+                        cv2.putText(frame, label, (x1, y1 - 8),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        for row, (query, sim) in enumerate(det.scores.items()):
+                            color = (0, 255, 0) if sim >= scene_service.get_threshold() else (0, 165, 255)
+                            text = f"{query[:20]}: {sim:.2f}"
+                            cv2.putText(frame, text, (x1, y1 + 20 + row * 20),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
                 ok, jpeg = cv2.imencode(
                     ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70]
                 )
