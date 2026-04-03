@@ -11,3 +11,8 @@ jinja2
 faster-whisper
 apscheduler
 opencv-python-headless
+torch
+torchvision
+ultralytics
+transformers
+Pillow

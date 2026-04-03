@@ -177,6 +177,20 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-02 — Session 11
+- **Implemented AI scene analysis pipeline** on the cameras page — YOLOv8 + ByteTrack + CLIP, all running locally on GPU.
+  - `services/scene_service.py`: independent background thread opens the RTSP stream at 3 fps, runs YOLOv8n person detection + ByteTrack tracking, crops each person bounding box, computes CLIP cosine similarity against user-defined natural-language queries, and logs events when similarity ≥ 0.25. Deduplicates by (track_id, query_index) with a 30-second recheck window.
+  - Models loaded lazily on first `start_analysis()` call — no impact on startup when cameras page is unused.
+  - Analysis loop is separate from the MJPEG stream thread — live video unaffected by inference.
+- **Scene query management** — users define arbitrary natural-language queries (e.g. "person in red clothing", "small child"). Queries are global (shared across cameras for now). Stored in memory.
+  - `GET /cameras/queries` — list current queries
+  - `POST /cameras/queries` — add query
+  - `DELETE /cameras/queries/{index}` — remove query
+- **Event log** — rolling 1-hour window, served via `GET /cameras/events`. Frontend polls every 5 seconds and renders events most-recent-first with timestamp, query text, and confidence %.
+- **cameras.html updated** — query management UI (add/remove badges) + live event log replace the "under construction" placeholder.
+- **Added packages:** `torch 2.6.0+cu124`, `torchvision 0.21.0+cu124`, `ultralytics` (YOLOv8 + ByteTrack), `transformers` (CLIP ViT-B/32), `Pillow`. All verified on CUDA.
+- **VRAM budget (post-AI):** Qwen 14b ~10GB + Whisper ~1.5GB + YOLOv8n ~0.05GB + CLIP ViT-B/32 ~0.6GB ≈ 12.15GB — fits comfortably in 16GB.
+
 ### 2026-04-02 — Session 10
 - **Restructured home page layout** — replaced two-section (Games / Assistant) layout with 4 large navigation cards: Games, Family Dashboard, Talk to Bianca, Cameras. Cleaner top-level navigation.
 - **Added Games hub page** (`GET /games`) — `templates/games.html` collects all game cards (Hangman, Times Tables, Tell the Time, Knowledge Quiz) in one place. Home now links to `/games` rather than individual game routes.

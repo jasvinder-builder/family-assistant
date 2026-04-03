@@ -9,10 +9,22 @@
     body { background: #f0f4f8; min-height: 100vh; }
     .hero { background: linear-gradient(135deg, #1e293b, #334155); color: white; padding: 1rem 1.25rem; display: flex; align-items: center; gap: 1rem; }
     .hero-text h1 { font-size: 1.4rem; font-weight: 700; margin: 0; }
-    .hero-text p { opacity: 0.85; font-size: 0.85rem; margin: 0.15rem 0 0; }
-    .card { border: none; border-radius: 16px; box-shadow: 0 2px 12px rgba(0,0,0,0.10); }
-    #videoFeed { width: 100%; max-height: 480px; object-fit: contain; border-radius: 10px; background: #000; display: block; }
-    .construction-box { border: 2px dashed #cbd5e1; border-radius: 16px; background: #f8fafc; }
+    .hero-text p  { opacity: 0.85; font-size: 0.85rem; margin: 0.15rem 0 0; }
+    .card { border: none; border-radius: 16px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
+    #videoFeed { width: 100%; max-height: 480px; object-fit: contain; border-radius: 10px; background: #0f172a; display: block; }
+    .query-badge {
+      display: flex; align-items: center; gap: 0.5rem;
+      background: #eff6ff; border: 1px solid #bfdbfe;
+      border-radius: 8px; padding: 0.4rem 0.75rem;
+      font-size: 0.88rem;
+    }
+    .query-badge button { padding: 0; border: none; background: none; color: #94a3b8; line-height: 1; font-size: 1rem; }
+    .query-badge button:hover { color: #ef4444; }
+    .event-row { border-left: 3px solid #6366f1; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; background: white; border-radius: 0 8px 8px 0; font-size: 0.88rem; }
+    .event-ts { color: #64748b; font-size: 0.78rem; font-variant-numeric: tabular-nums; }
+    .event-conf { color: #94a3b8; font-size: 0.75rem; }
+    .empty-hint { color: #94a3b8; font-size: 0.88rem; }
+    .stream-error { display: none; color: #ef4444; font-size: 0.85rem; margin-top: 0.5rem; }
   </style>
 </head>
 <body>
@@ -21,115 +33,232 @@
   <a href="/" class="btn btn-light btn-sm fw-semibold">← Home</a>
   <div class="hero-text">
     <h1>📷 Cameras</h1>
-    <p>Live stream viewer</p>
+    <p>Live stream · AI event detection</p>
   </div>
 </div>
 
-<div class="container py-4" style="max-width:800px;">
+<div class="container py-4" style="max-width:860px;">
 
-  <!-- RTSP URL form -->
+  <!-- ── Stream URL ─────────────────────────────────────────────────────── -->
   <div class="card mb-4">
     <div class="card-body">
       <h6 class="fw-semibold mb-3">Camera Stream</h6>
       <div class="input-group">
         <input type="text" id="rtspUrl" class="form-control font-monospace"
-               placeholder="rtsp://username:password@192.168.1.100:554/stream"
+               placeholder="rtsp://username:password@host:554/stream"
                value="{{ current_url or 'rtsp://zGFoMXarNI9GEdwg8nQe7xL6ZNQwhM3u:p0N-dg3ds_t_bY-zRmGf3@test.rtsp.stream/people' }}">
-        <button class="btn btn-primary" id="connectBtn" onclick="connectStream()">Connect</button>
+        <button class="btn btn-primary"   id="connectBtn"    onclick="connectStream()">Connect</button>
+        <button class="btn btn-outline-danger d-none" id="disconnectBtn" onclick="disconnectStream()">Disconnect</button>
       </div>
       <div id="statusMsg" class="mt-2 small"></div>
     </div>
   </div>
 
-  <!-- Live video -->
+  <!-- ── Live video ─────────────────────────────────────────────────────── -->
   <div id="videoSection" class="card mb-4 {% if not current_url %}d-none{% endif %}">
     <div class="card-body">
-      <div class="d-flex justify-content-between align-items-center mb-3">
-        <h6 class="fw-semibold mb-0">Live View</h6>
-        <button class="btn btn-outline-danger btn-sm" onclick="disconnectStream()">Disconnect</button>
-      </div>
+      <h6 class="fw-semibold mb-3">Live View</h6>
       <img id="videoFeed" src="{% if current_url %}/cameras/stream{% endif %}" alt="Camera feed">
-      <div id="streamError" class="text-danger small mt-2 d-none">
+      <div id="streamError" class="stream-error">
         Stream unavailable — check the RTSP URL and camera connectivity.
       </div>
     </div>
   </div>
 
-  <!-- Future features placeholder -->
-  <div class="construction-box p-5 text-center text-muted">
-    <div style="font-size:2.5rem;">🚧</div>
-    <div class="fw-semibold mt-2 fs-6">AI Event Detection — Coming Soon</div>
-    <div class="small mt-2 text-muted" style="max-width:400px;margin:0 auto;">
-      Significant events with timestamps will appear here — powered by YOLOv8, ByteTrack, and Qwen summarisation.
+  <!-- ── Scene queries ──────────────────────────────────────────────────── -->
+  <div class="card mb-4">
+    <div class="card-body">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <h6 class="fw-semibold mb-0">Scene Queries</h6>
+        <span class="text-muted small">CLIP matches against these during analysis</span>
+      </div>
+
+      <div id="queryList" class="d-flex flex-wrap gap-2 mb-3"></div>
+
+      <div class="input-group input-group-sm" style="max-width:420px;">
+        <input type="text" id="queryInput" class="form-control"
+               placeholder="e.g. small child, person in red clothing"
+               onkeydown="if(event.key==='Enter') addQuery()">
+        <button class="btn btn-outline-primary" onclick="addQuery()">+ Add</button>
+      </div>
     </div>
   </div>
 
-</div>
+  <!-- ── Event log ──────────────────────────────────────────────────────── -->
+  <div class="card">
+    <div class="card-body">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <h6 class="fw-semibold mb-0">Detected Events <span class="text-muted fw-normal small">(last hour)</span></h6>
+        <span id="eventCount" class="badge bg-indigo text-white" style="background:#6366f1;"></span>
+      </div>
+      <div id="eventLog">
+        <p class="empty-hint">No events yet. Connect a stream and add scene queries to start detection.</p>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /container -->
 
 <script>
-  const videoFeed = document.getElementById('videoFeed');
+  const videoFeed    = document.getElementById('videoFeed');
   const videoSection = document.getElementById('videoSection');
-  const statusMsg = document.getElementById('statusMsg');
-  const streamError = document.getElementById('streamError');
+  const statusMsg    = document.getElementById('statusMsg');
+  const streamError  = document.getElementById('streamError');
 
-  // Detect broken stream
-  videoFeed.onerror = () => {
-    streamError.classList.remove('d-none');
-  };
-  videoFeed.onload = () => {
-    streamError.classList.add('d-none');
-  };
+  // ── Stream connection ────────────────────────────────────────────────────
+
+  videoFeed.onerror = () => { streamError.style.display = 'block'; };
+  videoFeed.onload  = () => { streamError.style.display = 'none';  };
 
   async function connectStream() {
     const url = document.getElementById('rtspUrl').value.trim();
-    if (!url) {
-      statusMsg.className = 'mt-2 small text-danger';
-      statusMsg.textContent = 'Please enter an RTSP URL.';
-      return;
+    if (!url) { showStatus('Please enter an RTSP URL.', 'danger'); return; }
+
+    showStatus('Connecting…', 'muted');
+    setConnectBtns(true);
+
+    const res  = await fetch('/cameras/set-stream', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url}),
+    }).catch(() => null);
+
+    setConnectBtns(false);
+    if (!res || !res.ok) {
+      const err = res ? (await res.json()).error : 'Network error';
+      showStatus(err, 'danger'); return;
     }
 
-    statusMsg.className = 'mt-2 small text-muted';
-    statusMsg.textContent = 'Connecting…';
-    document.getElementById('connectBtn').disabled = true;
-
-    try {
-      const res = await fetch('/cameras/set-stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url })
-      });
-      const data = await res.json();
-
-      if (res.ok) {
-        streamError.classList.add('d-none');
-        videoFeed.src = '/cameras/stream?' + Date.now();
-        videoSection.classList.remove('d-none');
-        statusMsg.className = 'mt-2 small text-success';
-        statusMsg.textContent = 'Connected.';
-      } else {
-        statusMsg.className = 'mt-2 small text-danger';
-        statusMsg.textContent = data.error || 'Failed to connect.';
-      }
-    } catch {
-      statusMsg.className = 'mt-2 small text-danger';
-      statusMsg.textContent = 'Network error — server may be offline.';
-    } finally {
-      document.getElementById('connectBtn').disabled = false;
-    }
+    streamError.style.display = 'none';
+    videoFeed.src = '/cameras/stream?' + Date.now();
+    videoSection.classList.remove('d-none');
+    document.getElementById('connectBtn').classList.add('d-none');
+    document.getElementById('disconnectBtn').classList.remove('d-none');
+    showStatus('Connected — AI analysis starting in background.', 'success');
   }
 
   async function disconnectStream() {
     videoFeed.src = '';
     videoSection.classList.add('d-none');
-    streamError.classList.add('d-none');
-    statusMsg.className = 'mt-2 small text-muted';
-    statusMsg.textContent = '';
+    streamError.style.display = 'none';
+    document.getElementById('connectBtn').classList.remove('d-none');
+    document.getElementById('disconnectBtn').classList.add('d-none');
+    showStatus('', 'muted');
     await fetch('/cameras/set-stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: '' })
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url: ''}),
     });
   }
+
+  function showStatus(msg, type) {
+    statusMsg.className = `mt-2 small text-${type}`;
+    statusMsg.textContent = msg;
+  }
+
+  function setConnectBtns(disabled) {
+    document.getElementById('connectBtn').disabled    = disabled;
+    document.getElementById('disconnectBtn').disabled = disabled;
+  }
+
+  // ── Query management ──────────────────────────────────────────────────────
+
+  let queries = [];
+
+  function renderQueries() {
+    const el = document.getElementById('queryList');
+    if (queries.length === 0) {
+      el.innerHTML = '<span class="empty-hint">No queries yet.</span>';
+      return;
+    }
+    el.innerHTML = queries.map((q, i) => `
+      <div class="query-badge">
+        <span>${escHtml(q)}</span>
+        <button onclick="removeQuery(${i})" title="Remove">×</button>
+      </div>`).join('');
+  }
+
+  async function loadQueries() {
+    const res  = await fetch('/cameras/queries').catch(() => null);
+    if (!res || !res.ok) return;
+    const data = await res.json();
+    queries = data.queries;
+    renderQueries();
+  }
+
+  async function addQuery() {
+    const input = document.getElementById('queryInput');
+    const text  = input.value.trim();
+    if (!text) return;
+    const res  = await fetch('/cameras/queries', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text}),
+    }).catch(() => null);
+    if (!res || !res.ok) return;
+    const data = await res.json();
+    queries = data.queries;
+    renderQueries();
+    input.value = '';
+  }
+
+  async function removeQuery(index) {
+    const res  = await fetch(`/cameras/queries/${index}`, {method: 'DELETE'}).catch(() => null);
+    if (!res || !res.ok) return;
+    const data = await res.json();
+    queries = data.queries;
+    renderQueries();
+  }
+
+  // ── Event log ─────────────────────────────────────────────────────────────
+
+  function renderEvents(events) {
+    const el    = document.getElementById('eventLog');
+    const badge = document.getElementById('eventCount');
+    badge.textContent = events.length ? `${events.length} event${events.length > 1 ? 's' : ''}` : '';
+
+    if (events.length === 0) {
+      el.innerHTML = '<p class="empty-hint mb-0">No events yet. Connect a stream and add scene queries to start detection.</p>';
+      return;
+    }
+
+    // Show most recent first
+    const rows = [...events].reverse().map(e => {
+      const ts   = e.timestamp.replace('T', ' ');
+      const conf = `${Math.round(e.confidence * 100)}% match`;
+      return `<div class="event-row">
+        <div class="d-flex justify-content-between align-items-start gap-2">
+          <span>🔍 ${escHtml(e.query)}</span>
+          <span class="event-conf">${conf}</span>
+        </div>
+        <div class="event-ts">${ts}</div>
+      </div>`;
+    }).join('');
+    el.innerHTML = rows;
+  }
+
+  async function pollEvents() {
+    const res = await fetch('/cameras/events').catch(() => null);
+    if (res && res.ok) {
+      const data = await res.json();
+      renderEvents(data.events);
+    }
+    setTimeout(pollEvents, 5000);
+  }
+
+  // ── Utilities ─────────────────────────────────────────────────────────────
+
+  function escHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // ── Init ─────────────────────────────────────────────────────────────────
+
+  loadQueries();
+  pollEvents();
+
+  {% if current_url %}
+  document.getElementById('connectBtn').classList.add('d-none');
+  document.getElementById('disconnectBtn').classList.remove('d-none');
+  showStatus('Stream active — AI analysis running.', 'success');
+  {% endif %}
 </script>
 
 </body>

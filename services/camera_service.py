@@ -7,7 +7,13 @@ _stream_url: str | None = None
 
 def set_stream_url(url: str) -> None:
     global _stream_url
+    from services import scene_service
+
     _stream_url = url.strip() if url.strip() else None
+    if _stream_url:
+        scene_service.start_analysis(_stream_url)
+    else:
+        scene_service.stop_analysis()
 
 
 def get_stream_url() -> str | None:

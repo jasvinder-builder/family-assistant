@@ -15,7 +15,7 @@ from handlers.response_handler import voice_say_hangup
 from handlers import chat_handler
 from services import whisper_service, reminder_service
 from services import hangman_service
-from services import camera_service
+from services import camera_service, scene_service
 from config import settings as app_settings
 from services import markdown_service, session_store
 from services import qwen
@@ -108,6 +108,33 @@ async def cameras_stream():
         camera_service.mjpeg_generator(url),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.get("/cameras/queries")
+async def cameras_get_queries():
+    return JSONResponse({"queries": scene_service.get_queries()})
+
+
+@app.post("/cameras/queries")
+async def cameras_add_query(payload: dict):
+    text = payload.get("text", "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    added = scene_service.add_query(text)
+    return JSONResponse({"ok": True, "added": added, "queries": scene_service.get_queries()})
+
+
+@app.delete("/cameras/queries/{index}")
+async def cameras_remove_query(index: int):
+    removed = scene_service.remove_query(index)
+    if not removed:
+        return JSONResponse({"error": "index out of range"}, status_code=404)
+    return JSONResponse({"ok": True, "queries": scene_service.get_queries()})
+
+
+@app.get("/cameras/events")
+async def cameras_get_events():
+    return JSONResponse({"events": scene_service.get_events()})
 
 
 @app.post("/transcribe")
