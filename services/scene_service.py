@@ -24,7 +24,9 @@ import cv2
 # Keep ultralytics config and weights inside the project directory rather than
 # writing to ~/.config/Ultralytics — set before any ultralytics import.
 _project_root = Path(__file__).parent.parent
-os.environ.setdefault("YOLO_CONFIG_DIR", str(_project_root / ".ultralytics"))
+_yolo_cfg_dir = _project_root / ".ultralytics"
+_yolo_cfg_dir.mkdir(exist_ok=True)
+os.environ.setdefault("YOLO_CONFIG_DIR", str(_yolo_cfg_dir))
 import numpy as np
 
 logger = logging.getLogger(__name__)
