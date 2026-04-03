@@ -75,12 +75,21 @@
 
       <div id="queryList" class="d-flex flex-wrap gap-2 mb-3"></div>
 
-      <div class="input-group input-group-sm" style="max-width:420px;">
+      <div class="input-group input-group-sm mb-3" style="max-width:420px;">
         <input type="text" id="queryInput" class="form-control"
                placeholder="e.g. small child, person in red clothing"
                onkeydown="if(event.key==='Enter') addQuery()">
         <button class="btn btn-outline-primary" onclick="addQuery()">+ Add</button>
       </div>
+
+      <div class="d-flex align-items-center gap-3" style="max-width:420px;">
+        <label class="form-label mb-0 small fw-semibold text-nowrap">Match threshold</label>
+        <input type="range" class="form-range" id="thresholdSlider"
+               min="0.05" max="0.50" step="0.01" value="0.15"
+               oninput="updateThreshold(this.value)">
+        <span id="thresholdVal" class="small fw-semibold text-nowrap" style="min-width:3rem;">0.15</span>
+      </div>
+      <div class="small text-muted mt-1">Lower → more matches (risk of false positives) · Higher → fewer, more confident matches</div>
     </div>
   </div>
 
@@ -249,9 +258,29 @@
     return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   }
 
+  // ── Threshold ─────────────────────────────────────────────────────────────
+
+  async function updateThreshold(val) {
+    const v = parseFloat(val);
+    document.getElementById('thresholdVal').textContent = v.toFixed(2);
+    await fetch('/cameras/threshold', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({value: v}),
+    });
+  }
+
+  async function loadThreshold() {
+    const res = await fetch('/cameras/threshold').catch(() => null);
+    if (!res || !res.ok) return;
+    const {threshold} = await res.json();
+    document.getElementById('thresholdSlider').value = threshold;
+    document.getElementById('thresholdVal').textContent = threshold.toFixed(2);
+  }
+
   // ── Init ─────────────────────────────────────────────────────────────────
 
   loadQueries();
+  loadThreshold();
   pollEvents();
 
   {% if current_url %}

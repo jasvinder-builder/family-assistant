@@ -138,6 +138,22 @@ async def cameras_get_events():
     return JSONResponse({"events": scene_service.get_events()})
 
 
+@app.post("/cameras/threshold")
+async def cameras_set_threshold(payload: dict):
+    value = payload.get("value")
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "value must be a number"}, status_code=400)
+    scene_service.set_threshold(value)
+    return JSONResponse({"ok": True, "threshold": scene_service.get_threshold()})
+
+
+@app.get("/cameras/threshold")
+async def cameras_get_threshold():
+    return JSONResponse({"threshold": scene_service.get_threshold()})
+
+
 @app.post("/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):
     """Receive browser audio blob (webm or wav), transcribe via local Whisper."""

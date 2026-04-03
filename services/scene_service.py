@@ -39,7 +39,16 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-SIMILARITY_THRESHOLD = 0.15   # CLIP cosine similarity floor (tune upward to reduce false positives)
+_similarity_threshold = 0.15  # mutable at runtime via set_threshold()
+
+
+def get_threshold() -> float:
+    return _similarity_threshold
+
+
+def set_threshold(value: float) -> None:
+    global _similarity_threshold
+    _similarity_threshold = max(0.0, min(1.0, value))
 RECHECK_INTERVAL_S   = 30     # seconds before re-checking same (track, query)
 ANALYSIS_FPS         = 3      # frames per second to analyse
 TRACK_PRUNE_AGE_S    = 300    # prune fired-cache entries older than this
@@ -253,7 +262,7 @@ def _analysis_loop(rtsp_url: str) -> None:
                         continue
 
                     for local_i, (q_idx, sim) in enumerate(zip(pending, sims)):
-                        if sim >= SIMILARITY_THRESHOLD:
+                        if sim >= _similarity_threshold:
                             fired[(track_id, q_idx)] = now
                             ev = CameraEvent(
                                 timestamp=datetime.now().isoformat(timespec="seconds"),
