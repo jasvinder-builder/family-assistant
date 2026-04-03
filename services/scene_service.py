@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-_similarity_threshold = 0.15  # mutable at runtime via set_threshold()
+_similarity_threshold = 0.25  # mutable at runtime via set_threshold()
 _crop_padding = 0.3            # fractional padding added around each crop before CLIP
 _debug_overlay: bool = False   # mirrored from camera_service
 

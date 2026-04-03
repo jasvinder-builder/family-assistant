@@ -86,7 +86,7 @@ async def cameras_page(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="cameras.html",
-        context={"current_url": camera_service.get_stream_url()},
+        context={"current_url": camera_service.get_stream_url() or "/home/jasvinder/test1.mp4"},
     )
 
 
