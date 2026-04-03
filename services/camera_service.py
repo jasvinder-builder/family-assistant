@@ -83,7 +83,7 @@ def _reader_loop(rtsp_url: str) -> None:
                 for det in scene_service.get_latest_detections():
                     x1, y1, x2, y2 = det.box
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label = f"#{det.track_id}"
+                    label = f"{det.label} #{det.track_id}"
                     cv2.putText(frame, label, (x1, y1 - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                     for row, (query, sim) in enumerate(det.scores.items()):

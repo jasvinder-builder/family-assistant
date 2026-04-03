@@ -177,6 +177,13 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-02 — Session 16
+- **Expanded YOLO detection to vehicles and animals** — previously only class 0 (person). Now detects: bicycle (1), car (2), motorcycle (3), bus (5), truck (7), bird (14), cat (15), dog (16). All feed into CLIP matching and the event log. Debug overlay now shows the class label (e.g. `car #3`) alongside track ID.
+- **Added configurable crop padding** (`_crop_padding`, default 0.3) — before CLIP inference the YOLO bounding box is expanded by `pad_factor × box_size` on each side (clamped to frame boundaries). Gives CLIP more surrounding context for relational queries like "person with stroller" or "dog near car".
+  - New `GET/POST /cameras/pad` endpoints to read/set the factor at runtime.
+  - Pad factor slider (0.0–1.0, step 0.05) added to Scene Queries card in cameras.html.
+- **Detection dataclass extended** — added `label: str` field to `Detection`; populated from `_CLASS_LABELS` map keyed by YOLO class ID.
+
 ### 2026-04-03 — Session 15
 - **Diagnosed and fixed blank WebSocket camera stream** — WebSocket connected (`[WS] open`) but no frames arrived. Root cause discovered via server-side logging: `camera_service` had no logger, so the reader thread was silently failing. Added `logging.getLogger` to camera_service, plus log lines in `_reader_loop` (start, open failure, first 3 frames, crash, stop) and the WebSocket endpoint. Error surfaced: `failed to open stream /home/test.mp4` — video file was at `/home/jasvinder/test.mp4`, not `/home/test.mp4`. Fixed by using correct path; stream now works through Cloudflare Tunnel.
 - **Added debug console logging to cameras.html** — logs WebSocket URL, open/close/error events, and first 3 frame sizes to browser console for future diagnostics.

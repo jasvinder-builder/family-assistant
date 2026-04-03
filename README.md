@@ -69,7 +69,7 @@ Talk to Bianca (/talk)          Family Dashboard (/dashboard)
 - **Times Tables** — voice multiplication practice; Bianca asks, kid answers out loud
 - **Tell the Time** — 4-option clock reading game with pure SVG clock faces
 - **Knowledge Quiz** — pick a subject and grade; Qwen generates 10 tailored questions on the fly
-- **Cameras** — live view of any RTSP stream or local video file streamed via WebSocket (works through Cloudflare Tunnel); YOLOv8 + ByteTrack detects and tracks persons; CLIP matches them against user-defined natural-language queries (e.g. "small child", "person in red"); matched events are logged with a thumbnail crop of the detected person
+- **Cameras** — live view of any RTSP stream or local video file streamed via WebSocket (works through Cloudflare Tunnel); YOLOv8 + ByteTrack detects and tracks persons, vehicles (bicycle, car, motorcycle, bus, truck), and animals (bird, cat, dog); CLIP matches them against user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa"); configurable crop padding expands the bounding box to give CLIP surrounding context for relational queries; matched events are logged with a thumbnail crop
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events
@@ -240,7 +240,7 @@ family-assistant/
 │   ├── reminder_service.py   # APScheduler — proactive WhatsApp event reminders
 │   ├── hangman_service.py    # Hangman game logic and in-memory game state
 │   ├── camera_service.py     # RTSP/file VideoCapture → MJPEG generator; shares frames with scene_service
-│   └── scene_service.py      # YOLOv8n + ByteTrack + CLIP — person detection, tracking, query matching, event log
+│   └── scene_service.py      # YOLOv8n + ByteTrack + CLIP — person/vehicle/animal detection, tracking, query matching, event log
 │
 ├── models/
 │   └── schemas.py            # Pydantic models: IntentResult, TodoItem, EventItem

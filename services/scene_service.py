@@ -40,7 +40,15 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────────
 
 _similarity_threshold = 0.15  # mutable at runtime via set_threshold()
+_crop_padding = 0.3            # fractional padding added around each crop before CLIP
 _debug_overlay: bool = False   # mirrored from camera_service
+
+# YOLO COCO class IDs we detect and their human-readable labels
+_DETECT_CLASSES = [0, 1, 2, 3, 5, 7, 14, 15, 16]
+_CLASS_LABELS = {
+    0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
+    5: "bus", 7: "truck", 14: "bird", 15: "cat", 16: "dog",
+}
 
 
 def get_threshold() -> float:
@@ -59,6 +67,17 @@ def get_debug_overlay() -> bool:
 def set_debug_overlay(enabled: bool) -> None:
     global _debug_overlay
     _debug_overlay = enabled
+
+
+def get_pad_factor() -> float:
+    return _crop_padding
+
+
+def set_pad_factor(value: float) -> None:
+    global _crop_padding
+    _crop_padding = max(0.0, min(2.0, value))
+
+
 RECHECK_INTERVAL_S   = 30     # seconds before re-checking same (track, query)
 ANALYSIS_FPS         = 3      # frames per second to analyse
 TRACK_PRUNE_AGE_S    = 300    # prune fired-cache entries older than this
@@ -70,6 +89,7 @@ class Detection:
     track_id: int
     box: tuple        # (x1, y1, x2, y2)
     scores: dict      # {query: similarity}
+    label: str = "person"  # YOLO class label
 
 
 _latest_detections: list[Detection] = []
@@ -266,12 +286,12 @@ def _analysis_loop() -> None:
             time.sleep(max(0.0, frame_interval - (time.monotonic() - t0)))
             continue
 
-        # YOLOv8 + ByteTrack — persons only (class 0)
+        # YOLOv8 + ByteTrack — persons, vehicles, and animals
         results = _yolo.track(
             frame,
             persist=True,
             tracker="bytetrack.yaml",
-            classes=[0],
+            classes=_DETECT_CLASSES,
             verbose=False,
             device=_device,
         )
@@ -280,18 +300,28 @@ def _analysis_loop() -> None:
             now = time.monotonic()
             h, w = frame.shape[:2]
             frame_detections: list[Detection] = []
+            pad_factor = get_pad_factor()
 
             for box in results[0].boxes:
                 if box.id is None:
                     continue
                 track_id = int(box.id.item())
+                cls_id = int(box.cls[0].item())
+                label = _CLASS_LABELS.get(cls_id, "object")
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w, x2), min(h, y2)
                 if x2 <= x1 or y2 <= y1:
                     continue
 
-                crop = frame[y1:y2, x1:x2]
+                # Expand crop by pad_factor for better CLIP context
+                pad_x = int((x2 - x1) * pad_factor)
+                pad_y = int((y2 - y1) * pad_factor)
+                cx1 = max(0, x1 - pad_x)
+                cy1 = max(0, y1 - pad_y)
+                cx2 = min(w, x2 + pad_x)
+                cy2 = min(h, y2 + pad_y)
+                crop = frame[cy1:cy2, cx1:cx2]
                 if crop.size == 0:
                     continue
 
@@ -324,14 +354,15 @@ def _analysis_loop() -> None:
                                     image_b64=img_b64,
                                 ))
                                 logger.info(
-                                    "Camera event: track=%d query=%r sim=%.3f",
-                                    track_id, queries[q_idx], sim,
+                                    "Camera event: track=%d label=%s query=%r sim=%.3f",
+                                    track_id, label, queries[q_idx], sim,
                                 )
 
                 frame_detections.append(Detection(
                     track_id=track_id,
                     box=(x1, y1, x2, y2),
                     scores=scores,
+                    label=label,
                 ))
 
             _set_latest_detections(frame_detections)
