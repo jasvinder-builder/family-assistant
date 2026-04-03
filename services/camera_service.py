@@ -1,6 +1,14 @@
 import asyncio
+import os
 import queue
 import threading
+
+# Force TCP transport for RTSP — UDP is often blocked by firewalls/NAT.
+# stimeout is the socket timeout in microseconds (5s).
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000",
+)
 
 _stream_url: str | None = None
 
@@ -28,7 +36,7 @@ async def mjpeg_generator(rtsp_url: str):
     stop_event = threading.Event()
 
     def _reader():
-        cap = cv2.VideoCapture(rtsp_url)
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
         try:
             while not stop_event.is_set():
                 ret, frame = cap.read()

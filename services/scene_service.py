@@ -27,6 +27,12 @@ _project_root = Path(__file__).parent.parent
 _yolo_cfg_dir = _project_root / ".ultralytics"
 _yolo_cfg_dir.mkdir(exist_ok=True)
 os.environ.setdefault("YOLO_CONFIG_DIR", str(_yolo_cfg_dir))
+
+# Force TCP transport for RTSP — UDP is often blocked by firewalls/NAT.
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;5000000",
+)
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -174,7 +180,7 @@ def _analysis_loop(rtsp_url: str) -> None:
         logger.exception("Failed to load scene analysis models — analysis disabled")
         return
 
-    cap = cv2.VideoCapture(rtsp_url)
+    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         logger.error("Scene analysis: cannot open RTSP stream %s", rtsp_url)
         return
@@ -192,7 +198,7 @@ def _analysis_loop(rtsp_url: str) -> None:
                 logger.warning("Scene analysis: stream read failed — reconnecting in 2s")
                 time.sleep(2)
                 cap.release()
-                cap = cv2.VideoCapture(rtsp_url)
+                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
                 continue
 
             queries = get_queries()
