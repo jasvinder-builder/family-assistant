@@ -1,8 +1,11 @@
 import asyncio
+import logging
 import os
 import queue
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 
 # Force TCP transport for RTSP — UDP is often blocked by firewalls/NAT.
 # stimeout is the socket timeout in microseconds (5s).
@@ -54,10 +57,16 @@ def _reader_loop(rtsp_url: str) -> None:
     """Singleton background thread: reads frames and broadcasts JPEG bytes."""
     import cv2
 
+    logger.info("Camera reader starting — %s", rtsp_url)
     cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        logger.error("Camera reader: failed to open stream %s", rtsp_url)
+        return
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        logger.info("Camera reader: opened at %.1f fps", fps)
         frame_interval = 1.0 / fps
+        frame_count = 0
         while not _reader_stop.is_set():
             t0 = time.monotonic()
             ret, frame = cap.read()
@@ -85,12 +94,18 @@ def _reader_loop(rtsp_url: str) -> None:
 
             ok, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
+                frame_count += 1
+                if frame_count <= 3:
+                    logger.info("Camera reader: broadcasting frame %d to %d subscriber(s)", frame_count, len(_subscribers))
                 _broadcast(jpeg.tobytes())
 
             elapsed = time.monotonic() - t0
             time.sleep(max(0.0, frame_interval - elapsed))
+    except Exception:
+        logger.exception("Camera reader crashed")
     finally:
         cap.release()
+        logger.info("Camera reader stopped")
         # Signal all waiting subscribers that the stream has ended
         with _subscribers_lock:
             for q in _subscribers:

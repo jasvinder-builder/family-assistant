@@ -129,23 +129,27 @@
 
   function startWebSocket() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(`${proto}//${location.host}/cameras/ws`);
+    const wsUrl = `${proto}//${location.host}/cameras/ws`;
+    console.log('[WS] connecting to', wsUrl);
+    ws = new WebSocket(wsUrl);
     ws.binaryType = 'blob';
 
-    ws.onopen = () => { streamError.style.display = 'none'; };
+    ws.onopen  = () => { console.log('[WS] open'); streamError.style.display = 'none'; };
+    ws.onerror = (e) => { console.error('[WS] error', e); streamError.style.display = 'block'; };
+    ws.onclose = (e) => { console.log('[WS] closed — code:', e.code, 'reason:', e.reason); ws = null; };
 
+    let frameCount = 0;
     ws.onmessage = (e) => {
+      frameCount++;
+      if (frameCount <= 3) console.log('[WS] frame', frameCount, 'size:', e.data.size, 'bytes');
       const url = URL.createObjectURL(new Blob([e.data], {type: 'image/jpeg'}));
       videoFeed.onload = () => {
         if (prevBlobUrl) URL.revokeObjectURL(prevBlobUrl);
         prevBlobUrl = url;
       };
+      videoFeed.onerror = (err) => { console.error('[WS] img load error', err); URL.revokeObjectURL(url); };
       videoFeed.src = url;
     };
-
-    ws.onerror = () => { streamError.style.display = 'block'; };
-
-    ws.onclose = () => { ws = null; };
   }
 
   function stopWebSocket() {

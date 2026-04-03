@@ -121,11 +121,13 @@ async def cameras_stream():
 @app.websocket("/cameras/ws")
 async def cameras_ws(websocket: WebSocket):
     await websocket.accept()
+    logger.info("WebSocket camera client connected")
     try:
         async for jpeg_bytes in camera_service.ws_frame_generator():
             await websocket.send_bytes(jpeg_bytes)
     except WebSocketDisconnect:
         pass
+    logger.info("WebSocket camera client disconnected")
 
 
 @app.get("/cameras/queries")

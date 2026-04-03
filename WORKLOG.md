@@ -177,6 +177,10 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-03 — Session 15
+- **Diagnosed and fixed blank WebSocket camera stream** — WebSocket connected (`[WS] open`) but no frames arrived. Root cause discovered via server-side logging: `camera_service` had no logger, so the reader thread was silently failing. Added `logging.getLogger` to camera_service, plus log lines in `_reader_loop` (start, open failure, first 3 frames, crash, stop) and the WebSocket endpoint. Error surfaced: `failed to open stream /home/test.mp4` — video file was at `/home/jasvinder/test.mp4`, not `/home/test.mp4`. Fixed by using correct path; stream now works through Cloudflare Tunnel.
+- **Added debug console logging to cameras.html** — logs WebSocket URL, open/close/error events, and first 3 frame sizes to browser console for future diagnostics.
+
 ### 2026-04-03 — Session 14
 - **Switched camera stream from MJPEG to WebSocket** — MJPEG (`multipart/x-mixed-replace`) is buffered and silently dropped by Cloudflare Tunnel, making the camera page blank when accessed remotely.
   - `camera_service`: replaced per-connection `VideoCapture` reader threads with a **singleton broadcaster**. One `_reader_loop` thread reads frames and pushes JPEG bytes to all registered subscriber queues via `_broadcast()`. Both MJPEG and WebSocket consumers use `subscribe_frames()` / `unsubscribe_frames()`.
