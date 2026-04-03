@@ -177,6 +177,15 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-03 — Session 17
+- **Added three new voice games for kids:** Bulls and Cows, Word Ladder, and 20 Questions.
+- **Bulls and Cows** (`/games/bulls-cows`): Pure logic game — computer picks a secret 4-digit number (all unique, non-zero first); kid says digits aloud ("one two three four"); `parse_spoken_number()` maps tokens word-by-word (handles homophones: to→2, for→4, ate→8, digit chars). Server returns bulls/cows count; 10 attempts to win.
+- **Word Ladder** (`/games/word-ladder`): Qwen generates a start+target word pair (4-letter, common kid vocabulary); BFS validates a path exists in the filtered system dictionary (`/usr/share/dict/words` → lowercase alpha-only 3-5 letters, frozenset built at import). Per-step validation: same length, exactly 1 letter different, word in set. BFS-based hint tells which letter position to change. 5 wrong attempts. Hardcoded fallback pairs if Qwen pair fails BFS. Vertical chain visualiser with changed letter underlined.
+- **20 Questions** (`/games/twenty-questions`): Qwen asks yes/no questions to guess what the kid is thinking. Full Ollama `/api/chat` multi-turn conversation (messages list preserved in game state). 20-question limit; `force_twenty_questions_guess()` appends override message when limit reached. `_normalize_answer()` matches yes/no/maybe from natural speech. 4-phase UI: thinking → playing → guessing → finished. VAD only active during playing and guessing phases; paused during TTS (6s duration guard for longer questions).
+- **Qwen additions:** `ask_twenty_questions(messages)`, `force_twenty_questions_guess(messages)`, `generate_word_ladder()` — all use 30s timeout. Non-JSON Qwen responses in 20Q handled gracefully (treated as question with warning log).
+- **New routes:** 3 GET page routes + 8 POST game action routes added to main.py.
+- **games.html:** 3 new cards (teal/green/purple) added to the existing 4-game grid.
+
 ### 2026-04-02 — Session 16
 - **Expanded YOLO detection to vehicles and animals** — previously only class 0 (person). Now detects: bicycle (1), car (2), motorcycle (3), bus (5), truck (7), bird (14), cat (15), dog (16). All feed into CLIP matching and the event log. Debug overlay now shows the class label (e.g. `car #3`) alongside track ID.
 - **Added configurable crop padding** (`_crop_padding`, default 0.3) — before CLIP inference the YOLO bounding box is expanded by `pad_factor × box_size` on each side (clamped to frame boundaries). Gives CLIP more surrounding context for relational queries like "person with stroller" or "dog near car".

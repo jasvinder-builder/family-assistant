@@ -1,0 +1,18 @@
+Pick two common English words for a children's word ladder puzzle.
+
+Requirements:
+- Both words must be exactly 4 letters long
+- Both must be everyday words a child aged 7-11 would know (animals, colors, food, weather, simple objects, actions)
+- They must be different words
+- A word ladder path should exist between them (changing one letter at a time, each step a real word) in 2-5 steps
+
+Good examples of valid pairs:
+- love → like (path: love→live→like, 2 steps)
+- bear → deer (path: bear→beer→deer, 2 steps)
+- ball → tale (path: ball→tall→tale, 2 steps)
+- play → clan (path: play→clay→clan, 2 steps)
+
+Do not use proper nouns, offensive words, or obscure vocabulary.
+
+Respond with valid JSON only — no other text:
+{"start": "word1", "target": "word2"}

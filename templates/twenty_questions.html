@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>20 Questions — Bianca</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/bundle.min.js"></script>
+  <style>
+    body { background: #f5f3ff; min-height: 100vh; }
+    .header { background: #7c3aed; color: white; padding: 1rem 1.5rem; display: flex; align-items: center; gap: 1rem; }
+    .header a { color: rgba(255,255,255,0.85); text-decoration: none; font-size: 0.9rem; }
+
+    /* Phase panels */
+    .phase { display: none; }
+    .phase.active { display: block; }
+
+    /* Thinking phase */
+    .category-chip {
+      display: inline-block; background: white; border: 2px solid #ddd6fe;
+      border-radius: 20px; padding: 0.4rem 1rem; margin: 0.25rem;
+      font-size: 0.95rem; cursor: default; user-select: none;
+    }
+    .ready-btn {
+      background: #7c3aed; color: white; border: none;
+      border-radius: 14px; padding: 0.9rem 2.5rem;
+      font-size: 1.15rem; font-weight: 700; cursor: pointer;
+      transition: transform .1s, box-shadow .1s;
+    }
+    .ready-btn:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(124,58,237,0.35); }
+
+    /* Playing phase */
+    .progress-label { font-size: 0.85rem; color: #7c3aed; font-weight: 600; }
+    .question-card {
+      background: white; border-radius: 16px;
+      padding: 1.25rem 1.5rem; margin: 0.75rem 0;
+      font-size: 1.15rem; font-style: italic;
+      box-shadow: 0 2px 12px rgba(124,58,237,0.1);
+      min-height: 70px; display: flex; align-items: center; justify-content: center;
+    }
+    .answer-btn {
+      border-radius: 12px; padding: 0.65rem 1.6rem;
+      font-size: 1rem; font-weight: 600; border: 2px solid transparent;
+      cursor: pointer; transition: transform .1s;
+    }
+    .answer-btn:hover { transform: translateY(-1px); }
+    .btn-yes    { background: #dcfce7; color: #15803d; border-color: #86efac; }
+    .btn-no     { background: #fee2e2; color: #b91c1c; border-color: #fca5a5; }
+    .btn-maybe  { background: #fef9c3; color: #854d0e; border-color: #fde047; }
+
+    /* Q&A history */
+    .qa-row { display: flex; gap: 0.75rem; padding: 0.4rem 0;
+              border-bottom: 1px solid #ede9fe; font-size: 0.88rem; text-align: left; }
+    .qa-q { flex: 1; color: #4b5563; }
+    .qa-a { font-weight: 600; color: #7c3aed; min-width: 50px; text-align: right; }
+
+    /* Guessing phase */
+    .guess-card {
+      background: white; border-radius: 16px; padding: 1.5rem;
+      font-size: 1.2rem; box-shadow: 0 2px 12px rgba(124,58,237,0.15);
+    }
+    .guess-card strong { color: #7c3aed; font-size: 1.5rem; }
+    .confirm-btn {
+      border-radius: 12px; padding: 0.75rem 2rem;
+      font-size: 1.05rem; font-weight: 700; border: none; cursor: pointer;
+    }
+    .confirm-yes { background: #dcfce7; color: #15803d; }
+    .confirm-no  { background: #fee2e2; color: #b91c1c; }
+
+    /* Result */
+    .result-card { border-radius: 14px; padding: 1.25rem 1.5rem; font-size: 1.1rem; font-weight: 600; }
+    .result-card.won  { background: #dcfce7; color: #15803d; }
+    .result-card.lost { background: #ede9fe; color: #4c1d95; }
+
+    /* Voice ring */
+    #speech-text { font-size: 1rem; color: #374151; min-height: 1.5rem; }
+    #voice-ring {
+      width: 80px; height: 80px; border-radius: 50%;
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 2rem; transition: background 0.3s, box-shadow 0.3s;
+    }
+    #voice-ring.loading    { background: #f3f4f6; }
+    #voice-ring.ready      { background: #ede9fe; }
+    #voice-ring.speech     { background: #a78bfa; animation: ripple 1s infinite; }
+    #voice-ring.processing { background: #9ca3af; }
+    #voice-ring.speaking   { background: #dbeafe; }
+    #voice-ring.paused     { background: #f3f4f6; }
+    @keyframes ripple {
+      0%,100% { box-shadow: 0 0 0 0 rgba(167,139,250,0.4); }
+      50%      { box-shadow: 0 0 0 14px rgba(167,139,250,0); }
+    }
+    #status { font-size: 0.85rem; color: #6b7280; min-height: 1.4rem; }
+    .thinking-spinner { font-size: 2rem; animation: spin 1s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <a href="/games">← Games</a>
+  <strong>🤔 20 Questions</strong>
+</div>
+
+<div class="container py-4 text-center" style="max-width:480px">
+
+  <!-- ── Phase: thinking ───────────────────────────────────────────────── -->
+  <div id="phase-thinking" class="phase active">
+    <div style="font-size:3rem; margin-bottom:0.5rem;">🤫</div>
+    <h2 class="fw-bold mb-2" style="color:#4c1d95;">Think of something!</h2>
+    <p class="text-muted mb-3">Pick a category and keep it secret from Bianca:</p>
+    <div class="mb-4">
+      <span class="category-chip">🐘 Animal</span>
+      <span class="category-chip">🍕 Food</span>
+      <span class="category-chip">🎒 Object</span>
+      <span class="category-chip">🏔️ Place</span>
+    </div>
+    <button class="ready-btn" onclick="startGame()">I'm Ready! 🤫</button>
+    <p class="text-muted small mt-3">Don't tell Bianca — she'll try to guess with yes/no questions!</p>
+  </div>
+
+  <!-- ── Phase: loading (waiting for first question) ───────────────────── -->
+  <div id="phase-loading" class="phase">
+    <div class="thinking-spinner mt-4">⚙️</div>
+    <p class="text-muted mt-3">Bianca is thinking of her first question...</p>
+  </div>
+
+  <!-- ── Phase: playing ───────────────────────────────────────────────── -->
+  <div id="phase-playing" class="phase">
+    <!-- Progress -->
+    <div class="d-flex justify-content-between align-items-center mb-1">
+      <span class="progress-label">Question <span id="qNum">1</span> of 20</span>
+      <span class="text-muted small" id="qLeft"></span>
+    </div>
+    <div class="progress mb-2" style="height:6px;">
+      <div id="qProgress" class="progress-bar" style="background:#7c3aed; width:5%;"></div>
+    </div>
+
+    <!-- Question card -->
+    <div class="question-card" id="questionCard">
+      <span id="questionText">Bianca is thinking...</span>
+    </div>
+
+    <!-- Answer buttons -->
+    <div class="d-flex gap-2 justify-content-center mb-3">
+      <button class="answer-btn btn-yes"   onclick="sendAnswer('yes')">✅ Yes</button>
+      <button class="answer-btn btn-no"    onclick="sendAnswer('no')">❌ No</button>
+      <button class="answer-btn btn-maybe" onclick="sendAnswer('maybe')">🤷 Not sure</button>
+    </div>
+
+    <!-- Voice ring -->
+    <div class="mb-1">
+      <div id="voice-ring" class="loading">🎙️</div>
+      <div id="status" class="mt-2">Loading voice engine...</div>
+    </div>
+    <div class="text-muted small mb-3">Say "yes", "no", or "not sure"</div>
+
+    <!-- Bianca speech text -->
+    <div id="speech-text" class="mb-3 fst-italic text-muted"></div>
+
+    <!-- Q&A history (collapsible) -->
+    <div class="mt-2" style="text-align:left;">
+      <button class="btn btn-sm btn-outline-secondary w-100 mb-1" type="button"
+              data-bs-toggle="collapse" data-bs-target="#qaHistory">
+        📜 Show Q&amp;A history
+      </button>
+      <div class="collapse" id="qaHistory">
+        <div id="qaList" style="max-height:200px; overflow-y:auto; padding:0.5rem 0;"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Phase: guessing ───────────────────────────────────────────────── -->
+  <div id="phase-guessing" class="phase">
+    <div style="font-size:3rem; margin-bottom:0.5rem;">🎯</div>
+    <h3 class="fw-bold mb-3" style="color:#4c1d95;">I think I know!</h3>
+    <div class="guess-card mb-4" id="guessCard">
+      <strong id="guessText">...</strong>
+    </div>
+    <p class="text-muted mb-3">Am I right?</p>
+    <div class="d-flex gap-3 justify-content-center mb-3">
+      <button class="confirm-btn confirm-yes" onclick="confirmGuess('yes')">✅ Yes, you got it!</button>
+      <button class="confirm-btn confirm-no"  onclick="confirmGuess('no')">❌ Nope, wrong!</button>
+    </div>
+    <div id="speech-text-guess" class="fst-italic text-muted small"></div>
+  </div>
+
+  <!-- ── Phase: finished ───────────────────────────────────────────────── -->
+  <div id="phase-finished" class="phase">
+    <div id="result-banner" class="result-card mb-4"></div>
+    <button class="ready-btn" onclick="newGame()">🔄 Play Again</button>
+  </div>
+
+</div>
+
+<script>
+let sessionId = sessionStorage.getItem('twenty_q_session') || '';
+let currentPhase = 'thinking';
+let micVAD = null;
+let isProcessing = false;
+let vadActive = false;
+
+async function initVAD() {
+  try {
+    micVAD = await vad.MicVAD.new({
+      baseAssetPath:    'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/',
+      onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
+      model: 'v5',
+      positiveSpeechThreshold: 0.8,
+      negativeSpeechThreshold: 0.3,
+      minSpeechMs: 250,
+      onSpeechStart: () => {
+        if (!isProcessing && vadActive) { setRing('speech'); setStatus('Listening...'); }
+      },
+      onSpeechEnd: async (audio) => {
+        if (isProcessing || !vadActive) return;
+        if (audio.length / 16000 > 6) return;  // TTS questions are ~3-5s — guard at 6s
+        isProcessing = true;
+        micVAD.pause();
+        vadActive = false;
+        setRing('processing');
+        await transcribeAndAnswer(float32ToWav(audio, 16000));
+      },
+    });
+    // Don't auto-start — will be started once game begins (playing phase)
+    setRing('paused');
+    setStatus('Tap "I\'m Ready" to begin');
+  } catch (e) {
+    setRing('loading');
+    setStatus('Voice unavailable — use buttons to answer.');
+    console.error('VAD init failed:', e);
+  }
+}
+
+async function transcribeAndAnswer(blob) {
+  try {
+    const fd = new FormData();
+    fd.append('audio', blob, 'recording.wav');
+    const resp = await fetch('/transcribe', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (data.transcript && (data.confidence ?? 1) >= 0.25) {
+      const t = data.transcript.trim().toLowerCase();
+      if (currentPhase === 'playing') {
+        await sendAnswer(t);
+      } else if (currentPhase === 'guessing') {
+        await confirmGuess(t);
+      }
+    } else {
+      setStatus("Didn't catch that — use the buttons.");
+      resumeListening();
+    }
+  } catch {
+    setStatus('Transcription failed — use the buttons.');
+    resumeListening();
+  }
+}
+
+async function startGame() {
+  showPhase('loading');
+  try {
+    // New game first if we don't have a session
+    if (!sessionId) {
+      const nr = await fetch('/games/twenty-questions/new', { method: 'POST' });
+      const nd = await nr.json();
+      sessionId = nd.session_id;
+      sessionStorage.setItem('twenty_q_session', sessionId);
+    }
+    const resp = await fetch('/games/twenty-questions/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    applyState(await resp.json());
+  } catch {
+    showPhase('thinking');
+    alert('Could not connect. Please try again.');
+  }
+}
+
+async function sendAnswer(text) {
+  setStatus('Sending...');
+  try {
+    const resp = await fetch('/games/twenty-questions/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, answer: text }),
+    });
+    applyState(await resp.json());
+  } catch {
+    setStatus('Network error. Please try again.');
+    resumeListening();
+  }
+}
+
+async function confirmGuess(text) {
+  try {
+    const resp = await fetch('/games/twenty-questions/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, answer: text }),
+    });
+    applyState(await resp.json());
+  } catch {
+    alert('Network error. Please try again.');
+  }
+}
+
+async function newGame() {
+  sessionId = '';
+  sessionStorage.removeItem('twenty_q_session');
+  document.getElementById('qaList').innerHTML = '';
+  isProcessing = false;
+  vadActive = false;
+  if (micVAD) micVAD.pause();
+  setRing('paused');
+
+  // Pre-fetch a new session so it's ready
+  try {
+    const resp = await fetch('/games/twenty-questions/new', { method: 'POST' });
+    const data = await resp.json();
+    sessionId = data.session_id;
+    sessionStorage.setItem('twenty_q_session', sessionId);
+  } catch {}
+
+  showPhase('thinking');
+}
+
+function applyState(data) {
+  if (data.session_id) {
+    sessionId = data.session_id;
+    sessionStorage.setItem('twenty_q_session', sessionId);
+  }
+
+  if (data.phase === 'playing') {
+    showPhase('playing');
+
+    const n = data.question_count || 1;
+    const max = data.max_questions || 20;
+    document.getElementById('qNum').textContent = n;
+    document.getElementById('qLeft').textContent = `${max - n} left`;
+    document.getElementById('qProgress').style.width = `${Math.round((n / max) * 100)}%`;
+
+    if (data.last_question) {
+      document.getElementById('questionText').textContent = '"' + data.last_question + '"';
+    }
+
+    // Append latest Q&A pair to history
+    const qa = data.qa_history || [];
+    if (qa.length > 0) {
+      const latest = qa[qa.length - 1];
+      appendQA(latest[0], latest[1]);
+    }
+
+    if (data.speech) {
+      document.getElementById('speech-text').textContent = '💬 ' + data.speech;
+      speak(data.speech, () => resumeListening());
+    } else {
+      resumeListening();
+    }
+
+  } else if (data.phase === 'guessing') {
+    showPhase('guessing');
+    vadActive = false;
+    if (micVAD) micVAD.pause();
+    const guess = data.final_guess || '';
+    document.getElementById('guessText').textContent = guess;
+    if (data.speech) {
+      document.getElementById('speech-text-guess').textContent = '💬 ' + data.speech;
+      speak(data.speech, () => {
+        // Enable VAD for yes/no confirmation
+        vadActive = true;
+        if (micVAD) micVAD.start();
+        setRing('ready');
+        setStatus('Say yes or no');
+      });
+    }
+
+  } else if (data.phase === 'finished') {
+    showPhase('finished');
+    vadActive = false;
+    if (micVAD) micVAD.pause();
+    const banner = document.getElementById('result-banner');
+    if (data.correct) {
+      banner.className = 'result-card won';
+      banner.textContent = '🎉 Bianca guessed it! Great thinking!';
+    } else {
+      banner.className = 'result-card lost';
+      banner.textContent = '🏆 You stumped Bianca! Well done!';
+    }
+    if (data.speech) speak(data.speech, null);
+  }
+}
+
+function appendQA(question, answer) {
+  const list = document.getElementById('qaList');
+  const row = document.createElement('div');
+  row.className = 'qa-row';
+  row.innerHTML = `<span class="qa-q">${escHtml(question)}</span><span class="qa-a">${escHtml(answer)}</span>`;
+  list.appendChild(row);
+  list.scrollTop = list.scrollHeight;
+}
+
+function showPhase(name) {
+  currentPhase = name;
+  ['thinking', 'loading', 'playing', 'guessing', 'finished'].forEach(p => {
+    document.getElementById('phase-' + p).classList.toggle('active', p === name);
+  });
+}
+
+function resumeListening() {
+  isProcessing = false;
+  if (currentPhase === 'playing' || currentPhase === 'guessing') {
+    vadActive = true;
+    if (micVAD) micVAD.start();
+    setRing('ready');
+    setStatus(currentPhase === 'playing' ? 'Say "yes", "no", or "not sure"' : 'Say yes or no');
+  }
+}
+
+function speak(text, onDone) {
+  if (!window.speechSynthesis) { if (onDone) onDone(); return; }
+  vadActive = false;
+  if (micVAD) micVAD.pause();
+  window.speechSynthesis.cancel();
+  setRing('speaking');
+  setStatus('Bianca is speaking...');
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.lang = 'en-US'; utt.rate = 1.05;
+  let fired = false;
+  const wd = setTimeout(() => {
+    if (!fired) { fired = true; if (onDone) onDone(); else resumeListening(); }
+  }, Math.ceil(text.length / 15) * 1000 + 3000);
+  utt.onend  = () => { if (!fired) { fired = true; clearTimeout(wd); if (onDone) onDone(); else resumeListening(); } };
+  utt.onerror = () => { if (!fired) { fired = true; clearTimeout(wd); if (onDone) onDone(); else resumeListening(); } };
+  window.speechSynthesis.speak(utt);
+}
+
+function setRing(s) {
+  const el = document.getElementById('voice-ring');
+  if (el) el.className = s;
+}
+function setStatus(m) {
+  const el = document.getElementById('status');
+  if (el) el.textContent = m;
+}
+
+function escHtml(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function float32ToWav(samples, sampleRate) {
+  const len = samples.length;
+  const buf = new ArrayBuffer(44 + len * 2);
+  const view = new DataView(buf);
+  const w = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  w(0,'RIFF'); view.setUint32(4,36+len*2,true);
+  w(8,'WAVE'); w(12,'fmt ');
+  view.setUint32(16,16,true); view.setUint16(20,1,true);
+  view.setUint16(22,1,true);  view.setUint32(24,sampleRate,true);
+  view.setUint32(28,sampleRate*2,true); view.setUint16(32,2,true);
+  view.setUint16(34,16,true); w(36,'data');
+  view.setUint32(40,len*2,true);
+  let off = 44;
+  for (let i = 0; i < len; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true); off += 2;
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+if (window.speechSynthesis) {
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+}
+
+window.onload = async () => {
+  await initVAD();
+  // Pre-fetch a session silently in background
+  if (!sessionId) {
+    try {
+      const resp = await fetch('/games/twenty-questions/new', { method: 'POST' });
+      const data = await resp.json();
+      sessionId = data.session_id;
+      sessionStorage.setItem('twenty_q_session', sessionId);
+    } catch {}
+  }
+};
+</script>
+</body>
+</html>

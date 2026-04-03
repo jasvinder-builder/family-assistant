@@ -14,7 +14,7 @@ from handlers.research_handler import handle_research_choice, handle_research_wh
 from handlers.response_handler import voice_say_hangup
 from handlers import chat_handler
 from services import whisper_service, reminder_service
-from services import hangman_service
+from services import hangman_service, bulls_cows_service, word_ladder_service, twenty_questions_service
 from services import camera_service, scene_service
 from config import settings as app_settings
 from services import markdown_service, session_store
@@ -277,6 +277,108 @@ async def hangman_guess(payload: dict):
     session_id = payload.get("session_id", "")
     guess = payload.get("guess", "").strip()
     result = hangman_service.guess(session_id, guess)
+    return JSONResponse(result)
+
+
+# ── Bulls and Cows ────────────────────────────────────────────────────────────
+
+@app.get("/games/bulls-cows", response_class=HTMLResponse)
+async def bulls_cows_page(request: Request):
+    return templates.TemplateResponse(request=request, name="bulls_cows.html", context={})
+
+
+@app.post("/games/bulls-cows/new")
+async def bulls_cows_new():
+    game = bulls_cows_service.new_game()
+    speech = "I'm thinking of a 4-digit number — all digits are different. Say each digit separately to guess!"
+    return JSONResponse(game.to_dict(speech=speech))
+
+
+@app.post("/games/bulls-cows/guess")
+async def bulls_cows_guess(payload: dict):
+    session_id = payload.get("session_id", "")
+    guess_text = payload.get("guess", "").strip()
+    result = bulls_cows_service.guess(session_id, guess_text)
+    return JSONResponse(result)
+
+
+# ── Word Ladder ───────────────────────────────────────────────────────────────
+
+@app.get("/games/word-ladder", response_class=HTMLResponse)
+async def word_ladder_page(request: Request):
+    return templates.TemplateResponse(request=request, name="word_ladder.html", context={})
+
+
+@app.post("/games/word-ladder/new")
+async def word_ladder_new():
+    start = target = None
+    try:
+        pair = await asyncio.to_thread(qwen.generate_word_ladder)
+        start = pair.get("start", "").lower().strip()
+        target = pair.get("target", "").lower().strip()
+    except Exception as e:
+        logger.warning("word_ladder/new: Qwen pair generation failed: %s", e)
+    try:
+        game = await asyncio.to_thread(word_ladder_service.new_game, start, target)
+    except RuntimeError as e:
+        logger.error("word_ladder/new: %s", e)
+        return JSONResponse({"error": "Could not generate puzzle. Please try again."}, status_code=500)
+    s = game.start_word.upper()
+    t = game.target_word.upper()
+    speech = f"Word Ladder! Change {s} one letter at a time to reach {t}. Each step must be a real word. Say your first word!"
+    return JSONResponse(game.to_dict(speech=speech))
+
+
+@app.post("/games/word-ladder/step")
+async def word_ladder_step(payload: dict):
+    session_id = payload.get("session_id", "")
+    word = payload.get("word", "").strip()
+    result = word_ladder_service.step(session_id, word)
+    return JSONResponse(result)
+
+
+@app.post("/games/word-ladder/hint")
+async def word_ladder_hint(payload: dict):
+    session_id = payload.get("session_id", "")
+    result = word_ladder_service.hint(session_id)
+    return JSONResponse(result)
+
+
+# ── 20 Questions ──────────────────────────────────────────────────────────────
+
+@app.get("/games/twenty-questions", response_class=HTMLResponse)
+async def twenty_questions_page(request: Request):
+    return templates.TemplateResponse(request=request, name="twenty_questions.html", context={})
+
+
+@app.post("/games/twenty-questions/new")
+async def twenty_questions_new():
+    game = twenty_questions_service.new_game()
+    return JSONResponse(game.to_dict(
+        speech="Think of an animal, food, object, or place. Don't tell me! Tap 'I'm ready' when you've got one."
+    ))
+
+
+@app.post("/games/twenty-questions/start")
+async def twenty_questions_start(payload: dict):
+    session_id = payload.get("session_id", "")
+    result = await asyncio.to_thread(twenty_questions_service.start_questions, session_id)
+    return JSONResponse(result)
+
+
+@app.post("/games/twenty-questions/answer")
+async def twenty_questions_answer(payload: dict):
+    session_id = payload.get("session_id", "")
+    answer_text = payload.get("answer", "").strip()
+    result = await asyncio.to_thread(twenty_questions_service.answer, session_id, answer_text)
+    return JSONResponse(result)
+
+
+@app.post("/games/twenty-questions/confirm")
+async def twenty_questions_confirm(payload: dict):
+    session_id = payload.get("session_id", "")
+    answer_text = payload.get("answer", "").strip()
+    result = twenty_questions_service.confirm(session_id, answer_text)
     return JSONResponse(result)
 
 

@@ -44,6 +44,18 @@ Bianca is a family productivity assistant with two interfaces: phone calls (via 
 │                                   GET  /games/clock                    │
 │                                   GET  /games/quiz                     │
 │                                   POST /games/quiz/generate            │
+│                                   GET  /games/bulls-cows               │
+│                                   POST /games/bulls-cows/new           │
+│                                   POST /games/bulls-cows/guess         │
+│                                   GET  /games/word-ladder              │
+│                                   POST /games/word-ladder/new          │
+│                                   POST /games/word-ladder/step         │
+│                                   POST /games/word-ladder/hint         │
+│                                   GET  /games/twenty-questions         │
+│                                   POST /games/twenty-questions/new     │
+│                                   POST /games/twenty-questions/start   │
+│                                   POST /games/twenty-questions/answer  │
+│                                   POST /games/twenty-questions/confirm │
 │                                   GET  /cameras                        │
 │                                   POST /cameras/set-stream             │
 │                                   GET  /cameras/stream  (MJPEG)        │
@@ -540,6 +552,56 @@ Browser (Portal / phone / tablet)
               4. Single letter match with conservative "A" guard
             Confidence check: transcripts with confidence < 0.30 silently ignored
             minSpeechMs: 250ms (single letters ~150ms; duration guard handles echo)
+
+        ├─ GET /games/bulls-cows → bulls_cows.html
+            Bulls and Cows — 4-digit code-breaking game (no LLM)
+            POST /games/bulls-cows/new   → new BullsCowsGame (4-digit secret, all unique, non-zero first)
+            POST /games/bulls-cows/guess {session_id, guess: "two four one three"}
+              bulls_cows_service.parse_spoken_number() — token-by-token word→digit mapping
+                Handles: digit words, digit characters, homophones (to→2, for→4, ate→8)
+                Returns None if not exactly 4 tokens or any token unrecognised
+              _score(secret, guess) → (bulls, cows): O(n) comparison
+              Max 10 attempts; win = 4 bulls; speech narrates result each turn
+            VAD duration guard: 5s (digit sequences are short)
+
+        ├─ GET /games/word-ladder → word_ladder.html
+            Word Ladder — change one letter at a time from start→target word
+            POST /games/word-ladder/new
+              asyncio.to_thread(qwen.generate_word_ladder) → {"start": ..., "target": ...}
+              Prompt: prompts/word_ladder_generate.txt — 4-letter common kid words, 2-5 step path
+              word_ladder_service.new_game(start, target) validates pair with BFS
+              Falls back to hardcoded pairs if Qwen fails or BFS returns None
+            POST /games/word-ladder/step {session_id, word}
+              Validates: same length, exactly 1 letter different, word in _WORD_SET
+              _WORD_SET: /usr/share/dict/words filtered to lowercase alpha-only 3-5 letters
+                         built as frozenset at module import time; pre-grouped by length
+              5 wrong attempts allowed (bad word OR not in dict counts as wrong)
+            POST /games/word-ladder/hint {session_id}
+              BFS from current_word to target → next_word → reports which letter position to change
+            Chain visualiser: JS renders vertical word→word chain with differing letter underlined
+            VAD: says word aloud → Whisper → submitWord(); "hint" / "new game" also VAD-detected
+
+        └─ GET /games/twenty-questions → twenty_questions.html
+            20 Questions — Bianca asks yes/no questions; kid thinks of something; Bianca guesses
+            POST /games/twenty-questions/new     → TwentyQGame (phase=thinking)
+            POST /games/twenty-questions/start   {session_id}
+              asyncio.to_thread(twenty_questions_service.start_questions)
+              Primes Ollama messages list with system prompt + "I've thought of something"
+              qwen.ask_twenty_questions(messages) → multi-turn /api/chat call (30s timeout)
+              Returns {"type": "question"|"guess", "content": "..."} — JSON strict
+                Fallback on non-JSON: treat raw text as question, log warning
+            POST /games/twenty-questions/answer  {session_id, answer}
+              asyncio.to_thread(twenty_questions_service.answer)
+              Normalises answer (yes/no/maybe) via word-list matching before appending to messages
+              Appends user turn to messages list; calls ask_twenty_questions with full history
+              At MAX_QUESTIONS: calls qwen.force_twenty_questions_guess (appends override user msg)
+              Phase transitions: playing → guessing when Qwen returns type=="guess"
+            POST /games/twenty-questions/confirm {session_id, answer}
+              twenty_questions_service.confirm() — no Qwen call; phase→finished
+            VAD behaviour: paused during thinking/loading/finished phases;
+              active during playing (yes/no/maybe) and guessing (yes/no) phases only
+              Duration guard: 6s (questions are ~3-5s TTS; answers are short)
+            Phase flow: thinking → loading → playing → guessing → finished
 ```
 
 ---
@@ -573,7 +635,10 @@ family-assistant/
 │   ├── tavily_service.py      Tavily web + image search with retry
 │   ├── twilio_service.py      WhatsApp message + image sender
 │   ├── reminder_service.py    APScheduler — 24h/4h WhatsApp reminders for events
-│   └── hangman_service.py     Hangman game state, word list, guess logic
+│   ├── hangman_service.py     Hangman game state, word list, guess logic
+│   ├── bulls_cows_service.py  Bulls and Cows game state, secret generation, spoken-digit parser
+│   ├── word_ladder_service.py BFS-validated word ladder puzzles; /usr/share/dict/words word set
+│   └── twenty_questions_service.py  20Q multi-turn Qwen session, phase management, answer normalisation
 │
 ├── models/
 │   └── schemas.py             Pydantic models: IntentResult, TodoItem, EventItem
@@ -591,13 +656,16 @@ family-assistant/
 │
 └── templates/
     ├── home.html              Landing page — 4 nav cards: Games, Dashboard, Talk, Cameras
-    ├── games.html             Games hub — links to all 4 games
+    ├── games.html             Games hub — links to all 7 games
     ├── cameras.html           RTSP stream viewer — URL form + live MJPEG feed + AI event placeholder
     ├── talk.html              Browser voice interface — Silero VAD + Whisper STT, no tap needed
     ├── hangman.html           Voice hangman — VAD, hint letters pre-revealed at start
     ├── multiply.html          Times Tables game — VAD, spoken number parsing, score tracking
     ├── clock.html             Tell the Time game — SVG clocks, 4-option MCQ, VAD
     ├── quiz.html              Knowledge Quiz — subject/grade setup, Qwen questions, VAD
+    ├── bulls_cows.html        Bulls and Cows — history table, spoken digit VAD
+    ├── word_ladder.html       Word Ladder — vertical chain visualiser, BFS hints, VAD
+    ├── twenty_questions.html  20 Questions — 4-phase UI, multi-turn Qwen yes/no VAD
     └── dashboard.html         Editable family dashboard — Bootstrap 5, vanilla JS
 ```
 

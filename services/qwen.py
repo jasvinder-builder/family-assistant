@@ -243,6 +243,76 @@ def resolve_answer(transcript: str, options: list[str]) -> int | None:
     return idx_map.get(raw[0]) if raw else None
 
 
+def ask_twenty_questions(messages: list[dict]) -> dict:
+    """Send full conversation history to Qwen for 20 Questions. Returns parsed JSON.
+
+    Expected response: {"type": "question"|"guess", "content": "..."}
+    Falls back to treating raw text as a question if JSON parse fails.
+    """
+    response = httpx.post(
+        f"{settings.ollama_base_url}/api/chat",
+        json={
+            "model": settings.ollama_model,
+            "messages": messages,
+            "stream": False,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    raw = response.json()["message"]["content"]
+    try:
+        return _extract_json(raw)
+    except ValueError:
+        logger.warning("twenty_questions: non-JSON response, treating as question: %r", raw[:120])
+        return {"type": "question", "content": raw.strip()[:200]}
+
+
+def force_twenty_questions_guess(messages: list[dict]) -> dict:
+    """Force Qwen to make its best guess (called when MAX_QUESTIONS reached)."""
+    forced = messages + [{
+        "role": "user",
+        "content": "You've used all your questions. Make your best guess now using the guess JSON format.",
+    }]
+    response = httpx.post(
+        f"{settings.ollama_base_url}/api/chat",
+        json={
+            "model": settings.ollama_model,
+            "messages": forced,
+            "stream": False,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    raw = response.json()["message"]["content"]
+    try:
+        result = _extract_json(raw)
+        result["type"] = "guess"
+        return result
+    except ValueError:
+        return {"type": "guess", "content": "I'm not sure — I give up! What was it?"}
+
+
+def generate_word_ladder() -> dict:
+    """Ask Qwen to generate a word ladder puzzle pair for kids.
+
+    Returns {"start": "word1", "target": "word2"}.
+    The caller must validate the pair with BFS before using it.
+    """
+    prompt = _load_prompt("word_ladder_generate.txt")
+    response = httpx.post(
+        f"{settings.ollama_base_url}/api/chat",
+        json={
+            "model": settings.ollama_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    raw = response.json()["message"]["content"]
+    return _extract_json(raw)
+
+
 def synthesize_research(query: str, results: list) -> str:
     ctx = _today_context()
     results_text = json.dumps(results, indent=2)

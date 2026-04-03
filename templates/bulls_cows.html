@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bulls and Cows — Bianca</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/bundle.min.js"></script>
+  <style>
+    body { background: #ecfeff; min-height: 100vh; }
+    .header { background: #0891b2; color: white; padding: 1rem 1.5rem; display: flex; align-items: center; gap: 1rem; }
+    .header a { color: rgba(255,255,255,0.85); text-decoration: none; font-size: 0.9rem; }
+
+    .attempt-counter { font-size: 1.05rem; color: #0e7490; font-weight: 600; }
+
+    .history-wrap { max-height: 300px; overflow-y: auto; }
+    table.hist { width: 100%; border-collapse: separate; border-spacing: 0 0.35rem; }
+    table.hist th { color: #6b7280; font-size: 0.75rem; text-transform: uppercase;
+                    letter-spacing: 0.07em; padding: 0 0.75rem 0.25rem; }
+    .hist-row td { background: white; padding: 0.55rem 0.75rem;
+                   box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+    .hist-row td:first-child { border-radius: 10px 0 0 10px;
+                                font-family: monospace; font-size: 1.3rem;
+                                font-weight: 700; letter-spacing: 0.4rem; }
+    .hist-row td:last-child  { border-radius: 0 10px 10px 0; }
+    .bulls-val { color: #0891b2; font-weight: 700; font-size: 1.1rem; }
+    .cows-val  { color: #d97706; font-weight: 700; font-size: 1.1rem; }
+
+    .result-card { border-radius: 14px; padding: 1rem 1.5rem; font-weight: 600; }
+    .result-card.won  { background: #dcfce7; color: #15803d; }
+    .result-card.lost { background: #fee2e2; color: #b91c1c; }
+
+    #speech-text { font-size: 1rem; color: #374151; min-height: 1.5rem; }
+    #voice-ring {
+      width: 80px; height: 80px; border-radius: 50%;
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 2rem; transition: background 0.3s, box-shadow 0.3s;
+    }
+    #voice-ring.loading    { background: #f3f4f6; }
+    #voice-ring.ready      { background: #cffafe; }
+    #voice-ring.speech     { background: #06b6d4; animation: ripple 1s infinite; }
+    #voice-ring.processing { background: #9ca3af; }
+    #voice-ring.speaking   { background: #dbeafe; }
+    @keyframes ripple {
+      0%,100% { box-shadow: 0 0 0 0 rgba(6,182,212,0.4); }
+      50%      { box-shadow: 0 0 0 14px rgba(6,182,212,0); }
+    }
+    #status { font-size: 0.85rem; color: #6b7280; min-height: 1.4rem; }
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <a href="/games">← Games</a>
+  <strong>🐂 Bulls and Cows</strong>
+</div>
+
+<div class="container py-4 text-center" style="max-width:460px">
+
+  <!-- Attempt counter -->
+  <div class="attempt-counter mb-3" id="attemptCounter">Attempt 0 of 10</div>
+
+  <!-- History table -->
+  <div class="history-wrap mb-3">
+    <table class="hist" id="histTable">
+      <thead>
+        <tr>
+          <th style="text-align:left">Your Guess</th>
+          <th>🐂 Bulls</th>
+          <th>🐄 Cows</th>
+        </tr>
+      </thead>
+      <tbody id="histBody"></tbody>
+    </table>
+  </div>
+
+  <!-- Result banner -->
+  <div id="result-banner" class="result-card d-none mb-3"></div>
+
+  <!-- Bianca speech -->
+  <div id="speech-text" class="mb-4 fst-italic text-muted"></div>
+
+  <!-- Voice indicator -->
+  <div class="mb-1">
+    <div id="voice-ring" class="loading">🎙️</div>
+    <div id="status" class="mt-2">Loading voice engine...</div>
+  </div>
+  <div class="text-muted small mb-3">Say four digits — e.g. "one two three four"</div>
+
+  <!-- Typed fallback -->
+  <div class="input-group mb-4" style="max-width:300px; margin:0 auto">
+    <input type="text" id="type-input" class="form-control text-center font-monospace"
+           maxlength="20" placeholder="e.g. 1 2 3 4"
+           onkeydown="if(event.key==='Enter') submitTyped()">
+    <button class="btn" style="background:#0891b2;color:white;" onclick="submitTyped()">Guess</button>
+  </div>
+
+  <button class="btn btn-outline-secondary" onclick="newGame()">🔄 New Game</button>
+
+  <!-- Rules -->
+  <div class="mt-4 p-3 rounded" style="background:white; font-size:0.82rem; color:#6b7280; text-align:left;">
+    <strong class="text-dark">How to play:</strong><br>
+    I pick a secret 4-digit number (all digits different).<br>
+    🐂 <strong>Bull</strong> = right digit, right position.<br>
+    🐄 <strong>Cow</strong> = right digit, wrong position.<br>
+    Get 4 bulls to win!
+  </div>
+</div>
+
+<script>
+let sessionId = sessionStorage.getItem('bulls_cows_session') || '';
+let gameOver = false;
+let micVAD = null;
+let isProcessing = false;
+
+async function initVAD() {
+  try {
+    micVAD = await vad.MicVAD.new({
+      baseAssetPath:    'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.30/dist/',
+      onnxWASMBasePath: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/',
+      model: 'v5',
+      positiveSpeechThreshold: 0.8,
+      negativeSpeechThreshold: 0.3,
+      minSpeechMs: 250,
+      onSpeechStart: () => {
+        if (!isProcessing) { setRing('speech'); setStatus('Listening...'); }
+      },
+      onSpeechEnd: async (audio) => {
+        if (isProcessing) return;
+        if (audio.length / 16000 > 5) return;  // TTS echo guard
+        isProcessing = true;
+        micVAD.pause();
+        setRing('processing');
+        await transcribeAndGuess(float32ToWav(audio, 16000));
+      },
+    });
+    micVAD.start();
+    setRing('ready');
+    setStatus('Say four digits to guess');
+  } catch (e) {
+    setRing('loading');
+    setStatus('Voice unavailable — use the HTTPS URL, or type below.');
+    console.error('VAD init failed:', e);
+  }
+}
+
+async function transcribeAndGuess(blob) {
+  try {
+    const fd = new FormData();
+    fd.append('audio', blob, 'recording.wav');
+    const resp = await fetch('/transcribe', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (data.transcript && (data.confidence ?? 1) >= 0.25) {
+      await submitGuess(data.transcript.trim());
+    } else {
+      setStatus("Didn't catch that — try again or type below.");
+      resumeListening();
+    }
+  } catch {
+    setStatus('Transcription failed — type below.');
+    resumeListening();
+  }
+}
+
+function submitTyped() {
+  const input = document.getElementById('type-input');
+  const val = input.value.trim();
+  if (!val) return;
+  input.value = '';
+  submitGuess(val);
+}
+
+async function submitGuess(text) {
+  if (!text) return;
+  if (/new game|restart|again|start over/i.test(text)) { newGame(); return; }
+  setStatus('Checking...');
+  try {
+    const resp = await fetch('/games/bulls-cows/guess', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: sessionId, guess: text }),
+    });
+    applyState(await resp.json());
+  } catch {
+    setStatus('Network error. Please try again.');
+    resumeListening();
+  }
+}
+
+async function newGame() {
+  document.getElementById('result-banner').classList.add('d-none');
+  document.getElementById('histBody').innerHTML = '';
+  gameOver = false;
+  try {
+    const resp = await fetch('/games/bulls-cows/new', { method: 'POST' });
+    applyState(await resp.json());
+  } catch {
+    setStatus('Could not start game. Try again.');
+  }
+}
+
+function applyState(data) {
+  if (data.session_id) {
+    sessionId = data.session_id;
+    sessionStorage.setItem('bulls_cows_session', sessionId);
+  }
+
+  document.getElementById('attemptCounter').textContent =
+    `Attempt ${data.attempt_count} of ${data.max_attempts}`;
+
+  // Rebuild history
+  const tbody = document.getElementById('histBody');
+  tbody.innerHTML = '';
+  data.attempts.forEach((g, i) => {
+    const tr = tbody.insertRow();
+    tr.className = 'hist-row';
+    tr.insertCell().textContent = g.split('').join(' ');
+    const bc = tr.insertCell(); bc.className = 'bulls-val'; bc.textContent = data.bulls_list[i];
+    const cc = tr.insertCell(); cc.className = 'cows-val';  cc.textContent = data.cows_list[i];
+  });
+
+  const banner = document.getElementById('result-banner');
+  if (data.won) {
+    gameOver = true;
+    banner.className = 'result-card won mb-3';
+    banner.textContent = `🎉 You cracked it! The number was ${data.secret.split('').join(' ')}.`;
+    banner.classList.remove('d-none');
+  } else if (data.lost) {
+    gameOver = true;
+    banner.className = 'result-card lost mb-3';
+    banner.textContent = `😢 Out of guesses! The secret was ${data.secret.split('').join(' ')}.`;
+    banner.classList.remove('d-none');
+  }
+
+  if (data.speech) {
+    document.getElementById('speech-text').textContent = '💬 ' + data.speech;
+    speak(data.speech, () => {
+      resumeListening();
+      if (gameOver) setStatus('Say "new game" or tap New Game!');
+    });
+  } else {
+    resumeListening();
+  }
+}
+
+function resumeListening() {
+  isProcessing = false;
+  if (micVAD) micVAD.start();
+  setRing('ready');
+  if (!gameOver) setStatus('Say four digits to guess');
+}
+
+function speak(text, onDone) {
+  if (!window.speechSynthesis) { if (onDone) onDone(); return; }
+  if (micVAD) micVAD.pause();
+  window.speechSynthesis.cancel();
+  setRing('speaking');
+  setStatus('Bianca is speaking...');
+  const utt = new SpeechSynthesisUtterance(text);
+  utt.lang = 'en-US'; utt.rate = 1.05;
+  let fired = false;
+  const wd = setTimeout(() => {
+    if (!fired) { fired = true; if (onDone) onDone(); else resumeListening(); }
+  }, Math.ceil(text.length / 15) * 1000 + 3000);
+  utt.onend  = () => { if (!fired) { fired = true; clearTimeout(wd); if (onDone) onDone(); else resumeListening(); } };
+  utt.onerror = () => { if (!fired) { fired = true; clearTimeout(wd); if (onDone) onDone(); else resumeListening(); } };
+  window.speechSynthesis.speak(utt);
+}
+
+function setRing(s) { document.getElementById('voice-ring').className = s; }
+function setStatus(m) { document.getElementById('status').textContent = m; }
+
+function float32ToWav(samples, sampleRate) {
+  const len = samples.length;
+  const buf = new ArrayBuffer(44 + len * 2);
+  const view = new DataView(buf);
+  const w = (off, s) => { for (let i = 0; i < s.length; i++) view.setUint8(off + i, s.charCodeAt(i)); };
+  w(0,'RIFF'); view.setUint32(4,36+len*2,true);
+  w(8,'WAVE'); w(12,'fmt ');
+  view.setUint32(16,16,true); view.setUint16(20,1,true);
+  view.setUint16(22,1,true);  view.setUint32(24,sampleRate,true);
+  view.setUint32(28,sampleRate*2,true); view.setUint16(32,2,true);
+  view.setUint16(34,16,true); w(36,'data');
+  view.setUint32(40,len*2,true);
+  let off = 44;
+  for (let i = 0; i < len; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true); off += 2;
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+if (window.speechSynthesis) {
+  window.speechSynthesis.getVoices();
+  window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+}
+
+window.onload = () => { initVAD(); newGame(); };
+</script>
+</body>
+</html>
