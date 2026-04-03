@@ -400,11 +400,19 @@ Browser (Portal / phone / tablet)
         │   POST /cameras/set-stream  {url}
         │     camera_service.set_stream_url(url)
         │       → also calls scene_service.start_analysis(url) or stop_analysis()
-        │   GET  /cameras/stream      → MJPEG StreamingResponse
-        │     camera_service.mjpeg_generator(rtsp_url)
-        │       Background thread: cv2.VideoCapture(rtsp_url) → JPEG frames → queue
-        │       Async generator: polls queue, yields multipart/x-mixed-replace chunks
-        │       Browser displays in <img> tag — no plugin required
+        │   GET  /cameras/stream      → MJPEG StreamingResponse (local fallback)
+        │   WS   /cameras/ws          → WebSocket stream (works through Cloudflare Tunnel)
+        │
+        │   Singleton reader (camera_service._reader_loop):
+        │     One background thread per active stream URL
+        │     Reads frames → draws debug overlay if enabled → encodes JPEG
+        │     Broadcasts JPEG bytes to all subscriber queues (_broadcast)
+        │     Started/stopped by set_stream_url(); shared by all consumers
+        │
+        │   Consumers subscribe via subscribe_frames() → Queue, unsubscribe on disconnect
+        │     mjpeg_generator: wraps frames in multipart/x-mixed-replace chunks
+        │     ws_frame_generator: yields raw JPEG bytes → WebSocket sends as binary
+        │     Browser renders frames on <canvas> via createImageBitmap()
         │   GET  /cameras/queries     → list of global scene queries
         │   POST /cameras/queries     {text} → scene_service.add_query()
         │   DELETE /cameras/queries/{i}      → scene_service.remove_query(i)

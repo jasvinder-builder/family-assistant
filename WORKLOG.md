@@ -177,6 +177,14 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-03 — Session 14
+- **Switched camera stream from MJPEG to WebSocket** — MJPEG (`multipart/x-mixed-replace`) is buffered and silently dropped by Cloudflare Tunnel, making the camera page blank when accessed remotely.
+  - `camera_service`: replaced per-connection `VideoCapture` reader threads with a **singleton broadcaster**. One `_reader_loop` thread reads frames and pushes JPEG bytes to all registered subscriber queues via `_broadcast()`. Both MJPEG and WebSocket consumers use `subscribe_frames()` / `unsubscribe_frames()`.
+  - `main.py`: added `GET /cameras/ws` WebSocket endpoint — accepts connection, streams raw JPEG bytes from `ws_frame_generator()`, handles `WebSocketDisconnect` cleanly.
+  - `cameras.html`: replaced `<img>` with `<canvas>`; JS opens `wss://` (or `ws://` on plain HTTP) on connect, draws incoming JPEG blobs via `createImageBitmap()` + canvas 2D context. Multiple simultaneous browser clients now share a single reader thread.
+  - MJPEG endpoint kept as local fallback.
+- **Updated CLAUDE.md** — documentation rule expanded to cover ARCHITECTURE.md, WORKLOG.md, and README.md explicitly with trigger conditions for each. Dev workflow updated from ngrok to cloudflared.
+
 ### 2026-04-03 — Session 13
 - **Switched tunnel from ngrok to Cloudflare Tunnel** — ngrok free tier hit bandwidth limits. Installed `cloudflared` (v2026.3.0) as a replacement.
   - Quick tunnel started with `cloudflared tunnel --url http://localhost:8000` — no account required, no bandwidth limits on free tier.

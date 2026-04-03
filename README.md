@@ -69,7 +69,7 @@ Talk to Bianca (/talk)          Family Dashboard (/dashboard)
 - **Times Tables** — voice multiplication practice; Bianca asks, kid answers out loud
 - **Tell the Time** — 4-option clock reading game with pure SVG clock faces
 - **Knowledge Quiz** — pick a subject and grade; Qwen generates 10 tailored questions on the fly
-- **Cameras** — live MJPEG view of any RTSP stream or local video file; YOLOv8 + ByteTrack detects and tracks persons; CLIP matches them against user-defined natural-language queries (e.g. "small child", "person in red"); matched events are logged with a thumbnail crop of the detected person
+- **Cameras** — live view of any RTSP stream or local video file streamed via WebSocket (works through Cloudflare Tunnel); YOLOv8 + ByteTrack detects and tracks persons; CLIP matches them against user-defined natural-language queries (e.g. "small child", "person in red"); matched events are logged with a thumbnail crop of the detected person
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events
