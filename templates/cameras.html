@@ -46,7 +46,7 @@
       <div class="input-group">
         <input type="text" id="rtspUrl" class="form-control font-monospace"
                placeholder="rtsp://username:password@host:554/stream"
-               value="{{ current_url or 'rtsp://zGFoMXarNI9GEdwg8nQe7xL6ZNQwhM3u:p0N-dg3ds_t_bY-zRmGf3@test.rtsp.stream/people' }}">
+               value="{{ current_url or '' }}">
         <button class="btn btn-primary"   id="connectBtn"    onclick="connectStream()">Connect</button>
         <button class="btn btn-outline-danger d-none" id="disconnectBtn" onclick="disconnectStream()">Disconnect</button>
       </div>
