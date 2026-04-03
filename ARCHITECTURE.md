@@ -430,6 +430,10 @@ Browser (Portal / phone / tablet)
         │     Accepts: "letter A", "word elephant", bare single letter
         │     → {display_word, wrong_letters, figure, speech, won, lost}
         │   VAD stays active after game over — player can say "new game"
+        │   minSpeechMs: 250ms
+        │   Duration guard: audio > 4s rejected (TTS echo filter)
+        │   Confidence check: transcripts with confidence < 0.30 silently ignored
+        │   speak() has watchdog timer — forces resumeListening() if onend never fires
         │
         ├─ GET /games/multiply → multiply.html
         │   Times Tables practice game for kids
@@ -438,7 +442,7 @@ Browser (Portal / phone / tablet)
         │   VAD captures spoken answer → /transcribe → parseSpokenNumber()
         │     Handles digits ("24") and English words ("twenty four", "eight")
         │   Confidence check: transcripts with confidence < 0.45 silently ignored
-        │   minSpeechMs: 600ms to avoid triggering on brief noises
+        │   minSpeechMs: 250ms (numbers are short; duration guard handles echo)
         │   Tracks correct / answered score; Fresh Start resets
         │
         ├─ GET /games/clock → clock.html
@@ -453,8 +457,8 @@ Browser (Portal / phone / tablet)
         │     Strips filler phrases ("I think", "the answer is", "letter", etc.)
         │     Matches: bare letter (A/B/C/D), spoken names (ay/bee/see/dee)
         │     Conservative "A" guard: only accepts "a" when little other content
-        │   Confidence check: transcripts with confidence < 0.45 silently ignored
-        │   minSpeechMs: 600ms
+        │   Confidence check: transcripts with confidence < 0.30 silently ignored
+        │   minSpeechMs: 250ms (single letters ~150ms; duration guard handles echo)
         │   Tapping a clock card also accepted as answer
         │   Speaks human-friendly time: "half past 3", "quarter to 6", "3 o'clock"
         │   Tracks correct / answered score; Fresh Start resets
@@ -480,8 +484,8 @@ Browser (Portal / phone / tablet)
               2. Filler stripping: removes "I think", "the answer is", "I choose", etc.
               3. Spoken letter names: ay→A, bee→B, see/cee→C, dee→D
               4. Single letter match with conservative "A" guard
-            Confidence check: transcripts with confidence < 0.45 silently ignored
-            minSpeechMs: 600ms to prevent accidental triggering
+            Confidence check: transcripts with confidence < 0.30 silently ignored
+            minSpeechMs: 250ms (single letters ~150ms; duration guard handles echo)
 ```
 
 ---

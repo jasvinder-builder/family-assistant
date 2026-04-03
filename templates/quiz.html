@@ -456,7 +456,7 @@ async function initVAD() {
       model: 'v5',
       positiveSpeechThreshold: 0.8,
       negativeSpeechThreshold: 0.3,
-      minSpeechMs: 600,
+      minSpeechMs: 250,
       onSpeechStart: () => { if (!isProcessing) { setVADRing('speech'); setVADStatus('Listening...'); } },
       onSpeechEnd: async (audio) => {
         if (isProcessing || answered) return;

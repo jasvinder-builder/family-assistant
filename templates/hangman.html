@@ -31,6 +31,7 @@
     #voice-ring.ready      { background: #fde68a; }
     #voice-ring.speech     { background: #f59e0b; animation: ripple 1s infinite; }
     #voice-ring.processing { background: #9ca3af; }
+    #voice-ring.speaking   { background: #dbeafe; }
     @keyframes ripple {
       0%,100% { box-shadow: 0 0 0 0 rgba(245,158,11,0.35); }
       50%      { box-shadow: 0 0 0 14px rgba(245,158,11,0); }
@@ -109,6 +110,8 @@ async function initVAD() {
       },
       onSpeechEnd: async (audio) => {
         if (isProcessing) return;
+        // Duration guard: TTS echo is always long; real guesses are short
+        if (audio.length / 16000 > 4) return;
         isProcessing = true;
         micVAD.pause();
         setRing('processing');
@@ -131,7 +134,7 @@ async function transcribeAndGuess(blob) {
     formData.append('audio', blob, 'recording.wav');
     const resp = await fetch('/transcribe', { method: 'POST', body: formData });
     const data = await resp.json();
-    if (data.transcript && data.transcript.trim().length > 0) {
+    if (data.transcript && data.transcript.trim().length > 0 && (data.confidence ?? 1) >= 0.30) {
       await submitGuess(data.transcript.trim());
     } else {
       setStatus("Didn't catch that — try again or type below.");
@@ -228,12 +231,23 @@ function resumeListening() {
 
 function speak(text, onDone) {
   if (!window.speechSynthesis) { if (onDone) onDone(); return; }
+  if (micVAD) micVAD.pause();
   window.speechSynthesis.cancel();
+  setRing('speaking');
+  setStatus('Bianca is speaking...');
   const utt = new SpeechSynthesisUtterance(text);
-  utt.lang = 'en-US';
-  utt.rate = 1.05;
-  utt.onend  = () => { if (onDone) onDone(); };
-  utt.onerror = () => { if (onDone) onDone(); };
+  utt.lang = 'en-US'; utt.rate = 1.05;
+  // Watchdog: speechSynthesis.onend is unreliable on mobile — force resume if it never fires.
+  let fired = false;
+  const watchdog = setTimeout(() => {
+    if (!fired) { fired = true; if (onDone) onDone(); else resumeListening(); }
+  }, Math.ceil(text.length / 15) * 1000 + 3000);
+  utt.onend = () => {
+    if (!fired) { fired = true; clearTimeout(watchdog); if (onDone) onDone(); else resumeListening(); }
+  };
+  utt.onerror = () => {
+    if (!fired) { fired = true; clearTimeout(watchdog); if (onDone) onDone(); else resumeListening(); }
+  };
   window.speechSynthesis.speak(utt);
 }
 

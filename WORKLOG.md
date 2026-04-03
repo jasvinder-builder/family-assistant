@@ -177,6 +177,14 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-02 — Session 9
+- **Fixed `minSpeechMs` in clock.html and quiz.html** — lowered from 600ms to 250ms. Single-letter answers ("D") are ~150ms of actual speech; 600ms threshold silently discarded them before VAD ever fired. Duration guards (>4s clock, >5s quiz) already handle TTS echo, so minSpeechMs does not need to be high.
+- **Fixed Hangman game broken state** — three issues combined to make the game freeze or mis-behave:
+  1. `speak()` had no watchdog timer — if `speechSynthesis.onend` never fired (unreliable on mobile), `resumeListening()` was never called and the game stayed in processing state permanently. Fixed with same watchdog pattern as clock/quiz: `Math.ceil(text.length/15)*1000 + 3000ms`.
+  2. No duration guard in `onSpeechEnd` — TTS audio echo (always >4s) was being sent to Whisper as guesses. Added `if (audio.length / 16000 > 4) return;`.
+  3. No confidence check — low-quality transcripts from noise were submitted as guesses. Added `(data.confidence ?? 1) >= 0.30` gate.
+- All three games (clock, quiz, hangman) now consistent: minSpeechMs 250ms, duration guard, confidence 0.30, watchdog timer in speak().
+
 ### 2026-04-01 — Session 8
 - **Root cause: `speechSynthesis.onend` unreliable on mobile browsers** — when TTS finishes but `onend` silently never fires, `resumeListening()` is never called, VAD stays paused, ring shows "ready" but nothing is actually listening. This was the main cause of "stuck in listening state" in clock and quiz games.
 - **Fix: TTS watchdog timer** added to `speak()` in clock.html and quiz.html — estimates TTS duration (`text.length / 15` seconds) + 3s buffer, then force-calls the resume logic if `onend` hasn't fired. Clears itself if `onend` fires normally.
