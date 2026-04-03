@@ -136,17 +136,20 @@
       streamError.style.display = 'none';
     };
 
-    ws.onmessage = async (e) => {
-      try {
-        const bitmap = await createImageBitmap(e.data);
-        // Size the canvas buffer to the video resolution on first frame
-        if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
-          canvas.width  = bitmap.width;
-          canvas.height = bitmap.height;
+    ws.onmessage = (e) => {
+      const blob = new Blob([e.data], {type: 'image/jpeg'});
+      const url  = URL.createObjectURL(blob);
+      const img  = new Image();
+      img.onload = () => {
+        if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+          canvas.width  = img.naturalWidth;
+          canvas.height = img.naturalHeight;
         }
-        ctx.drawImage(bitmap, 0, 0);
-        bitmap.close();
-      } catch (_) {}
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+      };
+      img.onerror = () => URL.revokeObjectURL(url);
+      img.src = url;
     };
 
     ws.onerror = () => { streamError.style.display = 'block'; };
