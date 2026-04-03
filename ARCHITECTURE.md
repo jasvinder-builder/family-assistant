@@ -36,6 +36,7 @@ Bianca is a family productivity assistant with two interfaces: phone calls (via 
 │                                   POST /dashboard/delete-event         │
 │                                   POST /transcribe  (Whisper STT)      │
 │                                   POST /chat        (text→JSON)        │
+│                                   GET  /games        (games hub)       │
 │                                   GET  /games/hangman                  │
 │                                   POST /games/hangman/new              │
 │                                   POST /games/hangman/guess            │
@@ -43,6 +44,9 @@ Bianca is a family productivity assistant with two interfaces: phone calls (via 
 │                                   GET  /games/clock                    │
 │                                   GET  /games/quiz                     │
 │                                   POST /games/quiz/generate            │
+│                                   GET  /cameras                        │
+│                                   POST /cameras/set-stream             │
+│                                   GET  /cameras/stream  (MJPEG)        │
 │                                   GET  /health                         │
 └───────────────┬────────────────────────────────────────────────────────┘
                 │
@@ -388,7 +392,17 @@ Family members open the browser interface on any device on the local network. Th
 ```
 Browser (Portal / phone / tablet)
         │
-        ├─ GET /          → home.html  (card grid: Talk, Dashboard, Hangman)
+        ├─ GET /          → home.html  (4 nav cards: Games, Dashboard, Talk, Cameras)
+        │
+        ├─ GET /games      → games.html  (games hub: Hangman, Multiply, Clock, Quiz)
+        │
+        ├─ GET /cameras    → cameras.html
+        │   POST /cameras/set-stream  {url}  → camera_service.set_stream_url()
+        │   GET  /cameras/stream      → MJPEG StreamingResponse
+        │     camera_service.mjpeg_generator(rtsp_url)
+        │       Background thread: cv2.VideoCapture(rtsp_url) → JPEG frames → queue
+        │       Async generator: polls queue, yields multipart/x-mixed-replace chunks
+        │       Browser displays in <img> tag — no plugin required
         │
         ├─ GET /talk       → talk.html
         │   Page loads → Silero VAD initialises (ONNX model downloaded from CDN,
@@ -510,6 +524,7 @@ family-assistant/
 │   └── response_handler.py    TwiML builders: voice_gather, voice_say_then_gather, etc.
 │
 ├── services/
+│   ├── camera_service.py      RTSP URL storage; mjpeg_generator() — OpenCV frames → MJPEG stream
 │   ├── whisper_service.py     faster-whisper large-v3 CUDA, suffix param for webm/wav
 │   ├── qwen.py                Ollama REST wrapper, all LLM calls, JSON extraction
 │   ├── markdown_service.py    Read/write/parse/delete family.md with FileLock
@@ -534,7 +549,9 @@ family-assistant/
 │   └── quiz_generate.txt      Generate 10 kid-safe MCQ questions for subject + grade
 │
 └── templates/
-    ├── home.html              Landing page — games section (top) + assistant section (bottom)
+    ├── home.html              Landing page — 4 nav cards: Games, Dashboard, Talk, Cameras
+    ├── games.html             Games hub — links to all 4 games
+    ├── cameras.html           RTSP stream viewer — URL form + live MJPEG feed + AI event placeholder
     ├── talk.html              Browser voice interface — Silero VAD + Whisper STT, no tap needed
     ├── hangman.html           Voice hangman — VAD, hint letters pre-revealed at start
     ├── multiply.html          Times Tables game — VAD, spoken number parsing, score tracking
@@ -559,6 +576,7 @@ family-assistant/
 | Messaging | Twilio WhatsApp API | Async research + reminder delivery |
 | Storage | Markdown file (`family.md`) | Human-readable, editable, no DB setup |
 | File locking | `filelock` | Prevents concurrent write corruption |
+| RTSP streaming | OpenCV `VideoCapture` + MJPEG | Server-side decode; browser displays in `<img>` tag |
 | Scheduler | APScheduler `AsyncIOScheduler` | Proactive reminders without Celery/Redis |
 | Backend | FastAPI + uvicorn | Async, fast, minimal boilerplate |
 | Templates | Jinja2 + Bootstrap 5 | No build step, zero JS framework needed |

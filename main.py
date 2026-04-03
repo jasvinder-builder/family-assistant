@@ -6,7 +6,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI, Form, Response, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 import httpx
 from handlers.call_handler import handle_incoming, handle_transcription
@@ -15,6 +15,7 @@ from handlers.response_handler import voice_say_hangup
 from handlers import chat_handler
 from services import whisper_service, reminder_service
 from services import hangman_service
+from services import camera_service
 from config import settings as app_settings
 from services import markdown_service, session_store
 from services import qwen
@@ -73,6 +74,40 @@ async def talk(request: Request):
     except Exception:
         family_names = []
     return templates.TemplateResponse(request=request, name="talk.html", context={"family_names": family_names})
+
+
+@app.get("/games", response_class=HTMLResponse)
+async def games_hub(request: Request):
+    return templates.TemplateResponse(request=request, name="games.html", context={})
+
+
+@app.get("/cameras", response_class=HTMLResponse)
+async def cameras_page(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="cameras.html",
+        context={"current_url": camera_service.get_stream_url()},
+    )
+
+
+@app.post("/cameras/set-stream")
+async def cameras_set_stream(payload: dict):
+    url = payload.get("url", "").strip()
+    if url and not url.startswith("rtsp://"):
+        return JSONResponse({"error": "URL must start with rtsp://"}, status_code=400)
+    camera_service.set_stream_url(url)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/cameras/stream")
+async def cameras_stream():
+    url = camera_service.get_stream_url()
+    if not url:
+        return JSONResponse({"error": "No stream configured"}, status_code=404)
+    return StreamingResponse(
+        camera_service.mjpeg_generator(url),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 @app.post("/transcribe")

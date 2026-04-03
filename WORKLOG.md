@@ -177,6 +177,18 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-02 — Session 10
+- **Restructured home page layout** — replaced two-section (Games / Assistant) layout with 4 large navigation cards: Games, Family Dashboard, Talk to Bianca, Cameras. Cleaner top-level navigation.
+- **Added Games hub page** (`GET /games`) — `templates/games.html` collects all game cards (Hangman, Times Tables, Tell the Time, Knowledge Quiz) in one place. Home now links to `/games` rather than individual game routes.
+- **Added Cameras page** (`GET /cameras`) — Stage 1: RTSP URL input + live MJPEG stream viewer + placeholder for future AI event detection.
+  - `services/camera_service.py`: stores the active RTSP URL in memory; `mjpeg_generator()` reads frames via OpenCV in a background thread, encodes JPEG at quality 70, yields `multipart/x-mixed-replace` chunks to the async generator.
+  - `POST /cameras/set-stream`: saves RTSP URL (must start with `rtsp://`); empty URL disconnects.
+  - `GET /cameras/stream`: streams MJPEG via FastAPI `StreamingResponse`.
+  - Browser displays stream in a plain `<img>` tag — no plugin needed.
+  - Default test stream pre-filled: `rtsp://test.rtsp.stream/people`.
+- **Added `opencv-python-headless`** to `requirements.txt` and installed in venv (4.13.0.92). Headless variant used — no X11/Qt dependencies needed on a server.
+- **Updated ARCHITECTURE.md** — new routes, camera service, updated component map and browser interface flow.
+
 ### 2026-04-02 — Session 9
 - **Fixed `minSpeechMs` in clock.html and quiz.html** — lowered from 600ms to 250ms. Single-letter answers ("D") are ~150ms of actual speech; 600ms threshold silently discarded them before VAD ever fired. Duration guards (>4s clock, >5s quiz) already handle TTS echo, so minSpeechMs does not need to be high.
 - **Fixed Hangman game broken state** — three issues combined to make the game freeze or mis-behave:

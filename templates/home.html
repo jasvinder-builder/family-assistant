@@ -10,102 +10,69 @@
     .hero { background: linear-gradient(135deg, #4f46e5, #7c3aed); color: white; padding: 1.2rem 1rem; text-align: center; }
     .hero h1 { font-size: 1.5rem; font-weight: 700; margin: 0; }
     .hero p { opacity: 0.85; font-size: 0.9rem; margin: 0.25rem 0 0; }
-    .section-label { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08rem; color: #9ca3af; margin-bottom: 0.5rem; }
-    .card { border: none; border-radius: 16px; box-shadow: 0 2px 12px rgba(0,0,0,0.1); transition: transform .15s, box-shadow .15s; cursor: pointer; text-decoration: none; color: inherit; }
-    .card:hover { transform: translateY(-4px); box-shadow: 0 6px 20px rgba(0,0,0,0.15); }
-    .card-icon { font-size: 2.5rem; margin-bottom: 0.5rem; }
-    .card-body { padding: 1.5rem 1.25rem; text-align: center; }
-    .card-title { font-size: 1.2rem; font-weight: 600; }
-    .card-text { color: #6b7280; font-size: 0.9rem; }
+    .card { border: none; border-radius: 20px; box-shadow: 0 2px 16px rgba(0,0,0,0.10); transition: transform .15s, box-shadow .15s; cursor: pointer; text-decoration: none; color: inherit; }
+    .card:hover { transform: translateY(-5px); box-shadow: 0 8px 28px rgba(0,0,0,0.16); }
+    .card-icon { font-size: 3rem; margin-bottom: 0.75rem; }
+    .card-body { padding: 2rem 1.5rem; text-align: center; }
+    .card-title { font-size: 1.25rem; font-weight: 700; }
+    .card-text { color: #6b7280; font-size: 0.9rem; margin-top: 0.35rem; }
+    .card-games     { background: linear-gradient(135deg, #fef3c7, #fde68a); }
+    .card-dashboard { background: linear-gradient(135deg, #dcfce7, #bbf7d0); }
     .card-talk      { background: linear-gradient(135deg, #dbeafe, #ede9fe); }
-    .card-dashboard { background: linear-gradient(135deg, #dcfce7, #d1fae5); }
-    .card-hangman   { background: linear-gradient(135deg, #fef3c7, #fde68a); }
-    .card-multiply  { background: linear-gradient(135deg, #dcfce7, #bbf7d0); }
-    .card-clock     { background: linear-gradient(135deg, #ede9fe, #ddd6fe); }
-    .card-quiz      { background: linear-gradient(135deg, #ffedd5, #fed7aa); }
+    .card-cameras   { background: linear-gradient(135deg, #f1f5f9, #e2e8f0); }
   </style>
 </head>
 <body>
 
 <div class="hero">
   <h1>👋 Hi, I'm Bianca</h1>
-  <p>Your family assistant — voice, todos, events, and games</p>
+  <p>Your family assistant — voice, todos, events, games, and cameras</p>
 </div>
 
 <div class="container py-4">
+  <div class="row g-4 justify-content-center">
 
-  <!-- Games -->
-  <div class="section-label px-1">Games</div>
-  <div class="row g-3 justify-content-center mb-4">
-
-    <div class="col-sm-6 col-lg-4">
-      <a href="/games/hangman" class="card card-hangman d-block">
+    <div class="col-sm-6">
+      <a href="/games" class="card card-games d-block">
         <div class="card-body">
           <div class="card-icon">🎮</div>
-          <div class="card-title">Hangman</div>
-          <div class="card-text mt-1">Guess the word letter by letter — play using your voice!</div>
+          <div class="card-title">Games</div>
+          <div class="card-text">Hangman, Times Tables, Tell the Time, Knowledge Quiz — play with your voice!</div>
         </div>
       </a>
     </div>
 
-    <div class="col-sm-6 col-lg-4">
-      <a href="/games/multiply" class="card card-multiply d-block">
-        <div class="card-body">
-          <div class="card-icon">✖️</div>
-          <div class="card-title">Times Tables</div>
-          <div class="card-text mt-1">Practice multiplication — Bianca asks, you answer out loud!</div>
-        </div>
-      </a>
-    </div>
-
-    <div class="col-sm-6 col-lg-4">
-      <a href="/games/clock" class="card card-clock d-block">
-        <div class="card-body">
-          <div class="card-icon">🕐</div>
-          <div class="card-title">Tell the Time</div>
-          <div class="card-text mt-1">Pick the right clock — learn to read hours and minutes!</div>
-        </div>
-      </a>
-    </div>
-
-    <div class="col-sm-6 col-lg-4">
-      <a href="/games/quiz" class="card card-quiz d-block">
-        <div class="card-body">
-          <div class="card-icon">🧠</div>
-          <div class="card-title">Knowledge Quiz</div>
-          <div class="card-text mt-1">Pick a subject, pick your grade — Bianca quizzes you!</div>
-        </div>
-      </a>
-    </div>
-
-  </div>
-
-  <!-- Assistant -->
-  <div class="section-label px-1">Assistant</div>
-  <div class="row g-3 justify-content-center">
-
-    <div class="col-sm-6 col-lg-4">
-      <a href="/talk" class="card card-talk d-block">
-        <div class="card-body">
-          <div class="card-icon">🎙️</div>
-          <div class="card-title">Talk to Bianca</div>
-          <div class="card-text mt-1">Ask questions, add todos and events, search the web — hands-free</div>
-        </div>
-      </a>
-    </div>
-
-    <div class="col-sm-6 col-lg-4">
+    <div class="col-sm-6">
       <a href="/dashboard" class="card card-dashboard d-block">
         <div class="card-body">
           <div class="card-icon">📋</div>
           <div class="card-title">Family Dashboard</div>
-          <div class="card-text mt-1">View and manage your family's todos and upcoming events</div>
+          <div class="card-text">View and manage your family's todos and upcoming events</div>
+        </div>
+      </a>
+    </div>
+
+    <div class="col-sm-6">
+      <a href="/talk" class="card card-talk d-block">
+        <div class="card-body">
+          <div class="card-icon">🎙️</div>
+          <div class="card-title">Talk to Bianca</div>
+          <div class="card-text">Ask questions, add todos and events, search the web — hands-free</div>
+        </div>
+      </a>
+    </div>
+
+    <div class="col-sm-6">
+      <a href="/cameras" class="card card-cameras d-block">
+        <div class="card-body">
+          <div class="card-icon">📷</div>
+          <div class="card-title">Cameras</div>
+          <div class="card-text">Live RTSP stream viewer with AI event detection</div>
         </div>
       </a>
     </div>
 
   </div>
-
 </div>
 
 </body>
