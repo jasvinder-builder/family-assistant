@@ -253,6 +253,11 @@ def _analysis_loop(rtsp_url: str) -> None:
                         continue
 
                     for local_i, (q_idx, sim) in enumerate(zip(pending, sims)):
+                        logger.debug(
+                            "CLIP track=%d query=%r sim=%.3f threshold=%.3f %s",
+                            track_id, queries[q_idx], sim, SIMILARITY_THRESHOLD,
+                            "MATCH" if sim >= SIMILARITY_THRESHOLD else "below",
+                        )
                         if sim >= SIMILARITY_THRESHOLD:
                             fired[(track_id, q_idx)] = now
                             ev = CameraEvent(

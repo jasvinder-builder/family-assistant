@@ -40,6 +40,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     handlers=[logging.StreamHandler(), _file_handler],
 )
+# Scene service logs at DEBUG so CLIP scores are visible without flooding
+# other services — raise to INFO to silence when threshold is tuned
+logging.getLogger("services.scene_service").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
