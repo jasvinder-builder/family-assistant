@@ -93,8 +93,9 @@ async def cameras_page(request: Request):
 @app.post("/cameras/set-stream")
 async def cameras_set_stream(payload: dict):
     url = payload.get("url", "").strip()
-    if url and not url.startswith("rtsp://"):
-        return JSONResponse({"error": "URL must start with rtsp://"}, status_code=400)
+    # Accept rtsp://, http://, https://, and absolute file paths for local testing
+    if url and not any(url.startswith(p) for p in ("rtsp://", "http://", "https://", "/")):
+        return JSONResponse({"error": "Enter an RTSP URL (rtsp://...) or absolute file path (/path/to/video.mp4)"}, status_code=400)
     camera_service.set_stream_url(url)
     return JSONResponse({"ok": True})
 

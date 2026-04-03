@@ -22,6 +22,11 @@ __pycache__/
 .ultralytics/
 *.pt
 
+# Test videos — local only
+*.mp4
+*.mov
+*.avi
+
 # Logs
 logs/
 

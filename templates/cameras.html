@@ -45,7 +45,7 @@
       <h6 class="fw-semibold mb-3">Camera Stream</h6>
       <div class="input-group">
         <input type="text" id="rtspUrl" class="form-control font-monospace"
-               placeholder="rtsp://username:password@host:554/stream"
+               placeholder="rtsp://user:pass@host:554/stream  or  /path/to/video.mp4"
                value="{{ current_url or '' }}">
         <button class="btn btn-primary"   id="connectBtn"    onclick="connectStream()">Connect</button>
         <button class="btn btn-outline-danger d-none" id="disconnectBtn" onclick="disconnectStream()">Disconnect</button>
