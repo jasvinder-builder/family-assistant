@@ -195,11 +195,15 @@ def _analysis_loop(rtsp_url: str) -> None:
 
             ret, frame = cap.read()
             if not ret:
-                logger.warning("Scene analysis: stream read failed — reconnecting in 2s")
-                time.sleep(2)
-                cap.release()
-                cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-                continue
+                # End of file → loop; lost RTSP stream → reconnect
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = cap.read()
+                if not ret:
+                    logger.warning("Scene analysis: stream read failed — reconnecting in 2s")
+                    time.sleep(2)
+                    cap.release()
+                    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+                    continue
 
             queries = get_queries()
             if not queries:

@@ -2,6 +2,7 @@ import asyncio
 import os
 import queue
 import threading
+import time
 
 # Force TCP transport for RTSP — UDP is often blocked by firewalls/NAT.
 # stimeout is the socket timeout in microseconds (5s).
@@ -38,10 +39,15 @@ async def mjpeg_generator(rtsp_url: str):
     def _reader():
         cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
         try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+            frame_interval = 1.0 / fps
             while not stop_event.is_set():
+                t0 = time.monotonic()
                 ret, frame = cap.read()
                 if not ret:
-                    break
+                    # End of file — loop back to start
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
                 ok, jpeg = cv2.imencode(
                     ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70]
                 )
@@ -51,6 +57,9 @@ async def mjpeg_generator(rtsp_url: str):
                     frame_q.put_nowait(jpeg.tobytes())
                 except queue.Full:
                     pass  # drop frame — client is slow
+                # Throttle to native FPS (no-op for live RTSP which self-paces)
+                elapsed = time.monotonic() - t0
+                time.sleep(max(0.0, frame_interval - elapsed))
         finally:
             cap.release()
             try:
