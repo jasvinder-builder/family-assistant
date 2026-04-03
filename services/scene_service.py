@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 # ── Constants ────────────────────────────────────────────────────────────────
 
 _similarity_threshold = 0.15  # mutable at runtime via set_threshold()
+_debug_overlay: bool = False   # mirrored from camera_service
 
 
 def get_threshold() -> float:
@@ -49,6 +50,15 @@ def get_threshold() -> float:
 def set_threshold(value: float) -> None:
     global _similarity_threshold
     _similarity_threshold = max(0.0, min(1.0, value))
+
+
+def get_debug_overlay() -> bool:
+    return _debug_overlay
+
+
+def set_debug_overlay(enabled: bool) -> None:
+    global _debug_overlay
+    _debug_overlay = enabled
 RECHECK_INTERVAL_S   = 30     # seconds before re-checking same (track, query)
 ANALYSIS_FPS         = 3      # frames per second to analyse
 TRACK_PRUNE_AGE_S    = 300    # prune fired-cache entries older than this
@@ -85,6 +95,7 @@ class CameraEvent:
     query: str
     track_id: int
     confidence: float
+    image_b64: str   # base64-encoded JPEG crop, empty string if unavailable
 
 
 _events: deque[CameraEvent] = deque(maxlen=500)
@@ -99,6 +110,7 @@ def get_events(max_age_hours: float = 1.0) -> list[dict]:
                 "timestamp": e.timestamp,
                 "query": e.query,
                 "confidence": round(e.confidence, 3),
+                "image_b64": e.image_b64,
             }
             for e in _events
             if datetime.fromisoformat(e.timestamp) >= cutoff
@@ -199,137 +211,154 @@ def _clip_similarities(crop_bgr: np.ndarray, queries: list[str]) -> list[float]:
     return sims.tolist() if sims.dim() > 0 else [sims.item()]
 
 
+# ── Shared frame (pushed by camera_service reader) ────────────────────────────
+
+_shared_frame: Optional[np.ndarray] = None
+_shared_frame_event = threading.Event()
+_shared_frame_lock  = threading.Lock()
+
+
+def push_frame(frame: np.ndarray) -> None:
+    """Called by camera_service each time a new frame is decoded."""
+    global _shared_frame
+    with _shared_frame_lock:
+        _shared_frame = frame
+    _shared_frame_event.set()
+
+
+def _get_shared_frame() -> Optional[np.ndarray]:
+    with _shared_frame_lock:
+        return _shared_frame
+
+
 # ── Analysis loop ─────────────────────────────────────────────────────────────
 
 _stop_event      = threading.Event()
 _analysis_thread: Optional[threading.Thread] = None
 
 
-def _analysis_loop(rtsp_url: str) -> None:
-    logger.info("Scene analysis starting — stream: %s", rtsp_url)
+def _analysis_loop() -> None:
+    logger.info("Scene analysis starting (shared-frame mode)")
     try:
         _load_models()
     except Exception:
         logger.exception("Failed to load scene analysis models — analysis disabled")
         return
 
-    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        logger.error("Scene analysis: cannot open RTSP stream %s", rtsp_url)
-        return
-
     # (track_id, query_index) → monotonic time of last event fired
     fired: dict[tuple[int, int], float] = {}
     frame_interval = 1.0 / ANALYSIS_FPS
 
-    try:
-        while not _stop_event.is_set():
-            t0 = time.monotonic()
+    while not _stop_event.is_set():
+        t0 = time.monotonic()
 
-            ret, frame = cap.read()
-            if not ret:
-                # End of file → loop; lost RTSP stream → reconnect
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                ret, frame = cap.read()
-                if not ret:
-                    logger.warning("Scene analysis: stream read failed — reconnecting in 2s")
-                    time.sleep(2)
-                    cap.release()
-                    cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        # Wait up to frame_interval for a new frame from the display reader
+        _shared_frame_event.wait(timeout=frame_interval)
+        _shared_frame_event.clear()
+
+        frame = _get_shared_frame()
+        if frame is None:
+            continue
+
+        queries = get_queries()
+        debug = get_debug_overlay()
+        if not queries and not debug:
+            time.sleep(max(0.0, frame_interval - (time.monotonic() - t0)))
+            continue
+
+        # YOLOv8 + ByteTrack — persons only (class 0)
+        results = _yolo.track(
+            frame,
+            persist=True,
+            tracker="bytetrack.yaml",
+            classes=[0],
+            verbose=False,
+            device=_device,
+        )
+
+        if results and results[0].boxes is not None:
+            now = time.monotonic()
+            h, w = frame.shape[:2]
+            frame_detections: list[Detection] = []
+
+            for box in results[0].boxes:
+                if box.id is None:
+                    continue
+                track_id = int(box.id.item())
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                if x2 <= x1 or y2 <= y1:
                     continue
 
-            queries = get_queries()
-            if not queries:
-                time.sleep(max(0.0, frame_interval - (time.monotonic() - t0)))
-                continue
+                crop = frame[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
 
-            # YOLOv8 + ByteTrack — persons only (class 0)
-            results = _yolo.track(
-                frame,
-                persist=True,
-                tracker="bytetrack.yaml",
-                classes=[0],
-                verbose=False,
-                device=_device,
-            )
+                scores: dict[str, float] = {}
+                if queries:
+                    pending = [
+                        i for i, _ in enumerate(queries)
+                        if now - fired.get((track_id, i), 0.0) > RECHECK_INTERVAL_S
+                    ]
+                    if pending:
+                        try:
+                            sims = _clip_similarities(crop, [queries[i] for i in pending])
+                        except Exception:
+                            logger.exception("CLIP inference failed for track %d", track_id)
+                            sims = []
+                        for q_idx, sim in zip(pending, sims):
+                            scores[queries[q_idx]] = sim
+                            if sim >= _similarity_threshold:
+                                fired[(track_id, q_idx)] = now
+                                import base64
+                                ok_jpg, jpg_buf = cv2.imencode(
+                                    ".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                                )
+                                img_b64 = base64.b64encode(jpg_buf.tobytes()).decode() if ok_jpg else ""
+                                _append_event(CameraEvent(
+                                    timestamp=datetime.now().isoformat(timespec="seconds"),
+                                    query=queries[q_idx],
+                                    track_id=track_id,
+                                    confidence=sim,
+                                    image_b64=img_b64,
+                                ))
+                                logger.info(
+                                    "Camera event: track=%d query=%r sim=%.3f",
+                                    track_id, queries[q_idx], sim,
+                                )
 
-            if results and results[0].boxes is not None:
-                now = time.monotonic()
-                h, w = frame.shape[:2]
-                frame_detections: list[Detection] = []
+                frame_detections.append(Detection(
+                    track_id=track_id,
+                    box=(x1, y1, x2, y2),
+                    scores=scores,
+                ))
 
-                for box in results[0].boxes:
-                    if box.id is None:
-                        continue
-                    track_id = int(box.id.item())
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                    x1, y1 = max(0, x1), max(0, y1)
-                    x2, y2 = min(w, x2), min(h, y2)
-                    if x2 <= x1 or y2 <= y1:
-                        continue
+            _set_latest_detections(frame_detections)
 
-                    crop = frame[y1:y2, x1:x2]
-                    if crop.size == 0:
-                        continue
+            # Prune stale fired-cache entries
+            cutoff = now - TRACK_PRUNE_AGE_S
+            fired = {k: v for k, v in fired.items() if v > cutoff}
+        else:
+            _set_latest_detections([])
 
-                    scores: dict[str, float] = {}
-                    if queries:
-                        pending = [
-                            i for i, _ in enumerate(queries)
-                            if now - fired.get((track_id, i), 0.0) > RECHECK_INTERVAL_S
-                        ]
-                        if pending:
-                            try:
-                                sims = _clip_similarities(crop, [queries[i] for i in pending])
-                            except Exception:
-                                logger.exception("CLIP inference failed for track %d", track_id)
-                                sims = []
-                            for q_idx, sim in zip(pending, sims):
-                                scores[queries[q_idx]] = sim
-                                if sim >= _similarity_threshold:
-                                    fired[(track_id, q_idx)] = now
-                                    _append_event(CameraEvent(
-                                        timestamp=datetime.now().isoformat(timespec="seconds"),
-                                        query=queries[q_idx],
-                                        track_id=track_id,
-                                        confidence=sim,
-                                    ))
-                                    logger.info(
-                                        "Camera event: track=%d query=%r sim=%.3f",
-                                        track_id, queries[q_idx], sim,
-                                    )
+        elapsed = time.monotonic() - t0
+        time.sleep(max(0.0, frame_interval - elapsed))
 
-                    frame_detections.append(Detection(
-                        track_id=track_id,
-                        box=(x1, y1, x2, y2),
-                        scores=scores,
-                    ))
-
-                _set_latest_detections(frame_detections)
-
-                # Prune stale fired-cache entries
-                cutoff = now - TRACK_PRUNE_AGE_S
-                fired = {k: v for k, v in fired.items() if v > cutoff}
-            else:
-                _set_latest_detections([])
-
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0.0, frame_interval - elapsed))
-
-    finally:
-        cap.release()
-        logger.info("Scene analysis stopped")
+    logger.info("Scene analysis stopped")
 
 
 # ── Public control ────────────────────────────────────────────────────────────
 
 def start_analysis(rtsp_url: str) -> None:
-    global _analysis_thread
+    global _analysis_thread, _shared_frame
     stop_analysis()
+    with _shared_frame_lock:
+        _shared_frame = None
+    _shared_frame_event.clear()
     _stop_event.clear()
     _analysis_thread = threading.Thread(
         target=_analysis_loop,
-        args=(rtsp_url,),
         daemon=True,
         name="scene-analysis",
     )

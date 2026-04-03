@@ -410,16 +410,28 @@ Browser (Portal / phone / tablet)
         │   DELETE /cameras/queries/{i}      → scene_service.remove_query(i)
         │   GET  /cameras/events      → last 1-hour events (polled every 5s by browser)
         │
+        │   GET  /cameras/threshold   → current CLIP similarity threshold
+        │   POST /cameras/threshold   {value} → set threshold (0.0–1.0)
+        │   POST /cameras/debug-overlay {enabled} → toggle bounding-box overlay
+        │
+        │   Single-reader frame sharing:
+        │     camera_service._reader() reads every frame from VideoCapture
+        │       → calls scene_service.push_frame(frame) on each decoded frame
+        │       → encodes JPEG for MJPEG display (with optional debug overlay drawn)
+        │
         │   Scene analysis pipeline (scene_service.py — background thread):
-        │     RTSP stream (independent VideoCapture, 3 fps)
+        │     Receives frames via push_frame() / _shared_frame — no separate VideoCapture
+        │     Samples at 3 fps (waits on threading.Event, sleeps remainder of interval)
         │       → YOLOv8n: detect persons, bounding boxes (class 0 only)
         │       → ByteTrack: assign persistent track IDs across frames
-        │       → For each new/unchecked track:
+        │       → _set_latest_detections() updates shared Detection list (used by overlay)
+        │       → For each tracked person:
         │           crop = frame[bounding_box]
         │           CLIP ViT-B/32: cosine_similarity(crop, each query text)
-        │           if sim ≥ 0.25 → CameraEvent logged
+        │           if sim ≥ threshold → CameraEvent logged (with JPEG crop as base64)
         │           dedup: same (track_id, query_idx) suppressed for 30s
         │       → Rolling event log: deque(maxlen=500), filtered to last 1h on read
+        │     Runs YOLO even when no queries are defined if debug overlay is enabled
         │     Models loaded lazily on first start_analysis() call
         │
         ├─ GET /talk       → talk.html

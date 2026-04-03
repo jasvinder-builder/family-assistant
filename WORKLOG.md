@@ -177,6 +177,14 @@ PHONE_TO_NAME={"+"447911123456":"Alice","+447911987654":"Bob"}
 - [ ] Test locally with ngrok + Twilio dev number
 - [ ] Test each intent type end-to-end
 
+### 2026-04-02 — Session 12
+- **Fixed debug overlay bounding boxes not tracking with moving persons** — root cause: two independent `VideoCapture` instances (one in camera_service for MJPEG display, one in scene_service for AI analysis) reading the same file at different frame positions. Boxes were stamped from the analysis thread's position onto the display thread's frame → appeared frozen/misaligned.
+  - **Fix: single-reader frame sharing.** Removed the separate VideoCapture from `scene_service`. Camera_service's `_reader()` now calls `scene_service.push_frame(frame)` on every decoded frame. Scene service stores the latest frame in `_shared_frame` (protected by a lock + `threading.Event`). Analysis loop waits for the event and samples from the shared frame at 3fps — bounding boxes now perfectly align with what's shown in the live view.
+- **Fixed debug overlay not showing when no queries are defined** — analysis loop skipped YOLO entirely when `queries` was empty, so `_latest_detections` was never populated. Fixed by also checking the debug overlay flag: YOLO runs whenever `queries` OR `debug_overlay` is active.
+  - Debug overlay flag is now mirrored into `scene_service` via `scene_service.set_debug_overlay()` when `POST /cameras/debug-overlay` is called.
+- **Added CLIP match image thumbnails to event log** — when CLIP similarity ≥ threshold, the person crop is encoded as a base64 JPEG and stored on `CameraEvent.image_b64`. The `/cameras/events` API returns it; the event log renders a 56×80px thumbnail alongside each event row.
+- **Added threshold and debug-overlay routes to ARCHITECTURE.md**
+
 ### 2026-04-02 — Session 11
 - **Implemented AI scene analysis pipeline** on the cameras page — YOLOv8 + ByteTrack + CLIP, all running locally on GPU.
   - `services/scene_service.py`: independent background thread opens the RTSP stream at 3 fps, runs YOLOv8n person detection + ByteTrack tracking, crops each person bounding box, computes CLIP cosine similarity against user-defined natural-language queries, and logs events when similarity ≥ 0.25. Deduplicates by (track_id, query_index) with a 30-second recheck window.

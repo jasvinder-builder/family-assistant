@@ -69,6 +69,7 @@ Talk to Bianca (/talk)          Family Dashboard (/dashboard)
 - **Times Tables** — voice multiplication practice; Bianca asks, kid answers out loud
 - **Tell the Time** — 4-option clock reading game with pure SVG clock faces
 - **Knowledge Quiz** — pick a subject and grade; Qwen generates 10 tailored questions on the fly
+- **Cameras** — live MJPEG view of any RTSP stream or local video file; YOLOv8 + ByteTrack detects and tracks persons; CLIP matches them against user-defined natural-language queries (e.g. "small child", "person in red"); matched events are logged with a thumbnail crop of the detected person
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events
@@ -236,7 +237,9 @@ family-assistant/
 │   ├── markdown_service.py   # Read/write/parse family.md with filelock
 │   ├── session_store.py      # In-memory sessions for async phone call flow
 │   ├── reminder_service.py   # APScheduler — proactive WhatsApp event reminders
-│   └── hangman_service.py    # Hangman game logic and in-memory game state
+│   ├── hangman_service.py    # Hangman game logic and in-memory game state
+│   ├── camera_service.py     # RTSP/file VideoCapture → MJPEG generator; shares frames with scene_service
+│   └── scene_service.py      # YOLOv8n + ByteTrack + CLIP — person detection, tracking, query matching, event log
 │
 ├── models/
 │   └── schemas.py            # Pydantic models: IntentResult, TodoItem, EventItem
@@ -255,5 +258,7 @@ family-assistant/
     ├── home.html             # Landing page — card grid linking to all features
     ├── talk.html             # Browser voice interface (MediaRecorder + Whisper)
     ├── hangman.html          # Voice hangman game
-    └── dashboard.html        # Family todos and events — fully editable
+    ├── dashboard.html        # Family todos and events — fully editable
+    ├── games.html            # Games hub (Hangman, Times Tables, Clock, Quiz)
+    └── cameras.html          # RTSP live view + AI scene detection UI
 ```

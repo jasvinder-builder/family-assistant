@@ -18,6 +18,8 @@ _debug_overlay: bool = False
 def set_debug_overlay(enabled: bool) -> None:
     global _debug_overlay
     _debug_overlay = enabled
+    from services import scene_service
+    scene_service.set_debug_overlay(enabled)
 
 
 def get_debug_overlay() -> bool:
@@ -58,6 +60,9 @@ async def mjpeg_generator(rtsp_url: str):
                     # End of file — loop back to start
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
+                # Share frame with scene analysis (single source of truth)
+                from services import scene_service as _ss
+                _ss.push_frame(frame)
                 if _debug_overlay:
                     from services import scene_service
                     for det in scene_service.get_latest_detections():

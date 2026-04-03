@@ -20,7 +20,9 @@
     }
     .query-badge button { padding: 0; border: none; background: none; color: #94a3b8; line-height: 1; font-size: 1rem; }
     .query-badge button:hover { color: #ef4444; }
-    .event-row { border-left: 3px solid #6366f1; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; background: white; border-radius: 0 8px 8px 0; font-size: 0.88rem; }
+    .event-row { border-left: 3px solid #6366f1; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; background: white; border-radius: 0 8px 8px 0; font-size: 0.88rem; display: flex; align-items: flex-start; gap: 0.6rem; }
+    .event-thumb { width: 56px; height: 80px; object-fit: cover; border-radius: 6px; flex-shrink: 0; background: #e2e8f0; }
+    .event-thumb-placeholder { width: 56px; height: 80px; border-radius: 6px; flex-shrink: 0; background: #e2e8f0; }
     .event-ts { color: #64748b; font-size: 0.78rem; font-variant-numeric: tabular-nums; }
     .event-conf { color: #94a3b8; font-size: 0.75rem; }
     .empty-hint { color: #94a3b8; font-size: 0.88rem; }
@@ -238,12 +240,18 @@
     const rows = [...events].reverse().map(e => {
       const ts   = e.timestamp.replace('T', ' ');
       const conf = `${Math.round(e.confidence * 100)}% match`;
+      const thumb = e.image_b64
+        ? `<img class="event-thumb" src="data:image/jpeg;base64,${e.image_b64}" alt="crop">`
+        : `<div class="event-thumb-placeholder"></div>`;
       return `<div class="event-row">
-        <div class="d-flex justify-content-between align-items-start gap-2">
-          <span>🔍 ${escHtml(e.query)}</span>
-          <span class="event-conf">${conf}</span>
+        ${thumb}
+        <div class="flex-grow-1">
+          <div class="d-flex justify-content-between align-items-start gap-2">
+            <span>🔍 ${escHtml(e.query)}</span>
+            <span class="event-conf">${conf}</span>
+          </div>
+          <div class="event-ts">${ts}</div>
         </div>
-        <div class="event-ts">${ts}</div>
       </div>`;
     }).join('');
     el.innerHTML = rows;
