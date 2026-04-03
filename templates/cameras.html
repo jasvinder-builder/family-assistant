@@ -11,7 +11,7 @@
     .hero-text h1 { font-size: 1.4rem; font-weight: 700; margin: 0; }
     .hero-text p  { opacity: 0.85; font-size: 0.85rem; margin: 0.15rem 0 0; }
     .card { border: none; border-radius: 16px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
-    #videoFeed { width: 100%; max-height: 480px; border-radius: 10px; background: #0f172a; display: block; }
+    #videoFeed { width: 100%; max-height: 480px; object-fit: contain; border-radius: 10px; background: #0f172a; display: block; }
     .query-badge {
       display: flex; align-items: center; gap: 0.5rem;
       background: #eff6ff; border: 1px solid #bfdbfe;
@@ -66,7 +66,7 @@
           <label class="form-check-label small" for="debugToggle">Debug overlay</label>
         </div>
       </div>
-      <canvas id="videoFeed"></canvas>
+      <img id="videoFeed" alt="Camera feed">
       <div id="streamError" class="stream-error">
         Stream unavailable — check the RTSP URL and camera connectivity.
       </div>
@@ -117,8 +117,7 @@
 </div><!-- /container -->
 
 <script>
-  const canvas       = document.getElementById('videoFeed');
-  const ctx          = canvas.getContext('2d');
+  const videoFeed    = document.getElementById('videoFeed');
   const videoSection = document.getElementById('videoSection');
   const statusMsg    = document.getElementById('statusMsg');
   const streamError  = document.getElementById('streamError');
@@ -126,30 +125,22 @@
   // ── WebSocket stream ─────────────────────────────────────────────────────
 
   let ws = null;
+  let prevBlobUrl = null;
 
   function startWebSocket() {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/cameras/ws`);
     ws.binaryType = 'blob';
 
-    ws.onopen = () => {
-      streamError.style.display = 'none';
-    };
+    ws.onopen = () => { streamError.style.display = 'none'; };
 
     ws.onmessage = (e) => {
-      const blob = new Blob([e.data], {type: 'image/jpeg'});
-      const url  = URL.createObjectURL(blob);
-      const img  = new Image();
-      img.onload = () => {
-        if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
-          canvas.width  = img.naturalWidth;
-          canvas.height = img.naturalHeight;
-        }
-        ctx.drawImage(img, 0, 0);
-        URL.revokeObjectURL(url);
+      const url = URL.createObjectURL(new Blob([e.data], {type: 'image/jpeg'}));
+      videoFeed.onload = () => {
+        if (prevBlobUrl) URL.revokeObjectURL(prevBlobUrl);
+        prevBlobUrl = url;
       };
-      img.onerror = () => URL.revokeObjectURL(url);
-      img.src = url;
+      videoFeed.src = url;
     };
 
     ws.onerror = () => { streamError.style.display = 'block'; };
