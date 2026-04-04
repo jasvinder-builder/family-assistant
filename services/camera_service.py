@@ -98,7 +98,11 @@ def _reader_loop(url: str) -> None:
                 pass  # not all codecs support this
 
             fps = float(video_stream.average_rate or video_stream.base_rate or 25.0)
-            frame_interval = 1.0 / fps if not is_live else None
+            frame_interval   = 1.0 / fps if not is_live else None
+            # Display at 25 fps regardless of source rate — limits the expensive
+            # to_ndarray + JPEG encode path and reduces GIL pressure significantly.
+            display_interval = 1.0 / 25.0
+            last_display_t   = 0.0
             logger.info("Camera reader: opened at %.1f fps (live=%s)", fps, is_live)
 
             frame_count = 0
@@ -107,6 +111,15 @@ def _reader_loop(url: str) -> None:
                     break
                 t0 = time.monotonic()
 
+                # Only convert + encode + push on display frames; for the rest just
+                # honour the source-fps sleep so file playback runs at real-time speed.
+                if t0 - last_display_t < display_interval:
+                    if frame_interval:
+                        elapsed = time.monotonic() - t0
+                        time.sleep(max(0.0, frame_interval - elapsed))
+                    continue
+
+                last_display_t = t0
                 bgr = av_frame.to_ndarray(format="bgr24")
 
                 # Share raw frame with scene analysis
@@ -144,10 +157,11 @@ def _reader_loop(url: str) -> None:
                         )
                     _broadcast(jpeg.tobytes())
 
-                # Rate-limit file playback to source fps; live streams self-pace
+                # For display frames, sleep whatever remains of the display interval
+                # so the file does not race ahead of real time.
                 if frame_interval is not None:
                     elapsed = time.monotonic() - t0
-                    time.sleep(max(0.0, frame_interval - elapsed))
+                    time.sleep(max(0.0, display_interval - elapsed))
 
             # Inner decode loop exited
             if _reader_stop.is_set():
