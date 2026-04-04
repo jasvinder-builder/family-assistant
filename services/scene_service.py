@@ -290,8 +290,9 @@ def _analysis_loop() -> None:
                 images=pil_img, text=text, return_tensors="pt",
             ).to(_device)
 
-            with torch.no_grad():
-                outputs = _gdino_model(**inputs)
+            with torch.autocast(device_type=_device, enabled=(_device == "cuda")):
+                with torch.no_grad():
+                    outputs = _gdino_model(**inputs)
 
             results = _gdino_processor.post_process_grounded_object_detection(
                 outputs,
