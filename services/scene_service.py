@@ -297,7 +297,7 @@ def _analysis_loop() -> None:
             results = _gdino_processor.post_process_grounded_object_detection(
                 outputs,
                 inputs.input_ids,
-                box_threshold=_box_threshold,
+                threshold=_box_threshold,
                 text_threshold=_text_threshold,
                 target_sizes=[(h, w)],
             )[0]
