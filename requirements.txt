@@ -13,6 +13,7 @@ apscheduler
 opencv-python-headless
 torch
 torchvision
-ultralytics
 transformers
 Pillow
+supervision>=0.21
+av>=12.0
