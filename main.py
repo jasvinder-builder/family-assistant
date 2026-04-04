@@ -13,9 +13,12 @@ from handlers.call_handler import handle_incoming, handle_transcription
 from handlers.research_handler import handle_research_choice, handle_research_whatsapp_choice
 from handlers.response_handler import voice_say_hangup
 from handlers import chat_handler
+# camera_service must be imported first: it calls Gst.init() at module level,
+# establishing GStreamer's CUDA context before CTranslate2 (whisper_service)
+# initialises its own CUDA context.  Import order matters here.
+from services import camera_service, scene_service
 from services import whisper_service, reminder_service
 from services import hangman_service, bulls_cows_service, word_ladder_service, twenty_questions_service
-from services import camera_service, scene_service
 from config import settings as app_settings
 from services import markdown_service, session_store
 from services import qwen

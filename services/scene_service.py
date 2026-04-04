@@ -1,17 +1,19 @@
 """
-Scene analysis service — Grounding DINO + ByteTrack (supervision).
+Scene analysis service — Grounding DINO + ByteTrack via Triton.
 
-Replaces the former YOLO + CLIP two-stage pipeline with a single
-open-vocabulary object detector: Grounding DINO localises objects described by
-natural-language queries in one forward pass, producing well-calibrated
-confidence scores instead of raw cosine similarities.  Supervision's
-ByteTracker assigns persistent track IDs.
+Frames are sent as JPEG bytes to a Triton Inference Server (Python backend
+running Grounding DINO Tiny on GPU) over gRPC.  Boxes, scores and labels are
+returned in full-resolution pixel coordinates.  ByteTrack tracking and all
+event-firing logic run locally in this process (CPU-only, no PyTorch here).
 
-Models load lazily on the first start_analysis() call.
+Set TRITON_URL in .env (default: localhost:8001) to point at the Triton
+gRPC port.
 """
 
 import base64
+import json
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -24,18 +26,17 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+TRITON_URL = os.getenv("TRITON_URL", "localhost:8001")
+
 # ── Thresholds ────────────────────────────────────────────────────────────────
-# box_threshold  — minimum GDINO box confidence to keep a detection
-# text_threshold — per-token text-image alignment (kept below box_threshold)
 _box_threshold:  float = 0.35
 _text_threshold: float = 0.25
 _debug_overlay:  bool  = False
 
 RECHECK_INTERVAL_S = 30
 ANALYSIS_FPS       = 5
-VOTE_FRAMES        = 1    # GDINO confidence is well-calibrated; 1 frame enough for short-lived tracks
+VOTE_FRAMES        = 1
 TRACK_PRUNE_AGE_S  = 300
-MAX_ANALYSIS_W     = 800  # Pre-resize to this width before GDINO to avoid Swin-T slowness at 1333px
 
 
 def get_threshold() -> float:
@@ -45,7 +46,6 @@ def get_threshold() -> float:
 def set_threshold(value: float) -> None:
     global _box_threshold, _text_threshold
     _box_threshold  = max(0.0, min(1.0, value))
-    # Keep text threshold a fixed margin below box threshold
     _text_threshold = max(0.05, _box_threshold - 0.10)
 
 
@@ -58,8 +58,7 @@ def set_debug_overlay(enabled: bool) -> None:
     _debug_overlay = enabled
 
 
-# Retained for API compatibility with cameras.html pad slider — no-op since
-# GDINO returns tight boxes without needing extra crop context.
+# Retained for API compatibility with cameras.html pad slider — no-op.
 def get_pad_factor() -> float:
     return 0.0
 
@@ -122,10 +121,10 @@ def get_events(max_age_hours: float = 1.0) -> list[dict]:
     with _events_lock:
         return [
             {
-                "timestamp": e.timestamp,
-                "query":     e.query,
+                "timestamp":  e.timestamp,
+                "query":      e.query,
                 "confidence": round(e.confidence, 3),
-                "image_b64": e.image_b64,
+                "image_b64":  e.image_b64,
             }
             for e in _events
             if datetime.fromisoformat(e.timestamp) >= cutoff
@@ -174,57 +173,81 @@ def _get_shared_frame() -> Optional[np.ndarray]:
         return _shared_frame
 
 
-# ── Model loading ─────────────────────────────────────────────────────────────
+# ── Triton gRPC client ────────────────────────────────────────────────────────
 
-_models_lock   = threading.Lock()
-_models_loaded = False
-_gdino_model     = None
-_gdino_processor = None
-_device          = "cpu"
+def _connect_triton(max_wait_s: float = 30.0, retry_interval: float = 2.0):
+    """Wait for Triton to become ready, return a connected client or None."""
+    import tritonclient.grpc as grpcclient
 
-
-def _load_models() -> None:
-    global _models_loaded, _gdino_model, _gdino_processor, _device
-
-    with _models_lock:
-        if _models_loaded:
-            return
-
-        import torch
-        _device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info("Loading Grounding DINO Tiny on %s", _device)
-
-        from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-        _gdino_processor = AutoProcessor.from_pretrained(
-            "IDEA-Research/grounding-dino-tiny"
-        )
-        dtype = torch.float16 if _device == "cuda" else torch.float32
-        _gdino_model = (
-            AutoModelForZeroShotObjectDetection
-            .from_pretrained("IDEA-Research/grounding-dino-tiny", torch_dtype=dtype)
-            .to(_device)
-            .eval()
-        )
-        logger.info(
-            "Grounding DINO Tiny loaded on %s (%s)",
-            _device, "fp16" if _device == "cuda" else "fp32",
-        )
-        _models_loaded = True
+    deadline = time.monotonic() + max_wait_s
+    while time.monotonic() < deadline:
+        if _stop_event.is_set():
+            return None
+        try:
+            client = grpcclient.InferenceServerClient(url=TRITON_URL, verbose=False)
+            if client.is_server_ready() and client.is_model_ready("gdino"):
+                logger.info("Connected to Triton at %s (gdino model ready)", TRITON_URL)
+                return client
+        except Exception as exc:
+            logger.debug("Triton not ready yet: %s", exc)
+        time.sleep(retry_interval)
+    logger.error(
+        "Triton at %s did not become ready within %.0fs — camera analysis disabled",
+        TRITON_URL, max_wait_s,
+    )
+    return None
 
 
-# ── Inference helpers ─────────────────────────────────────────────────────────
+def _triton_infer(
+    client,
+    jpeg_bytes: bytes,
+    queries: list[str],
+    threshold: float,
+    text_threshold: float,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Send a frame to Triton, return (boxes [N,4], scores [N], labels [N])."""
+    import tritonclient.grpc as grpcclient
 
-def _build_prompt(queries: list[str]) -> str:
-    """Format query list as 'thing1 . thing2 . thing3 .' for Grounding DINO."""
-    return " . ".join(q.strip().lower().rstrip(" .") for q in queries) + " ."
+    img_input = grpcclient.InferInput("IMAGE", [1], "BYTES")
+    img_input.set_data_from_numpy(np.array([jpeg_bytes], dtype=object))
 
+    qry_input = grpcclient.InferInput("QUERIES", [1], "BYTES")
+    qry_input.set_data_from_numpy(
+        np.array([json.dumps(queries).encode()], dtype=object)
+    )
+
+    thr_input = grpcclient.InferInput("THRESHOLD", [1], "FP32")
+    thr_input.set_data_from_numpy(np.array([threshold], dtype=np.float32))
+
+    txt_input = grpcclient.InferInput("TEXT_THRESHOLD", [1], "FP32")
+    txt_input.set_data_from_numpy(np.array([text_threshold], dtype=np.float32))
+
+    outputs = [
+        grpcclient.InferRequestedOutput("BOXES"),
+        grpcclient.InferRequestedOutput("SCORES"),
+        grpcclient.InferRequestedOutput("LABELS"),
+    ]
+
+    response = client.infer(
+        model_name="gdino",
+        inputs=[img_input, qry_input, thr_input, txt_input],
+        outputs=outputs,
+    )
+
+    boxes  = response.as_numpy("BOXES")   # float32 [N, 4] or [0, 4]
+    scores = response.as_numpy("SCORES")  # float32 [N]
+    labels_raw = response.as_numpy("LABELS")
+    labels = [
+        l.decode() if isinstance(l, bytes) else str(l)
+        for l in labels_raw
+    ]
+    return boxes, scores, labels
+
+
+# ── Label-to-query matching ───────────────────────────────────────────────────
 
 def _match_label_to_query(label: str, queries: list[str]) -> int:
-    """Return the index of the best-matching query for a GDINO label string.
-
-    Tries exact match, then substring containment, then returns 0 as fallback.
-    GDINO labels closely mirror the input phrases, so exact match usually hits.
-    """
+    """Return the index of the best-matching query for a GDINO label string."""
     label_l = label.lower().strip()
     for i, q in enumerate(queries):
         if q.lower().strip() == label_l:
@@ -239,16 +262,13 @@ def _match_label_to_query(label: str, queries: list[str]) -> int:
 # ── Analysis loop ─────────────────────────────────────────────────────────────
 
 def _analysis_loop() -> None:
-    logger.info("Scene analysis starting (Grounding DINO + ByteTrack)")
-    try:
-        _load_models()
-    except Exception:
-        logger.exception("Failed to load Grounding DINO — analysis disabled")
+    logger.info("Scene analysis starting (Grounding DINO via Triton + ByteTrack)")
+
+    client = _connect_triton()
+    if client is None:
         return
 
-    import torch
     import supervision as sv
-    from PIL import Image
 
     tracker = sv.ByteTrack(
         track_activation_threshold=0.25,
@@ -257,8 +277,8 @@ def _analysis_loop() -> None:
         frame_rate=ANALYSIS_FPS,
     )
 
-    fired:        dict[tuple[int, int], float]        = {}
-    score_buffer: dict[tuple[int, int], deque]        = {}
+    fired:        dict[tuple[int, int], float] = {}
+    score_buffer: dict[tuple[int, int], deque] = {}
     frame_interval = 1.0 / ANALYSIS_FPS
 
     while not _stop_event.is_set():
@@ -279,57 +299,29 @@ def _analysis_loop() -> None:
             continue
 
         h, w = frame.shape[:2]
-
-        # Pre-resize to MAX_ANALYSIS_W so Swin-T processes ~800×450 not ~1333×750.
-        # GDINO boxes are in analysis-frame coords; scale back to full-res after.
-        if w > MAX_ANALYSIS_W:
-            scale_x    = MAX_ANALYSIS_W / w
-            ah         = int(h * scale_x)
-            analysis_frame = cv2.resize(frame, (MAX_ANALYSIS_W, ah), interpolation=cv2.INTER_AREA)
-            box_scale_x = w / MAX_ANALYSIS_W
-            box_scale_y = h / ah
-        else:
-            analysis_frame = frame
-            ah, _aw = frame.shape[:2]
-            box_scale_x = box_scale_y = 1.0
-
-        # Use real queries or a generic fallback when debug mode is on with no queries
         prompt_queries = queries if queries else ["person", "vehicle", "animal"]
 
+        # JPEG-encode frame for Triton transport
+        ok, jpeg_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            continue
+        jpeg_bytes = jpeg_buf.tobytes()
+
         try:
-            pil_img = Image.fromarray(cv2.cvtColor(analysis_frame, cv2.COLOR_BGR2RGB))
-            text    = _build_prompt(prompt_queries)
-
-            inputs = _gdino_processor(
-                images=pil_img, text=text, return_tensors="pt",
-            ).to(_device)
-
-            with torch.autocast(device_type=_device, enabled=(_device == "cuda")):
-                with torch.no_grad():
-                    outputs = _gdino_model(**inputs)
-
-            results = _gdino_processor.post_process_grounded_object_detection(
-                outputs,
-                inputs.input_ids,
-                threshold=_box_threshold,
-                text_threshold=_text_threshold,
-                target_sizes=[(ah, MAX_ANALYSIS_W if w > MAX_ANALYSIS_W else w)],
-            )[0]
-
+            boxes, scores, labels = _triton_infer(
+                client, jpeg_bytes, prompt_queries, _box_threshold, _text_threshold,
+            )
         except Exception:
-            logger.exception("Grounding DINO inference failed")
+            logger.exception("Triton GDINO inference failed")
+            # Try to reconnect on next iteration
+            try:
+                import tritonclient.grpc as grpcclient
+                client = grpcclient.InferenceServerClient(url=TRITON_URL, verbose=False)
+            except Exception:
+                pass
             _set_latest_detections([])
             time.sleep(max(0.0, frame_interval - (time.monotonic() - t0)))
             continue
-
-        boxes  = results["boxes"].cpu().float().numpy()   # [N, 4] xyxy in analysis-frame coords
-        confs  = results["scores"].cpu().float().numpy()  # [N]
-        labels = results["labels"]                        # [N] matched phrase strings
-
-        # Scale boxes back to full-resolution frame coords
-        if box_scale_x != 1.0:
-            boxes[:, [0, 2]] *= box_scale_x
-            boxes[:, [1, 3]] *= box_scale_y
 
         if len(boxes) == 0:
             tracker.update_with_detections(sv.Detections.empty())
@@ -337,7 +329,7 @@ def _analysis_loop() -> None:
             time.sleep(max(0.0, frame_interval - (time.monotonic() - t0)))
             continue
 
-        # Map each GDINO label to a query index; stored as class_id for tracker
+        # Map each GDINO label to a query index for ByteTrack class_id
         class_ids = np.array(
             [_match_label_to_query(lbl, prompt_queries) for lbl in labels],
             dtype=int,
@@ -345,7 +337,7 @@ def _analysis_loop() -> None:
 
         sv_dets = sv.Detections(
             xyxy=boxes.astype(np.float32),
-            confidence=confs.astype(np.float32),
+            confidence=scores.astype(np.float32),
             class_id=class_ids,
         )
         tracked = tracker.update_with_detections(sv_dets)
@@ -408,8 +400,11 @@ def _analysis_loop() -> None:
 
         _set_latest_detections(frame_detections)
 
-        # Prune score_buffer for tracks no longer in the active set
-        active_ids = {int(tid) for tid in tracked.tracker_id} if tracked.tracker_id is not None else set()
+        # Prune score_buffer for inactive tracks
+        active_ids = (
+            {int(tid) for tid in tracked.tracker_id}
+            if tracked.tracker_id is not None else set()
+        )
         score_buffer = {k: v for k, v in score_buffer.items() if k[0] in active_ids}
 
         # Prune stale fired entries

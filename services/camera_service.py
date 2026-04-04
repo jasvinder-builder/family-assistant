@@ -401,19 +401,18 @@ def _gstreamer_available() -> bool:
         return False
 
 
-_gst_available: bool | None = None  # cached after first check
+# GStreamer is available on this system but disabled for now.
+# Root cause: _reader_loop_gst() calls Gst.init(None) on the camera-reader
+# thread, but GStreamer must only be initialised from the main thread.
+# Calling Gst.init() from a worker thread while CTranslate2 owns the CUDA
+# context causes a segfault.  Fix requires pre-creating the GStreamer pipeline
+# on the main thread and passing it to the reader thread — tracked in
+# improvement_ideas.md Step 3.
+_gst_available: bool = False
+logger.info("Camera decode backend: PyAV (GStreamer deferred — see improvement_ideas.md Step 3)")
 
 
 def _reader_loop(url: str) -> None:
-    global _gst_available
-    if _gst_available is None:
-        _gst_available = _gstreamer_available()
-        logger.info(
-            "GStreamer available: %s — using %s decoder",
-            _gst_available, "GStreamer (avdec_h264)" if _gst_available else "PyAV",
-        )
-    # GStreamer path disabled until CUDA context conflict with PyTorch is resolved.
-    # See improvement_ideas.md Step 3 notes. Using PyAV fallback unconditionally.
     _reader_loop_pyav(url)
 
 

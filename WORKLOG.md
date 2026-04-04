@@ -370,6 +370,65 @@ Six improvements applied to `services/scene_service.py` to reduce false positive
 
 **Updated:** `improvement_ideas.md` with Steps 7 (DALI) and 8 (DeepStream), plus a phased roadmap table
 
+---
+
+### 2026-04-04 — Session 18 — Triton Python backend for GDINO (camera crash fix)
+
+**Root cause of crash:** `Aborted (core dumped)` immediately after GDINO Tiny loaded on CUDA. Cause: GStreamer `Gst.init()` + PyTorch CUDA context initialisation on different threads → SIGABRT. Manifested every time the cameras page was opened.
+
+**Fix — Triton Inference Server (Docker, Path A):**
+- Moved all GDINO inference (PyTorch, transformers) out of the main process into a Triton Python backend running in a separate Docker container
+- Main app process now has **zero PyTorch/CUDA** — no CUDA context to conflict with GStreamer
+- Communication: `scene_service.py` → Triton gRPC (port 8001) via `tritonclient[grpc]`
+
+**New files:**
+- `triton_models/gdino/config.pbtxt` — Triton model config (Python backend, gRPC I/O: IMAGE bytes + QUERIES JSON + thresholds in, BOXES/SCORES/LABELS out)
+- `triton_models/gdino/1/model.py` — Python backend; loads GDINO Tiny fp16; pre-resizes frames to 800px; returns full-res boxes via `target_sizes=[(orig_h, orig_w)]`
+- `Dockerfile.triton` — `nvcr.io/nvidia/tritonserver:24.12-py3` + transformers + Pillow + opencv; gRPC-only on port 8001
+
+**Changes:**
+- `services/scene_service.py` — stripped all torch/transformers/PIL imports; replaced model loading + inference block with `_connect_triton()` + `_triton_infer()` gRPC calls; analysis loop is now CPU-only (ByteTrack still in process)
+- `services/camera_service.py` — re-enabled GStreamer path (safe now; CUDA conflict eliminated)
+- `requirements.txt` — removed torch/transformers/Pillow; added `tritonclient[grpc]`
+
+**Key technical decisions:**
+- `target_sizes=[(orig_h, orig_w)]` in model.py: GDINO outputs normalised [0,1] boxes; passing original dims directly converts them to full-res pixel coords even though inference ran on a downscaled frame — works because aspect ratio is preserved
+- Triton Python backend chosen over TRT: GDINO Tiny's data-dependent Python loops in the text encoder block all ONNX/TRT export paths (investigated in Session 6/improvement_ideas.md Step 4). Python backend has zero conversion friction and same model quality. TRT upgrade can follow if GDINO gets ONNX support or model is replaced with YOLOv8-World.
+- HF cache mounted as Docker volume (`~/.cache/huggingface`) — avoids re-downloading ~900MB weights on each container start
+
+**To start Triton:**
+```bash
+docker build -f Dockerfile.triton -t family-assistant-triton .
+docker run --gpus all -d -p 8001:8001 -v ${PWD}/triton_models:/models -v ${HOME}/.cache/huggingface:/root/.cache/huggingface --name triton-gdino family-assistant-triton
+```
+
+**GStreamer status:** Disabled (PyAV used). Three crash attempts documented:
+1. GDINO PyTorch + GStreamer nvcodec both init CUDA on different threads → SIGABRT (fixed: GDINO moved to Triton)
+2. CTranslate2 (Whisper) CUDA context + GStreamer nvcodec scan on reader thread → SIGABRT (attempted fix: eager Gst.init at import time)
+3. `Gst.init(None)` called inside reader thread function → SIGSEGV (GStreamer threading violation)
+
+**Next session fix for GStreamer:** Remove `Gst.init(None)` from `_reader_loop_gst()` (already called at import). If nvcodec CUDA scan still conflicts with CTranslate2, add `os.environ["GST_PLUGIN_FEATURE_RANK"] = "nvh264dec:0,nvh265dec:0"` before `Gst.init()` call.
+
+---
+
+### 2026-04-03 — Session 6 — Game improvements + GDINO ONNX investigation
+
+**What was built:**
+
+*Game improvements (committed in session 5):*
+- Bulls & Cows: difficulty selector (2/3/4 digits, Grades 1–3/4–6/7+), always 10 guesses
+- Word Ladder: escalating hints — 1st hint names the position, 2nd reveals the letter, 3rd gives the full next word; hint level resets on a valid step
+- Twenty Questions: raised minimum question floor to 10 + code guard so Qwen can't guess early
+
+*GDINO ONNX/TRT investigation (Step 4):*
+- Investigated all available export paths for GDINO Tiny on PyTorch 2.6 + transformers 5.5
+- All paths blocked: trace ONNX (data-dependent Python loops), dynamo ONNX (unsupported ops), torch.compile (transformers 5.x output_capturing/dynamo bug), SDPA (not implemented for GDINO in transformers 5.5)
+- `scene_service.py` already loads GDINO in fp16 with `torch.autocast` — already at the optimum reachable point
+- At 5fps (200ms budget) with ~83ms inference, inference is not the bottleneck anyway
+- Documented in `improvement_ideas.md` (Step 4 table) and `scripts/export_gdino_onnx.py`
+
+**Benchmark (RTX 4070 Ti Super):** fp32=113ms → fp16 autocast=83ms (1.36×)
+
 ## Open Questions / Future Ideas
 - Add a "complete todo" voice command ("mark buy groceries as done")
 - Scheduled reminders: outbound WhatsApp at event time

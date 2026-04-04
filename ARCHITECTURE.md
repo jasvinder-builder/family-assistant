@@ -418,13 +418,10 @@ Browser (Portal / phone / tablet)
         │   Singleton reader (camera_service._reader_loop):
         │     One background thread per active stream URL
         │     Decode backend selected at first start:
-        │       GStreamer NVDEC (preferred): nvh264dec hardware H.264 decode
-        │         Plugin: 'nvcodec' from gstreamer1.0-plugins-bad (desktop GPU)
-        │         Pipeline: rtspsrc → rtph264depay → h264parse → nvh264dec
-        │                   → videoconvert → BGRx → appsink (pull-sample)
-        │         NVDEC decodes directly on GPU; no CPU H.264 work
-        │       PyAV fallback: software decode (4 CPU threads) — used when GStreamer
-        │         or the nvcodec plugin is unavailable
+        │       PyAV software decode (4 CPU threads) — current active backend
+        │         GStreamer code present but disabled: Gst.init() called on reader
+        │         thread violates GStreamer threading contract → SIGSEGV.
+        │         Fix tracked in improvement_ideas.md Step 3.
         │     Reads frames → draws debug overlay if enabled → encodes JPEG
         │     Broadcasts JPEG bytes to all subscriber queues (_broadcast)
         │     Started/stopped by set_stream_url(); shared by all consumers
@@ -452,21 +449,29 @@ Browser (Portal / phone / tablet)
         │   Scene analysis pipeline (scene_service.py — background thread):
         │     Receives frames via push_frame() / _shared_frame — no separate VideoCapture
         │     Samples at 5 fps (waits on threading.Event, sleeps remainder of interval)
-        │       → YOLOv8s (small): detect persons (0), vehicles (1,2,3,5,7), animals (14,15,16)
-        │           conf=0.15 (lower than default 0.25 for better recall)
-        │       → ByteTrack: assign persistent track IDs across frames
+        │     No PyTorch in main process — all GPU inference runs in Triton container
+        │       → JPEG-encode frame → send to Triton gRPC (localhost:8001, model "gdino")
+        │           Triton Python backend: Grounding DINO Tiny fp16 on GPU
+        │             Resize to max 800px wide (Swin-T perf), run GDINO, return full-res boxes
+        │             Returns: BOXES [N,4] xyxy, SCORES [N], LABELS [N] strings
+        │       → ByteTrack (CPU, supervision): assign persistent track IDs across frames
         │       → _set_latest_detections() updates shared Detection list (used by overlay)
         │       → For each tracked object:
-        │           crop = frame[bounding_box expanded by pad_factor on each side]
-        │           Skip CLIP if crop area < 3000 px² (tiny/distant objects)
-        │           CLIP ViT-L/14: cosine_similarity(crop, each query text)
-        │             Text embeddings: prompt-ensembled (4 templates), cached per query
-        │             Multi-frame voting: mean of last 3 frames must meet threshold
-        │           if mean_sim ≥ threshold → CameraEvent logged (with JPEG crop as base64)
-        │           dedup: same (track_id, query_idx) suppressed for 30s after firing
+        │           if conf ≥ threshold for 30s recheck window → CameraEvent logged
+        │           CameraEvent includes JPEG crop as base64 for event log thumbnails
         │       → Rolling event log: deque(maxlen=500), filtered to last 1h on read
-        │     Runs YOLO even when no queries are defined if debug overlay is enabled
-        │     Models loaded lazily on first start_analysis() call
+        │     Skips inference when no queries defined and debug overlay is off
+        │     Triton connection: waits up to 30s on start_analysis(), reconnects on error
+        │
+        │   Triton Inference Server (separate Docker container):
+        │     Image: family-assistant-triton (built from Dockerfile.triton)
+        │     Model repo: triton_models/gdino/ (Python backend)
+        │     gRPC port 8001 mapped to host — app connects via tritonclient.grpc
+        │     Isolated CUDA context — eliminates GStreamer/PyTorch conflict
+        │     Start: docker run --gpus all -p 8001:8001
+        │              -v ${PWD}/triton_models:/models
+        │              -v ~/.cache/huggingface:/root/.cache/huggingface
+        │              family-assistant-triton
         │
         ├─ GET /talk       → talk.html
         │   Page loads → Silero VAD initialises (ONNX model downloaded from CDN,
@@ -638,8 +643,8 @@ family-assistant/
 │   └── response_handler.py    TwiML builders: voice_gather, voice_say_then_gather, etc.
 │
 ├── services/
-│   ├── camera_service.py      RTSP URL storage; GStreamer NVDEC decode (PyAV fallback); mjpeg_generator() → MJPEG stream; triggers scene analysis
-│   ├── scene_service.py       YOLOv8s + ByteTrack + CLIP ViT-L/14 pipeline; prompt ensembling; multi-frame voting; query management; event log
+│   ├── camera_service.py      RTSP URL storage; PyAV software decode (GStreamer present but disabled — thread-safety bug); WebSocket/MJPEG broadcast; triggers scene analysis
+│   ├── scene_service.py       Grounding DINO Tiny via Triton gRPC + ByteTrack (CPU); query management; event log; no PyTorch in main process
 │   ├── whisper_service.py     faster-whisper large-v3 CUDA, suffix param for webm/wav
 │   ├── qwen.py                Ollama REST wrapper, all LLM calls, JSON extraction
 │   ├── markdown_service.py    Read/write/parse/delete family.md with FileLock
@@ -697,10 +702,10 @@ family-assistant/
 | Messaging | Twilio WhatsApp API | Async research + reminder delivery |
 | Storage | Markdown file (`family.md`) | Human-readable, editable, no DB setup |
 | File locking | `filelock` | Prevents concurrent write corruption |
-| RTSP streaming | GStreamer `nvv4l2decoder` + MJPEG (PyAV CPU fallback) | NVDEC hardware decode; zero CPU H.264 work; browser displays via WebSocket canvas |
-| Object detection | YOLOv8s (ultralytics) | Person/vehicle/animal detection at 5 fps, conf=0.15; ~100MB VRAM |
-| Object tracking | ByteTrack (built into ultralytics) | Persistent track IDs across frames, deduplication |
-| Scene matching | CLIP ViT-L/14 (HuggingFace transformers) | Open-vocabulary query matching; prompt ensembling + multi-frame voting; ~1.7GB VRAM |
+| RTSP streaming | PyAV (FFmpeg software decode) + WebSocket canvas | GStreamer present but disabled (Gst.init thread-safety bug); browser receives JPEG frames over WebSocket |
+| Scene detection | Grounding DINO Tiny (fp16, HuggingFace) via Triton | Open-vocabulary detection in one pass; ~0.3GB VRAM in Triton container |
+| Object tracking | ByteTrack (supervision, CPU) | Persistent track IDs across frames, deduplication; runs in main process |
+| Inference serving | Triton Inference Server (Docker, Python backend) | Isolated CUDA context; eliminates GStreamer/PyTorch conflict; gRPC |
 | Scheduler | APScheduler `AsyncIOScheduler` | Proactive reminders without Celery/Redis |
 | Backend | FastAPI + uvicorn | Async, fast, minimal boilerplate |
 | Templates | Jinja2 + Bootstrap 5 | No build step, zero JS framework needed |
@@ -724,23 +729,24 @@ family-assistant/
 │  │  large-v3    │  (always loaded, not active    │
 │  │  int8_float16│   during Qwen inference)       │
 │  └──────────────┘                                │
-│  ┌──────────────┐                                │
-│  │  YOLOv8s     │  ~0.1 GB                       │
-│  │  + ByteTrack │  (CPU tracker)                 │
-│  └──────────────┘                                │
-│  ┌──────────────┐                                │
-│  │  CLIP        │  ~1.7 GB                       │
-│  │  ViT-L/14    │  (scene matching)              │
-│  └──────────────┘                                │
 │  ┌──────────────────────────────┐                │
-│  │  Free headroom  ~2.7 GB     │                │
+│  │  Free headroom  ~4.5 GB     │                │
 │  └──────────────────────────────┘                │
+└──────────────────────────────────────────────────┘
+
+Triton Docker container (separate CUDA context — no conflict with main process):
+┌──────────────────────────────────────────────────┐
+│  ┌──────────────┐                                │
+│  │  GDINO Tiny  │  ~0.3 GB  (fp16)               │
+│  │  Python bknd │                                │
+│  └──────────────┘                                │
 └──────────────────────────────────────────────────┘
 
 Note: Whisper and Qwen never run at the same time —
 Whisper transcribes first, then Qwen processes.
-YOLOv8s + CLIP run continuously at 5 fps in a background
-thread when a camera stream is active.
+GDINO runs continuously at 5 fps via Triton gRPC when a
+camera stream is active. ByteTrack runs in the main process
+on CPU (no VRAM needed).
 ```
 
 ---

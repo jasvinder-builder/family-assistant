@@ -41,19 +41,32 @@ pipeline_str = (
 
 Use `appsink.emit("pull-sample")` (blocking) rather than the `new-sample` signal to avoid GLib main loop complexity.
 
-**Status (2026-04-03): partially implemented — BLOCKED by CUDA context conflict.**
+**Status (2026-04-04): BLOCKED — Gst.init() thread-safety issue.**
 
-The GStreamer reader (`_reader_loop_gst`) is written and working as a pipeline but causes a segfault (SIGABRT / core dump) when combined with PyTorch/GDINO on CUDA:
+Full crash history:
+1. Original crash: GDINO (PyTorch) + GStreamer nvcodec plugin both initialising CUDA
+   on different threads → SIGABRT.  Fixed by moving GDINO to Triton Docker (Session 18).
+2. Second crash: CTranslate2 (faster-whisper) already owns CUDA context; GStreamer's
+   nvcodec plugin scans during Gst.init() on the reader thread → SIGABRT.
+   Attempted fix: eager Gst.init() at import time (main thread) before CTranslate2 loads.
+3. Third crash (2026-04-04): `_reader_loop_gst()` calls `Gst.init(None)` on the
+   camera-reader thread.  GStreamer docs state gst_init() must only be called from
+   the main thread.  Calling it from a worker thread → SIGSEGV.
 
-- `nvh264dec` (desktop NVDEC) outputs `video/x-raw(memory:CUDAMemory)` and creates its own CUDA context on the reader thread
-- PyTorch creates its CUDA context on the analysis thread when GDINO loads
-- Two concurrent CUDA context initialisations on different threads → crash
-- Switching to `avdec_h264` (software decode in GStreamer) did not fully resolve it — crash still occurs, suggesting an underlying GStreamer + PyTorch CUDA interaction even without nvh264dec
+**Root cause of #3:** `Gst.init(None)` inside `_reader_loop_gst()` runs on a daemon
+thread, violating GStreamer's threading contract.
 
-**Required to unblock:**
-- Eager-initialise PyTorch CUDA at app startup (before any GStreamer pipeline starts) so the CUDA context exists before GStreamer touches it
-- OR run the GStreamer reader in a subprocess to isolate CUDA contexts entirely
-- Currently falling back to PyAV unconditionally (one-line change in `_reader_loop`)
+**Required fix (deferred):**
+- Remove `Gst.init(None)` from `_reader_loop_gst()` entirely (GStreamer is already
+  initialised at import time on the main thread).
+- The `from gi.repository import Gst` import inside the thread function is fine
+  (module is already loaded), but Gst.init() must not be called again.
+- After removing the duplicate init, test whether the nvcodec CUDA scan on the
+  main thread (at import) still conflicts with CTranslate2 loading immediately after.
+- If conflict persists: set `GST_PLUGIN_FEATURE_RANK=nvh264dec:0,nvh265dec:0`
+  env var before Gst.init() to prevent nvcodec from loading at all.
+
+**Current status:** PyAV used unconditionally.  GStreamer code retained but disabled.
 
 **Zero-copy path (advanced, post-fix):**
 - Use `nvbufsurface` CUDA memory directly → torch tensor without touching CPU RAM
@@ -61,29 +74,41 @@ The GStreamer reader (`_reader_loop_gst`) is written and working as a pipeline b
 
 ---
 
-## Step 4 — Triton Inference Server for GDINO
+## Step 4 — GDINO ONNX / TRT optimisation
 
-Run GDINO as a gRPC service via NVIDIA Triton, batching frames from multiple cameras.
+**Status: INVESTIGATED — all current export paths are blocked (2026-04-03)**
 
-**Why:**
-- Current synchronous inference: GPU utilisation ~20–30% (inference + idle gaps)
-- Triton dynamic batching: GPU utilisation ~80–90%
-- Enables multi-camera: 4 streams each at 5fps = 20 frames/sec batched together
+### What was tried
 
-**Architecture:**
+| Approach | Result | Root cause |
+|---|---|---|
+| `torch.onnx.export` (trace) | FAIL | `generate_masks_with_special_tokens_and_transfer_map` has Python loops over actual token values — not traceable |
+| `torch.onnx.dynamo_export` | FAIL | Unsupported ops in dynamo ONNX exporter for GDINO architecture |
+| `torch.compile` | FAIL | transformers 5.x `output_capturing` decorator causes `NameError: name 'torch'` inside dynamo (upstream bug) |
+| SDPA / Flash Attention | NOT SUPPORTED | `GroundingDinoForObjectDetection` doesn't implement `attn_implementation="sdpa"` in transformers 5.5 |
+| fp16 autocast eager | **WORKS — 1.36×** | Already in production (`scene_service.py` loads model in fp16 + `torch.autocast`) |
+
+### Current production latency
+- fp32 eager: ~113ms
+- fp16 autocast (production): **~83ms** per frame — at 5fps target (200ms budget), inference is NOT the bottleneck
+
+### When to revisit
+- After transformers adds SDPA support for GDINO (tracks transformers#28005)
+- After transformers fixes `output_capturing` / dynamo compatibility (transformers 5.x)
+- If switching to a different detector with better export support (e.g. RT-DETR)
+
+### Alternative path to TRT (bypassing ONNX)
+- `torch_tensorrt.compile(model, ...)` — can compile directly from PyTorch without ONNX,
+  but also uses dynamo under the hood; likely hits the same transformers 5.x bug
+- Triton Inference Server is only worth standing up once an exportable model exists
+
+**Architecture (when unblocked):**
 ```
 Camera 1 reader ──┐
 Camera 2 reader ──┼──► shared frame queue ──► Triton gRPC client ──► GDINO batch inference
 Camera 3 reader ──┘                                                       │
                                                                     ByteTrack per-stream
 ```
-
-**Steps:**
-1. Export GDINO Tiny to ONNX
-2. Serve via `tritonserver` with TensorRT backend (fp16)
-3. Replace direct model call in `_analysis_loop` with `tritonclient.grpc` async call
-
-**Expected throughput:** ~50–100ms per batch of 4 frames → effectively ~40fps total across 4 cameras
 
 ---
 
@@ -183,13 +208,14 @@ Two options:
 
 ## Phased Roadmap
 
-| Phase | Step | Effort | Impact |
-|-------|------|--------|--------|
-| 1 | GStreamer NVDEC (Step 3) | ~1 day | High — frees CPU, zero-copy decode |
-| 2 | GDINO → TensorRT → Triton (Step 4) | 2–3 days | 2–3× inference speedup, GPU ~80% utilised |
-| 3 | DALI preprocessing (Step 7) | 2–3 days | Eliminates PIL/cv2 CPU chain entirely |
-| 4 | Multi-camera fan-out (Step 5) | 1–2 days | Requires phases 1+2 |
-| 5 | DeepStream full pipeline (Step 8) | 1–2 weeks | Maximum throughput, 4+ cameras |
+| Phase | Step | Effort | Impact | Status |
+|-------|------|--------|--------|--------|
+| 1 | GStreamer NVDEC (Step 3) | ~1 day | High — frees CPU, zero-copy decode | ⏸ Deferred (Gst.init thread-safety bug) |
+| 1b | Triton Python backend (Session 18) | ~half day | Eliminates CUDA crash; isolated inference | ✅ Done |
+| 2 | GDINO → TensorRT → Triton (Step 4) | 2–3 days | 2–3× inference speedup | Blocked (ONNX export unsupported) |
+| 3 | DALI preprocessing (Step 7) | 2–3 days | Eliminates PIL/cv2 CPU chain | Deferred |
+| 4 | Multi-camera fan-out (Step 5) | 1–2 days | Requires phases 1+2 | Deferred |
+| 5 | DeepStream full pipeline (Step 8) | 1–2 weeks | Maximum throughput, 4+ cameras | Deferred |
 
 **VRAM budget (all phases):** Qwen 10GB + Whisper 1.5GB + GDINO TRT 0.3GB + Triton 0.5GB ≈ 3.7GB free — tight but fine.
 

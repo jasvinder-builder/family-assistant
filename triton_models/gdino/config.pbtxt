@@ -1,0 +1,46 @@
+name: "gdino"
+backend: "python"
+max_batch_size: 0
+
+input [
+  {
+    name: "IMAGE"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "QUERIES"
+    data_type: TYPE_STRING
+    dims: [ 1 ]
+  },
+  {
+    name: "THRESHOLD"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "TEXT_THRESHOLD"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "BOXES"
+    data_type: TYPE_FP32
+    dims: [ -1, 4 ]
+  },
+  {
+    name: "SCORES"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "LABELS"
+    data_type: TYPE_STRING
+    dims: [ -1 ]
+  }
+]
+
+instance_group [{ kind: KIND_GPU, count: 1 }]

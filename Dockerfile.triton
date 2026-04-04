@@ -1,0 +1,34 @@
+# Triton Inference Server with Grounding DINO dependencies.
+#
+# Build:
+#   docker build -f Dockerfile.triton -t family-assistant-triton .
+#
+# Run:
+#   docker run --gpus all --rm -d \
+#     -p 8001:8001 \
+#     -v ${PWD}/triton_models:/models \
+#     -v ${HOME}/.cache/huggingface:/root/.cache/huggingface \
+#     --name triton-gdino \
+#     family-assistant-triton
+#
+# The HuggingFace cache mount avoids re-downloading GDINO Tiny (~900MB)
+# on every container start.  On the very first start it will download
+# automatically; subsequent starts use the cached weights.
+
+FROM nvcr.io/nvidia/tritonserver:24.12-py3
+
+# Install Python packages needed by the GDINO Python backend.
+# PyTorch is already present in the tritonserver image.
+RUN pip install --no-cache-dir \
+    "torch" \
+    "transformers==5.5.0" \
+    "Pillow>=10.0" \
+    "opencv-python-headless>=4.9"
+
+# Default command: start Triton with gRPC only (HTTP disabled to save port space)
+CMD ["tritonserver", \
+     "--model-repository=/models", \
+     "--allow-grpc=true", "--grpc-port=8001", \
+     "--allow-http=false", \
+     "--allow-metrics=false", \
+     "--log-verbose=1"]
