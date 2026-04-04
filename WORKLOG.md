@@ -348,6 +348,28 @@ Six improvements applied to `services/scene_service.py` to reduce false positive
 
 ---
 
+---
+
+### 2026-04-03 — Session 5 — GStreamer NVDEC hardware decode (Phase 1)
+
+**What was built:**
+- Replaced PyAV software decode in `camera_service.py` with a GStreamer NVDEC pipeline (`nvv4l2decoder`) as the primary backend
+- PyAV retained as an automatic fallback when GStreamer or the nvv4l2decoder/nvcodec plugin is not available
+- Backend is probed once at startup via `Gst.Registry` plugin lookup and cached; no runtime switching overhead
+
+**Key technical decisions:**
+- Used `appsink emit-signals=false` + `pull-sample` (blocking) rather than the `new-sample` signal + GLib main loop — avoids GLib thread complexity in a Python threading context; one less moving part
+- `nvvidconv` outputs `video/x-raw,format=BGRx` — 4 bytes/pixel, trivially sliced to BGR with `arr[:, :, :3]` (no colour conversion needed)
+- For local files (non-RTSP), used `decodebin` so GStreamer auto-selects nvv4l2decoder when available; handles mp4/mkv/etc. without format-specific parsing
+- Display cap kept at 25fps (same as before) — appsink is configured `max-buffers=2 drop=true` so decode never backs up regardless of downstream speed
+
+**Benefits vs. PyAV:**
+- Zero CPU H.264/H.265 decode — NVDEC handles it entirely
+- Frees ~1–2 CPU cores previously spent on software decode
+- Frames arrive already in system RAM from NVDEC DMA; next step (Phase 3/DALI) will keep them on GPU entirely
+
+**Updated:** `improvement_ideas.md` with Steps 7 (DALI) and 8 (DeepStream), plus a phased roadmap table
+
 ## Open Questions / Future Ideas
 - Add a "complete todo" voice command ("mark buy groceries as done")
 - Scheduled reminders: outbound WhatsApp at event time

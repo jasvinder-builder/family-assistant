@@ -417,6 +417,14 @@ Browser (Portal / phone / tablet)
         │
         │   Singleton reader (camera_service._reader_loop):
         │     One background thread per active stream URL
+        │     Decode backend selected at first start:
+        │       GStreamer NVDEC (preferred): nvh264dec hardware H.264 decode
+        │         Plugin: 'nvcodec' from gstreamer1.0-plugins-bad (desktop GPU)
+        │         Pipeline: rtspsrc → rtph264depay → h264parse → nvh264dec
+        │                   → videoconvert → BGRx → appsink (pull-sample)
+        │         NVDEC decodes directly on GPU; no CPU H.264 work
+        │       PyAV fallback: software decode (4 CPU threads) — used when GStreamer
+        │         or the nvcodec plugin is unavailable
         │     Reads frames → draws debug overlay if enabled → encodes JPEG
         │     Broadcasts JPEG bytes to all subscriber queues (_broadcast)
         │     Started/stopped by set_stream_url(); shared by all consumers
@@ -437,7 +445,7 @@ Browser (Portal / phone / tablet)
         │   POST /cameras/debug-overlay {enabled} → toggle bounding-box overlay
         │
         │   Single-reader frame sharing:
-        │     camera_service._reader() reads every frame from VideoCapture
+        │     camera_service._reader_loop() decodes every frame (GStreamer or PyAV)
         │       → calls scene_service.push_frame(frame) on each decoded frame
         │       → encodes JPEG for MJPEG display (with optional debug overlay drawn)
         │
@@ -630,7 +638,7 @@ family-assistant/
 │   └── response_handler.py    TwiML builders: voice_gather, voice_say_then_gather, etc.
 │
 ├── services/
-│   ├── camera_service.py      RTSP URL storage; mjpeg_generator() — OpenCV frames → MJPEG stream; triggers scene analysis
+│   ├── camera_service.py      RTSP URL storage; GStreamer NVDEC decode (PyAV fallback); mjpeg_generator() → MJPEG stream; triggers scene analysis
 │   ├── scene_service.py       YOLOv8s + ByteTrack + CLIP ViT-L/14 pipeline; prompt ensembling; multi-frame voting; query management; event log
 │   ├── whisper_service.py     faster-whisper large-v3 CUDA, suffix param for webm/wav
 │   ├── qwen.py                Ollama REST wrapper, all LLM calls, JSON extraction
@@ -689,7 +697,7 @@ family-assistant/
 | Messaging | Twilio WhatsApp API | Async research + reminder delivery |
 | Storage | Markdown file (`family.md`) | Human-readable, editable, no DB setup |
 | File locking | `filelock` | Prevents concurrent write corruption |
-| RTSP streaming | OpenCV `VideoCapture` + MJPEG | Server-side decode; browser displays in `<img>` tag |
+| RTSP streaming | GStreamer `nvv4l2decoder` + MJPEG (PyAV CPU fallback) | NVDEC hardware decode; zero CPU H.264 work; browser displays via WebSocket canvas |
 | Object detection | YOLOv8s (ultralytics) | Person/vehicle/animal detection at 5 fps, conf=0.15; ~100MB VRAM |
 | Object tracking | ByteTrack (built into ultralytics) | Persistent track IDs across frames, deduplication |
 | Scene matching | CLIP ViT-L/14 (HuggingFace transformers) | Open-vocabulary query matching; prompt ensembling + multi-frame voting; ~1.7GB VRAM |

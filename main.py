@@ -86,7 +86,7 @@ async def cameras_page(request: Request):
     return templates.TemplateResponse(
         request=request,
         name="cameras.html",
-        context={"current_url": camera_service.get_stream_url() or "/home/jasvinder/test1.mp4"},
+        context={"current_url": camera_service.get_stream_url()},
     )
 
 
@@ -288,9 +288,14 @@ async def bulls_cows_page(request: Request):
 
 
 @app.post("/games/bulls-cows/new")
-async def bulls_cows_new():
-    game = bulls_cows_service.new_game()
-    speech = "I'm thinking of a 4-digit number — all digits are different. Say each digit separately to guess!"
+async def bulls_cows_new(payload: dict = {}):
+    digits = int(payload.get("digits", 4))
+    game   = bulls_cows_service.new_game(digits)
+    digit_word = ["", "one", "two", "three", "four"][game.digits]
+    speech = (
+        f"I'm thinking of a {game.digits}-digit number — "
+        f"all digits are different. Say {digit_word} digits to guess!"
+    )
     return JSONResponse(game.to_dict(speech=speech))
 
 

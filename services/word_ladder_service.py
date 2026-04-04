@@ -237,9 +237,10 @@ def step(session_id: str, word: str) -> dict:
                    f"{remaining} wrong {'attempt' if remaining == 1 else 'attempts'} left."
         )
 
-    # Valid step!
+    # Valid step! Reset hint escalation.
     game.current_word = word
     game.path.append(word)
+    game._hint_level = 0  # type: ignore[attr-defined]
 
     if word == game.target_word:
         game.won = True
@@ -253,7 +254,14 @@ def step(session_id: str, word: str) -> dict:
 
 
 def hint(session_id: str) -> dict:
-    """BFS-based hint: tells which letter position to change next."""
+    """BFS-based hint with escalating detail on repeated requests.
+
+    Each call before a valid move reveals more:
+    - 1st hint: which position to change ("Try changing the second letter")
+    - 2nd hint: what letter to use ("Change the second letter to O")
+    - 3rd+ hint: the full next word ("The next word is FOND")
+    Resets when the player makes a valid step.
+    """
     game = _games.get(session_id)
     if not game:
         return {"speech": "Game not found."}
@@ -262,15 +270,28 @@ def hint(session_id: str) -> dict:
         return game.to_dict(speech="The game is over!")
 
     path = _bfs_path(game.current_word, game.target_word)
-    if path and len(path) >= 2:
-        next_word = path[1]
-        ordinals = ["first", "second", "third", "fourth", "fifth"]
-        for i, (a, b) in enumerate(zip(game.current_word, next_word)):
-            if a != b:
-                pos = ordinals[i] if i < len(ordinals) else f"position {i + 1}"
-                return game.to_dict(speech=f"Try changing the {pos} letter of {game.current_word.upper()}.")
+    if not path or len(path) < 2:
+        return game.to_dict(
+            speech=f"Try to think of a word one letter away from {game.current_word.upper()} "
+                   f"that gets you closer to {game.target_word.upper()}."
+        )
 
-    return game.to_dict(
-        speech=f"Try to think of a word one letter away from {game.current_word.upper()} "
-               f"that gets you closer to {game.target_word.upper()}."
-    )
+    next_word = path[1]
+    steps_left = len(path) - 1
+    ordinals = ["first", "second", "third", "fourth", "fifth"]
+    changed_pos = next(i for i, (a, b) in enumerate(zip(game.current_word, next_word)) if a != b)
+    pos_name   = ordinals[changed_pos] if changed_pos < len(ordinals) else f"position {changed_pos + 1}"
+    new_letter = next_word[changed_pos].upper()
+    steps_msg  = f" ({steps_left} step{'s' if steps_left != 1 else ''} to go)"
+
+    hint_level = getattr(game, "_hint_level", 0) + 1
+    game._hint_level = hint_level  # type: ignore[attr-defined]
+
+    if hint_level == 1:
+        speech = f"Try changing the {pos_name} letter of {game.current_word.upper()}.{steps_msg}"
+    elif hint_level == 2:
+        speech = f"Change the {pos_name} letter of {game.current_word.upper()} to {new_letter}.{steps_msg}"
+    else:
+        speech = f"The next word is {next_word.upper()}.{steps_msg}"
+
+    return game.to_dict(speech=speech)

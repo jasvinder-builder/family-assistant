@@ -33,8 +33,9 @@ _debug_overlay:  bool  = False
 
 RECHECK_INTERVAL_S = 30
 ANALYSIS_FPS       = 5
-VOTE_FRAMES        = 2    # GDINO confidence is calibrated; 2 frames enough
+VOTE_FRAMES        = 1    # GDINO confidence is well-calibrated; 1 frame enough for short-lived tracks
 TRACK_PRUNE_AGE_S  = 300
+MAX_ANALYSIS_W     = 800  # Pre-resize to this width before GDINO to avoid Swin-T slowness at 1333px
 
 
 def get_threshold() -> float:
@@ -279,11 +280,24 @@ def _analysis_loop() -> None:
 
         h, w = frame.shape[:2]
 
+        # Pre-resize to MAX_ANALYSIS_W so Swin-T processes ~800×450 not ~1333×750.
+        # GDINO boxes are in analysis-frame coords; scale back to full-res after.
+        if w > MAX_ANALYSIS_W:
+            scale_x    = MAX_ANALYSIS_W / w
+            ah         = int(h * scale_x)
+            analysis_frame = cv2.resize(frame, (MAX_ANALYSIS_W, ah), interpolation=cv2.INTER_AREA)
+            box_scale_x = w / MAX_ANALYSIS_W
+            box_scale_y = h / ah
+        else:
+            analysis_frame = frame
+            ah, _aw = frame.shape[:2]
+            box_scale_x = box_scale_y = 1.0
+
         # Use real queries or a generic fallback when debug mode is on with no queries
         prompt_queries = queries if queries else ["person", "vehicle", "animal"]
 
         try:
-            pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            pil_img = Image.fromarray(cv2.cvtColor(analysis_frame, cv2.COLOR_BGR2RGB))
             text    = _build_prompt(prompt_queries)
 
             inputs = _gdino_processor(
@@ -299,7 +313,7 @@ def _analysis_loop() -> None:
                 inputs.input_ids,
                 threshold=_box_threshold,
                 text_threshold=_text_threshold,
-                target_sizes=[(h, w)],
+                target_sizes=[(ah, MAX_ANALYSIS_W if w > MAX_ANALYSIS_W else w)],
             )[0]
 
         except Exception:
@@ -308,9 +322,14 @@ def _analysis_loop() -> None:
             time.sleep(max(0.0, frame_interval - (time.monotonic() - t0)))
             continue
 
-        boxes  = results["boxes"].cpu().float().numpy()   # [N, 4] xyxy pixels
+        boxes  = results["boxes"].cpu().float().numpy()   # [N, 4] xyxy in analysis-frame coords
         confs  = results["scores"].cpu().float().numpy()  # [N]
         labels = results["labels"]                        # [N] matched phrase strings
+
+        # Scale boxes back to full-resolution frame coords
+        if box_scale_x != 1.0:
+            boxes[:, [0, 2]] *= box_scale_x
+            boxes[:, [1, 3]] *= box_scale_y
 
         if len(boxes) == 0:
             tracker.update_with_detections(sv.Detections.empty())

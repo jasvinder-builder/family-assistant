@@ -2,6 +2,7 @@ import uuid
 from dataclasses import dataclass, field
 
 MAX_QUESTIONS = 20
+MIN_QUESTIONS_BEFORE_GUESS = 10  # Qwen must ask at least this many before guessing
 
 _SYSTEM_PROMPT = """\
 You are playing 20 Questions with a child. The child has thought of something secret.
@@ -13,7 +14,8 @@ Rules:
 - Ask ONE short, simple yes/no question per turn
 - Keep all questions friendly and age-appropriate for children aged 6-12
 - Build logically on previous answers to narrow down the answer
-- When confident, OR by question 18 at the latest, make your final guess
+- Do NOT guess before you have asked at least 10 questions — you need enough information first
+- Only make a final guess when you are highly confident after 10+ questions, or by question 18 at the latest
 - Do NOT ask for descriptions, hints, or 'does it start with X' — yes/no questions only
 
 You MUST respond with valid JSON only — absolutely no other text before or after:
@@ -170,6 +172,11 @@ def answer(session_id: str, text: str) -> dict:
     msg_type = result.get("type", "question")
     content  = result.get("content", "Hmm, let me think...")
     game.messages.append({"role": "assistant", "content": str(result)})
+
+    # Guard: don't allow a guess before the minimum question threshold,
+    # regardless of what Qwen decided — treat it as a question instead.
+    if msg_type == "guess" and game.question_count < MIN_QUESTIONS_BEFORE_GUESS:
+        msg_type = "question"
 
     if msg_type == "guess":
         game.phase = "guessing"
