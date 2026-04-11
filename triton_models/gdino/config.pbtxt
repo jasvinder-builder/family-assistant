@@ -2,16 +2,20 @@ name: "gdino"
 backend: "python"
 max_batch_size: 0
 
+# Uses the HTTP transport (not gRPC) from the app side.  Triton 24.04's gRPC
+# shared-memory path broadcasts the first tensor element to every position for
+# all dtypes; HTTP uses a different C++ data path that is unaffected.
+
 input [
   {
     name: "IMAGE"
-    data_type: TYPE_STRING
-    dims: [ 1 ]
+    data_type: TYPE_UINT8
+    dims: [ -1 ]
   },
   {
     name: "QUERIES"
-    data_type: TYPE_STRING
-    dims: [ 1 ]
+    data_type: TYPE_UINT8
+    dims: [ -1 ]
   },
   {
     name: "THRESHOLD"
@@ -38,7 +42,7 @@ output [
   },
   {
     name: "LABELS"
-    data_type: TYPE_STRING
+    data_type: TYPE_FP32
     dims: [ -1 ]
   }
 ]

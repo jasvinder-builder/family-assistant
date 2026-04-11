@@ -17,7 +17,9 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen2.5:14b"
 
     family_md_path: str = "./family.md"
-    whisper_model_size: str = "large-v3"  # GPU: large-v3 (~1.5GB VRAM with int8_float16)
+    whisper_model_size: str = "large-v3"  # used by whisper container only
+    whisper_url: str = "http://localhost:8080"
+    triton_url: str = "localhost:8001"
 
     # Stored as a JSON string in .env, e.g. '{"+447911123456": "Alice"}'
     phone_to_name: str = "{}"

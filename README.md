@@ -72,7 +72,7 @@ Talk to Bianca (/talk)          Family Dashboard (/dashboard)
 - **Bulls and Cows** — crack Bianca's secret 4-digit code; say each digit aloud; bulls = right digit right place, cows = right digit wrong place
 - **Word Ladder** — change one letter at a time to climb from the start word to the target; BFS-powered hints; Qwen generates kid-friendly puzzles
 - **20 Questions** — think of an animal, food, object, or place; Bianca asks up to 20 yes/no questions and tries to guess it using Qwen
-- **Cameras** — live view of any RTSP stream or local video file streamed via WebSocket (works through Cloudflare Tunnel); YOLOv8s + ByteTrack detects and tracks persons, vehicles (bicycle, car, motorcycle, bus, truck), and animals (bird, cat, dog); CLIP ViT-L/14 matches them against user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa") using prompt-ensemble text embeddings and multi-frame voting to suppress false positives; configurable crop padding expands the bounding box for relational queries; matched events are logged with a thumbnail crop
+- **Cameras** — live view of any RTSP stream or local video file streamed via WebSocket (works through Cloudflare Tunnel); Grounding DINO Tiny (fp16, open-vocabulary) runs in a separate Docker container and detects objects matching user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa"); _SimpleTracker assigns persistent track IDs; matched events are logged with a thumbnail crop
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events
@@ -224,6 +224,18 @@ family-assistant/
 ├── ARCHITECTURE.md           # Full technical architecture and call flow diagrams
 ├── logs/                     # Daily rotating log files (not in git)
 │
+├── docker-compose.yml        # 4-container stack: app, whisper, triton (GDINO), ollama
+├── Dockerfile.app            # Main app image (CPU-only, no CUDA)
+├── Dockerfile.whisper        # faster-whisper STT service on GPU
+├── Dockerfile.triton         # GDINO FastAPI inference service on GPU
+├── requirements.app.txt      # Python deps for the app container
+│
+├── triton_models/
+│   └── gdino_server.py       # GDINO FastAPI service (runs in triton container, :8082)
+│
+├── scripts/
+│   └── ollama-entrypoint.sh  # Auto-pulls qwen2.5:14b on first Ollama container start
+│
 ├── handlers/
 │   ├── call_handler.py       # Twilio webhooks, async filler+compute pattern
 │   ├── chat_handler.py       # Browser /chat endpoint — text in, structured JSON out
@@ -243,7 +255,7 @@ family-assistant/
 │   ├── reminder_service.py   # APScheduler — proactive WhatsApp event reminders
 │   ├── hangman_service.py    # Hangman game logic and in-memory game state
 │   ├── camera_service.py     # RTSP/file VideoCapture → MJPEG generator; shares frames with scene_service
-│   ├── scene_service.py      # YOLOv8s + ByteTrack + CLIP ViT-L/14 — detection, tracking, prompt ensembling, multi-frame voting, event log
+│   ├── scene_service.py      # Grounding DINO Tiny via GDINO FastAPI (httpx POST) + _SimpleTracker (IoU); query management; event log
 │   ├── bulls_cows_service.py # Bulls and Cows game state and spoken-digit parser
 │   ├── word_ladder_service.py # Word Ladder — BFS validation, system dictionary word set, hint generation
 │   └── twenty_questions_service.py # 20 Questions — multi-turn Qwen session, phase management

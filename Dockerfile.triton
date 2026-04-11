@@ -15,20 +15,26 @@
 # on every container start.  On the very first start it will download
 # automatically; subsequent starts use the cached weights.
 
-FROM nvcr.io/nvidia/tritonserver:24.12-py3
+# 24.04 uses CUDA 12.4 runtime — compatible with driver version 12040 (CUDA 12.4).
+# Upgrade to 24.12+ once the host NVIDIA driver is updated to support CUDA 12.6+.
+FROM nvcr.io/nvidia/tritonserver:24.04-py3
 
-# Install Python packages needed by the GDINO Python backend.
-# PyTorch is already present in the tritonserver image.
+# Install CUDA-enabled PyTorch from PyTorch's own index (cu124 = CUDA 12.4).
+# Must use --index-url so pip picks the GPU wheel, not the CPU-only wheel on PyPI.
 RUN pip install --no-cache-dir \
-    "torch" \
+    torch \
+    --index-url https://download.pytorch.org/whl/cu124
+
+# Install remaining GDINO dependencies from PyPI.
+RUN pip install --no-cache-dir \
     "transformers==5.5.0" \
     "Pillow>=10.0" \
-    "opencv-python-headless>=4.9"
+    "opencv-python-headless>=4.9" \
+    "fastapi>=0.111" \
+    "uvicorn[standard]>=0.29" \
+    "python-multipart>=0.0.9"
 
-# Default command: start Triton with gRPC only (HTTP disabled to save port space)
-CMD ["tritonserver", \
-     "--model-repository=/models", \
-     "--allow-grpc=true", "--grpc-port=8001", \
-     "--allow-http=false", \
-     "--allow-metrics=false", \
-     "--log-verbose=1"]
+# Run the FastAPI GDINO server (bind-mounted from ./triton_models/gdino_server.py).
+# tritonserver is no longer used — it has a Python backend bug in 24.04 where
+# every tensor element is overwritten with the first element's value via shm IPC.
+CMD ["python3", "-m", "uvicorn", "gdino_server:app", "--host", "0.0.0.0", "--port", "8082", "--app-dir", "/models", "--log-level", "warning"]

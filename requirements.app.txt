@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+twilio
+tavily-python
+filelock
+httpx
+pydantic-settings
+python-dotenv
+python-multipart
+jinja2
+apscheduler
+opencv-python-headless
+av>=12.0
+# tritonclient removed — GDINO now runs as a plain FastAPI service (gdino_server.py)

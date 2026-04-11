@@ -1,0 +1,33 @@
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+# ffmpeg: required by faster-whisper to normalise webm/mp3/etc to wav
+# libgomp1: CTranslate2 OpenMP runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3.11-dev python3-pip \
+    ffmpeg \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+
+WORKDIR /app
+
+COPY whisper_server/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY whisper_server/ .
+
+ENV WHISPER_MODEL_SIZE=large-v3
+# HF_HOME must match the volume mount in docker-compose so weights survive restarts
+ENV HF_HOME=/root/.cache/huggingface
+
+EXPOSE 8080
+
+# start_period=120s: model load takes 30-90s on first run (weights already cached);
+# first-ever run downloads ~3GB — increase start_period to 300s if health check
+# kills the container before the download completes.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')" \
+    || exit 1
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

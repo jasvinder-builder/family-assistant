@@ -77,11 +77,15 @@ def _gst_pipeline_str(url: str) -> str:
     For local files:
       filesrc → decodebin (nvh264dec rank set to NONE at init) → videoconvert → appsink
     """
+    is_rtsp = url.startswith("rtsp://")
+    # sync=false: live RTSP — don't throttle to clock, drop late frames
+    # sync=true:  local files — honour presentation timestamps, play at real speed
+    sync = "false" if is_rtsp else "true"
     appsink = (
-        "appsink name=sink emit-signals=false "
-        "max-buffers=2 drop=true sync=false"
+        f"appsink name=sink emit-signals=false "
+        f"max-buffers=2 drop=true sync={sync}"
     )
-    if url.startswith("rtsp://"):
+    if is_rtsp:
         return (
             f"rtspsrc location={url} latency=100 protocols=tcp ! "
             "rtph264depay ! h264parse ! "
@@ -118,8 +122,8 @@ def _reader_loop_gst(url: str) -> None:
     import gi
     gi.require_version("Gst", "1.0")
     from gi.repository import Gst
-
-    Gst.init(None)
+    # Gst.init() already called on the main thread in _gstreamer_available().
+    # Calling it again from a worker thread is a GStreamer threading violation (SIGSEGV).
 
     is_live  = url.startswith("rtsp://") or url.startswith("http://")
     pipeline_str = _gst_pipeline_str(url)
@@ -401,19 +405,18 @@ def _gstreamer_available() -> bool:
         return False
 
 
-# GStreamer is available on this system but disabled for now.
-# Root cause: _reader_loop_gst() calls Gst.init(None) on the camera-reader
-# thread, but GStreamer must only be initialised from the main thread.
-# Calling Gst.init() from a worker thread while CTranslate2 owns the CUDA
-# context causes a segfault.  Fix requires pre-creating the GStreamer pipeline
-# on the main thread and passing it to the reader thread — tracked in
-# improvement_ideas.md Step 3.
-_gst_available: bool = False
-logger.info("Camera decode backend: PyAV (GStreamer deferred — see improvement_ideas.md Step 3)")
+_gst_available: bool = _gstreamer_available()
+if _gst_available:
+    logger.info("Camera decode backend: GStreamer (avdec_h264 software decode)")
+else:
+    logger.info("Camera decode backend: PyAV fallback")
 
 
 def _reader_loop(url: str) -> None:
-    _reader_loop_pyav(url)
+    if _gst_available:
+        _reader_loop_gst(url)
+    else:
+        _reader_loop_pyav(url)
 
 
 # ── Public control ────────────────────────────────────────────────────────────

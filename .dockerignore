@@ -1,0 +1,24 @@
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Model weights — too large for images, mounted as volumes or served via Triton
+*.pt
+*.onnx
+*.engine
+*.trt
+
+# Secrets
+.env
+
+# Dev artifacts
+logs/
+.git/
+.venv/
+
+# Triton model repo — bind-mounted in docker-compose, not baked into app image
+triton_models/
+
+# Investigation scripts
+scripts/export_gdino_onnx.py

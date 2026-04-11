@@ -429,6 +429,59 @@ docker run --gpus all -d -p 8001:8001 -v ${PWD}/triton_models:/models -v ${HOME}
 
 **Benchmark (RTX 4070 Ti Super):** fp32=113ms → fp16 autocast=83ms (1.36×)
 
+### 2026-04-11 — Session 19 — Docker Compose + GDINO FastAPI (Triton Python backend bypass)
+
+**What was built:**
+
+*Docker Compose containerisation (4-container stack):*
+- Split the single bare-metal process into 4 Docker containers: `bianca-whisper`, `bianca-triton` (GDINO), `bianca-ollama`, `bianca-app`
+- All containers share GPU via Nvidia Container Toolkit; `bianca-app` has **no GPU reservation** (enforced CUDA-free constraint)
+- Bridge network `bianca-net` — containers reach each other by service name
+- `depends_on: condition: service_healthy` — app waits for all three AI services before starting
+- `~/.cache/huggingface` bind-mounted into whisper + triton; `ollama-models` named volume for Qwen weights
+- `family-data` and `app-logs` named volumes survive app rebuilds
+- New files: `Dockerfile.whisper`, `Dockerfile.app`, `Dockerfile.triton`, `docker-compose.yml`, `scripts/ollama-entrypoint.sh`
+
+*Whisper microservice (Dockerfile.whisper):*
+- `faster-whisper` wrapped in a FastAPI REST service (`services/whisper_server.py`)
+- POST `/transcribe` accepts audio bytes; GET `/health` for healthcheck
+- Loads `large-v3` fp16 at startup; responses are JSON `{transcript, confidence, language}`
+
+*Triton Python backend — investigated and abandoned:*
+- Implemented Grounding DINO Tiny as a Triton Python backend (`triton_models/gdino/1/model.py`)
+- **Root cause of failure:** Triton 24.04 Python backend has a shared-memory IPC broadcast bug — when C++ Triton core writes tensor data to the shared-memory channel for the Python stub subprocess, **all N tensor elements are overwritten with the first element's value**. Pattern confirmed: `received[i] == received[0]` for all i, regardless of dtype (UINT8, FP32), shape, or transport (gRPC/HTTP).
+- Attempted workarounds: UINT8 encoding, FP32 encoding, null stripping, HTTP transport, `rstrip(b"\x00")` — all failed because the bug is pre-data (in the IPC write, not serialisation).
+- Diagnostic: added `print(f"[diag] elem[{i}]={v}")` in model.py; confirmed `first_byte & 0x3F` repeated N times for UINT8; `first_float` repeated for FP32.
+
+*GDINO FastAPI service (replacement):*
+- Created `triton_models/gdino_server.py` — standalone FastAPI/uvicorn app that loads and runs GDINO directly
+- Runs in the same "triton" Docker container on port 8082 (bind-mounted from `./triton_models/`)
+- POST `/infer`: multipart JPEG + JSON queries → JSON `{boxes, scores, labels}` — no Triton IPC involved
+- GET `/health`: used by Docker Compose healthcheck and `scene_service` wait loop
+- Dockerfile.triton CMD changed from `tritonserver ...` to `uvicorn gdino_server:app ...`
+
+*scene_service.py refactor:*
+- Removed all `tritonclient` imports and gRPC connection logic
+- `_connect_triton()` now polls GET `/health` via `httpx.get` (waits up to 60s)
+- `_triton_infer()` now sends multipart POST via `httpx.Client`, parses JSON response
+- `_SimpleTracker` (pure-numpy IoU) replaces ByteTrack/supervision — eliminates pybind11/matplotlib dependency
+
+*requirements.app.txt:*
+- Removed `tritonclient[http]`; added comment noting GDINO moved to plain FastAPI
+
+**Key technical decisions:**
+- FastAPI over Triton Python backend: zero conversion friction, same model quality, same GPU
+- Plain HTTP (httpx) over gRPC: simpler client, no protobuf, easier debugging with curl
+- `_SimpleTracker` over supervision/ByteTrack: 0 native deps; sufficient for family-assistant use case
+- App container intentionally CUDA-free: if a CUDA dep sneaks in, inference calls fail loudly
+- `sync=true` on appsink for local file GStreamer sources (correct playback speed)
+
+**Verified working:**
+- Standalone test from app container confirmed GDINO service returns correct empty detections on black test image: `STANDALONE TEST PASSED`
+- Full stack started with Docker Compose; whisper/triton/ollama pass healthchecks; app reaches healthy
+
+---
+
 ## Open Questions / Future Ideas
 - Add a "complete todo" voice command ("mark buy groceries as done")
 - Scheduled reminders: outbound WhatsApp at event time

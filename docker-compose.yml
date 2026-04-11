@@ -1,0 +1,154 @@
+services:
+
+  # ── Whisper STT ─────────────────────────────────────────────────────────────
+  whisper:
+    build:
+      context: .
+      dockerfile: Dockerfile.whisper
+    image: bianca-whisper:latest
+    container_name: bianca-whisper
+    restart: unless-stopped
+    networks:
+      - bianca-net
+    ports:
+      - "8080:8080"
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      WHISPER_MODEL_SIZE: large-v3
+      HF_HUB_OFFLINE: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      # Model load is 30-90s when weights are cached; increase to 300s on first
+      # run if weights need to be downloaded (~3GB).
+      start_period: 120s
+      retries: 3
+
+  # ── Triton / GDINO ──────────────────────────────────────────────────────────
+  triton:
+    build:
+      context: .
+      dockerfile: Dockerfile.triton
+    image: bianca-triton:latest
+    container_name: bianca-triton
+    restart: unless-stopped
+    networks:
+      - bianca-net
+    ports:
+      - "8082:8082"
+    volumes:
+      - ./triton_models:/models
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      HF_HUB_OFFLINE: "1"
+      PYTHONIOENCODING: "utf-8"
+      LANG: "C.UTF-8"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8082/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 3
+
+  # ── Ollama / Qwen ───────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: bianca-ollama
+    restart: unless-stopped
+    networks:
+      - bianca-net
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+      - ./scripts/ollama-entrypoint.sh:/entrypoint.sh:ro
+    environment:
+      OLLAMA_KEEP_ALIVE: 24h
+      OLLAMA_MODEL: qwen2.5:14b
+    entrypoint: ["/bin/bash", "/entrypoint.sh"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # ── Main app ─────────────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    image: bianca-app:latest
+    container_name: bianca-app
+    restart: unless-stopped
+    networks:
+      - bianca-net
+    ports:
+      - "8000:8000"
+    volumes:
+      - family-data:/data
+      - app-logs:/app/logs
+      - /home/jasvinder:/home/jasvinder:ro
+    env_file:
+      - .env
+    environment:
+      # Override bare-metal localhost defaults from .env with Docker service names.
+      # These four vars are the only differences between bare-metal and Docker runs.
+      WHISPER_URL: http://whisper:8080
+      TRITON_URL: triton:8082
+      OLLAMA_BASE_URL: http://ollama:11434
+      FAMILY_MD_PATH: /data/family.md
+    # App intentionally has NO GPU reservation — it must be CUDA-free.
+    # If a CUDA dependency sneaks into the app image, calls will fail fast here.
+    depends_on:
+      whisper:
+        condition: service_healthy
+      triton:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+networks:
+  bianca-net:
+    driver: bridge
+
+volumes:
+  # family.md and logs survive app container restarts/rebuilds
+  family-data:
+  app-logs:
+  # HuggingFace weights are bind-mounted from the host (~/.cache/huggingface)
+  # so both whisper and triton use already-downloaded weights — no named volume needed.
+  # Ollama model storage — qwen2.5:14b (~9GB) persists across restarts
+  ollama-models:

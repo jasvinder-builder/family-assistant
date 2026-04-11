@@ -23,10 +23,11 @@ from typing import Optional
 
 import cv2
 import numpy as np
+from config import settings
 
 logger = logging.getLogger(__name__)
 
-TRITON_URL = os.getenv("TRITON_URL", "localhost:8001")
+TRITON_URL = settings.triton_url
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
 _box_threshold:  float = 0.35
@@ -36,6 +37,100 @@ _debug_overlay:  bool  = False
 RECHECK_INTERVAL_S = 30
 ANALYSIS_FPS       = 5
 VOTE_FRAMES        = 1
+
+
+# ── Minimal IoU tracker (replaces supervision.ByteTrack) ─────────────────────
+# supervision pulls in all of matplotlib (including the pybind11 C extension
+# ft2font).  GLib's initialisation (Gst.init) corrupts pybind11's GC traversal
+# handler, causing std::terminate() inside Python's cyclic GC.
+# This self-contained class has zero extra dependencies (pure numpy).
+
+class _SimpleTracker:
+    """Greedy IoU multi-object tracker sufficient for ANALYSIS_FPS=5."""
+
+    def __init__(self, iou_threshold: float = 0.3, max_lost: int = 10):
+        self._iou_thr  = iou_threshold
+        self._max_lost = max_lost
+        self._next_id  = 1
+        # {track_id: {'box': [x1,y1,x2,y2], 'class_id': int, 'lost': int}}
+        self._tracks: dict[int, dict] = {}
+
+    @staticmethod
+    def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Compute IoU between every pair in boxes a [N,4] and b [M,4] → [N,M]."""
+        inter_x1 = np.maximum(a[:, None, 0], b[None, :, 0])
+        inter_y1 = np.maximum(a[:, None, 1], b[None, :, 1])
+        inter_x2 = np.minimum(a[:, None, 2], b[None, :, 2])
+        inter_y2 = np.minimum(a[:, None, 3], b[None, :, 3])
+        inter    = np.maximum(0, inter_x2 - inter_x1) * np.maximum(0, inter_y2 - inter_y1)
+        area_a   = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+        area_b   = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+        union    = area_a[:, None] + area_b[None, :] - inter
+        return np.where(union > 0, inter / union, 0.0)
+
+    def update(
+        self,
+        boxes:     np.ndarray,   # [N, 4] float32 xyxy
+        scores:    np.ndarray,   # [N]    float32
+        class_ids: np.ndarray,   # [N]    int
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return (boxes, scores, class_ids, track_ids) for active detections."""
+        _empty = (
+            np.zeros((0, 4), np.float32), np.zeros((0,), np.float32),
+            np.zeros((0,), int),          np.zeros((0,), int),
+        )
+        for t in self._tracks.values():
+            t["lost"] += 1
+
+        if len(boxes) == 0:
+            self._tracks = {k: v for k, v in self._tracks.items()
+                            if v["lost"] <= self._max_lost}
+            return _empty
+
+        out_boxes, out_scores, out_cids, out_tids = [], [], [], []
+        track_ids  = list(self._tracks)
+        matched_t  = set()
+        matched_d  = set()
+
+        if track_ids:
+            t_boxes = np.array([self._tracks[i]["box"] for i in track_ids], np.float32)
+            iou     = self._iou_matrix(t_boxes, boxes)           # [T, N]
+            ti_arr, di_arr = np.where(iou >= self._iou_thr)
+            if len(ti_arr):
+                order = np.argsort(-iou[ti_arr, di_arr])
+                for idx in order:
+                    ti, di = int(ti_arr[idx]), int(di_arr[idx])
+                    if ti in matched_t or di in matched_d:
+                        continue
+                    matched_t.add(ti); matched_d.add(di)
+                    tid = track_ids[ti]
+                    self._tracks[tid] = {
+                        "box": boxes[di].tolist(), "class_id": int(class_ids[di]), "lost": 0
+                    }
+                    out_boxes.append(boxes[di]); out_scores.append(scores[di])
+                    out_cids.append(class_ids[di]); out_tids.append(tid)
+
+        for di in range(len(boxes)):
+            if di in matched_d:
+                continue
+            tid = self._next_id; self._next_id += 1
+            self._tracks[tid] = {
+                "box": boxes[di].tolist(), "class_id": int(class_ids[di]), "lost": 0
+            }
+            out_boxes.append(boxes[di]); out_scores.append(scores[di])
+            out_cids.append(class_ids[di]); out_tids.append(tid)
+
+        self._tracks = {k: v for k, v in self._tracks.items()
+                        if v["lost"] <= self._max_lost}
+
+        if not out_boxes:
+            return _empty
+        return (
+            np.array(out_boxes,  np.float32),
+            np.array(out_scores, np.float32),
+            np.array(out_cids,   int),
+            np.array(out_tids,   int),
+        )
 TRACK_PRUNE_AGE_S  = 300
 
 
@@ -175,25 +270,32 @@ def _get_shared_frame() -> Optional[np.ndarray]:
 
 # ── Triton gRPC client ────────────────────────────────────────────────────────
 
-def _connect_triton(max_wait_s: float = 30.0, retry_interval: float = 2.0):
-    """Wait for Triton to become ready, return a connected client or None."""
-    import tritonclient.grpc as grpcclient
+def _connect_triton(max_wait_s: float = 60.0, retry_interval: float = 2.0):
+    """Wait for the GDINO FastAPI server to become ready, return an httpx.Client.
 
+    The 'Triton' service was replaced with a plain FastAPI/uvicorn server running
+    GDINO directly.  This avoids a Triton 24.04 Python backend bug where every
+    tensor element is overwritten with the first element's value via shm IPC.
+    """
+    import httpx
+
+    base_url = f"http://{TRITON_URL}"
     deadline = time.monotonic() + max_wait_s
     while time.monotonic() < deadline:
         if _stop_event.is_set():
             return None
         try:
-            client = grpcclient.InferenceServerClient(url=TRITON_URL, verbose=False)
-            if client.is_server_ready() and client.is_model_ready("gdino"):
-                logger.info("Connected to Triton at %s (gdino model ready)", TRITON_URL)
+            r = httpx.get(f"{base_url}/health", timeout=3.0)
+            if r.status_code == 200:
+                client = httpx.Client(base_url=base_url, timeout=15.0)
+                logger.info("Connected to GDINO server at %s", base_url)
                 return client
         except Exception as exc:
-            logger.debug("Triton not ready yet: %s", exc)
+            logger.debug("GDINO server not ready yet: %s", exc)
         time.sleep(retry_interval)
     logger.error(
-        "Triton at %s did not become ready within %.0fs — camera analysis disabled",
-        TRITON_URL, max_wait_s,
+        "GDINO server at %s did not become ready within %.0fs — camera analysis disabled",
+        base_url, max_wait_s,
     )
     return None
 
@@ -205,42 +307,26 @@ def _triton_infer(
     threshold: float,
     text_threshold: float,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Send a frame to Triton, return (boxes [N,4], scores [N], labels [N])."""
-    import tritonclient.grpc as grpcclient
-
-    img_input = grpcclient.InferInput("IMAGE", [1], "BYTES")
-    img_input.set_data_from_numpy(np.array([jpeg_bytes], dtype=object))
-
-    qry_input = grpcclient.InferInput("QUERIES", [1], "BYTES")
-    qry_input.set_data_from_numpy(
-        np.array([json.dumps(queries).encode()], dtype=object)
+    """Send a frame to the GDINO FastAPI server, return (boxes, scores, labels)."""
+    response = client.post(
+        "/infer",
+        files={"image": ("frame.jpg", jpeg_bytes, "image/jpeg")},
+        data={
+            "queries": json.dumps(queries),
+            "threshold": str(threshold),
+            "text_threshold": str(text_threshold),
+        },
     )
+    response.raise_for_status()
+    result = response.json()
 
-    thr_input = grpcclient.InferInput("THRESHOLD", [1], "FP32")
-    thr_input.set_data_from_numpy(np.array([threshold], dtype=np.float32))
-
-    txt_input = grpcclient.InferInput("TEXT_THRESHOLD", [1], "FP32")
-    txt_input.set_data_from_numpy(np.array([text_threshold], dtype=np.float32))
-
-    outputs = [
-        grpcclient.InferRequestedOutput("BOXES"),
-        grpcclient.InferRequestedOutput("SCORES"),
-        grpcclient.InferRequestedOutput("LABELS"),
-    ]
-
-    response = client.infer(
-        model_name="gdino",
-        inputs=[img_input, qry_input, thr_input, txt_input],
-        outputs=outputs,
-    )
-
-    boxes  = response.as_numpy("BOXES")   # float32 [N, 4] or [0, 4]
-    scores = response.as_numpy("SCORES")  # float32 [N]
-    labels_raw = response.as_numpy("LABELS")
-    labels = [
-        l.decode() if isinstance(l, bytes) else str(l)
-        for l in labels_raw
-    ]
+    if result["boxes"]:
+        boxes  = np.array(result["boxes"],  dtype=np.float32).reshape(-1, 4)
+        scores = np.array(result["scores"], dtype=np.float32)
+    else:
+        boxes  = np.zeros((0, 4), dtype=np.float32)
+        scores = np.zeros((0,),   dtype=np.float32)
+    labels = result["labels"]
     return boxes, scores, labels
 
 
@@ -262,20 +348,13 @@ def _match_label_to_query(label: str, queries: list[str]) -> int:
 # ── Analysis loop ─────────────────────────────────────────────────────────────
 
 def _analysis_loop() -> None:
-    logger.info("Scene analysis starting (Grounding DINO via Triton + ByteTrack)")
+    logger.info("Scene analysis starting (Grounding DINO via Triton + IoU tracker)")
 
     client = _connect_triton()
     if client is None:
         return
 
-    import supervision as sv
-
-    tracker = sv.ByteTrack(
-        track_activation_threshold=0.25,
-        lost_track_buffer=30,
-        minimum_matching_threshold=0.8,
-        frame_rate=ANALYSIS_FPS,
-    )
+    tracker = _SimpleTracker(iou_threshold=0.3, max_lost=10)
 
     fired:        dict[tuple[int, int], float] = {}
     score_buffer: dict[tuple[int, int], deque] = {}
@@ -312,50 +391,47 @@ def _analysis_loop() -> None:
                 client, jpeg_bytes, prompt_queries, _box_threshold, _text_threshold,
             )
         except Exception:
-            logger.exception("Triton GDINO inference failed")
-            # Try to reconnect on next iteration
-            try:
-                import tritonclient.grpc as grpcclient
-                client = grpcclient.InferenceServerClient(url=TRITON_URL, verbose=False)
-            except Exception:
-                pass
+            logger.exception("GDINO inference failed")
             _set_latest_detections([])
             time.sleep(max(0.0, frame_interval - (time.monotonic() - t0)))
             continue
 
         if len(boxes) == 0:
-            tracker.update_with_detections(sv.Detections.empty())
+            tracker.update(
+                np.zeros((0, 4), np.float32),
+                np.zeros((0,), np.float32),
+                np.zeros((0,), int),
+            )
             _set_latest_detections([])
             time.sleep(max(0.0, frame_interval - (time.monotonic() - t0)))
             continue
 
-        # Map each GDINO label to a query index for ByteTrack class_id
+        # Map each GDINO label to a query index for tracker class_id
         class_ids = np.array(
             [_match_label_to_query(lbl, prompt_queries) for lbl in labels],
             dtype=int,
         )
 
-        sv_dets = sv.Detections(
-            xyxy=boxes.astype(np.float32),
-            confidence=scores.astype(np.float32),
-            class_id=class_ids,
+        t_boxes, t_scores, t_class_ids, t_track_ids = tracker.update(
+            boxes.astype(np.float32),
+            scores.astype(np.float32),
+            class_ids,
         )
-        tracked = tracker.update_with_detections(sv_dets)
 
         now = time.monotonic()
         frame_detections: list[Detection] = []
 
-        if tracked.tracker_id is not None and len(tracked) > 0:
-            for i in range(len(tracked)):
-                track_id = int(tracked.tracker_id[i])
-                x1, y1, x2, y2 = map(int, tracked.xyxy[i])
+        if len(t_boxes) > 0:
+            for i in range(len(t_boxes)):
+                track_id = int(t_track_ids[i])
+                x1, y1, x2, y2 = map(int, t_boxes[i])
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w, x2), min(h, y2)
                 if x2 <= x1 or y2 <= y1:
                     continue
 
-                conf  = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
-                q_idx = int(tracked.class_id[i])     if tracked.class_id   is not None else 0
+                conf  = float(t_scores[i])
+                q_idx = int(t_class_ids[i])
                 label = prompt_queries[q_idx] if q_idx < len(prompt_queries) else ""
 
                 scores_dict: dict[str, float] = {}
@@ -401,10 +477,7 @@ def _analysis_loop() -> None:
         _set_latest_detections(frame_detections)
 
         # Prune score_buffer for inactive tracks
-        active_ids = (
-            {int(tid) for tid in tracked.tracker_id}
-            if tracked.tracker_id is not None else set()
-        )
+        active_ids = {int(tid) for tid in t_track_ids}
         score_buffer = {k: v for k, v in score_buffer.items() if k[0] in active_ids}
 
         # Prune stale fired entries

@@ -3,8 +3,8 @@ Triton Python backend — Grounding DINO Tiny (fp16 on GPU).
 
 Inputs
 ------
-IMAGE         TYPE_BYTES  [1]   JPEG-encoded frame bytes
-QUERIES       TYPE_BYTES  [1]   JSON-encoded list of query strings
+IMAGE         TYPE_UINT8  [-1]  JPEG-encoded frame bytes
+QUERIES       TYPE_UINT8  [-1]  JSON-encoded list of query strings
 THRESHOLD     TYPE_FP32   [1]   box confidence threshold
 TEXT_THRESHOLD TYPE_FP32  [1]   per-token text-image threshold
 
@@ -12,7 +12,14 @@ Outputs
 -------
 BOXES   TYPE_FP32  [-1, 4]  xyxy in full-resolution pixel coords
 SCORES  TYPE_FP32  [-1]     detection confidence scores
-LABELS  TYPE_BYTES [-1]     matched query string for each box
+LABELS  TYPE_FP32  [-1]     newline-delimited label string, byte→float32 encoded
+
+Note: the app uses tritonclient.http (not gRPC).  Triton 24.04's gRPC shared-
+memory path has a bug that broadcasts the first tensor element to every position
+for all dtypes.  The HTTP transport delivers data correctly.
+
+LABELS uses byte→float32 encoding on output (each byte value stored as fp32)
+to sidestep any similar issue on the output path.
 
 Resize strategy: frame is downscaled to at most _MAX_W wide before GDINO
 to avoid Swin-T processing large frames slowly.  target_sizes is set to
@@ -28,13 +35,9 @@ _MAX_W = 800  # pre-resize width cap (same as scene_service constant)
 
 
 def _get_bytes(request, name: str) -> bytes:
-    """Extract bytes from a TYPE_BYTES input tensor (shape [1])."""
+    """Extract bytes from a TYPE_UINT8 flat input tensor."""
     arr = pb_utils.get_input_tensor_by_name(request, name).as_numpy()
-    val = arr.flat[0]
-    if isinstance(val, (bytes, bytearray)):
-        return bytes(val)
-    # numpy bytes_ or str scalar
-    return val.tobytes() if hasattr(val, "tobytes") else str(val).encode()
+    return arr.tobytes()
 
 
 class TritonPythonModel:
@@ -45,7 +48,7 @@ class TritonPythonModel:
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         model_id = "IDEA-Research/grounding-dino-tiny"
 
-        print(f"[gdino] Loading on {self._device}…", flush=True)
+        print(f"[gdino] Loading on {self._device}...", flush=True)
         self._processor = AutoProcessor.from_pretrained(model_id)
         dtype = torch.float16 if self._device == "cuda" else torch.float32
         self._model = (
@@ -82,7 +85,7 @@ class TritonPythonModel:
                 nparr  = np.frombuffer(jpeg_bytes, np.uint8)
                 bgr    = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 if bgr is None:
-                    raise ValueError("cv2.imdecode returned None — bad JPEG?")
+                    raise ValueError("cv2.imdecode returned None -- bad JPEG?")
                 orig_h, orig_w = bgr.shape[:2]
 
                 # Downscale wide frames to avoid Swin-T slowness
@@ -109,9 +112,7 @@ class TritonPythonModel:
                     with torch.no_grad():
                         outputs = self._model(**inputs)
 
-                # target_sizes = ORIGINAL dims → boxes returned in full-res pixel coords.
-                # This works because GDINO outputs normalized [0,1] coords which scale
-                # correctly to any target size when aspect ratio is preserved.
+                # target_sizes = ORIGINAL dims → boxes in full-res pixel coords.
                 results = self._processor.post_process_grounded_object_detection(
                     outputs,
                     inputs.input_ids,
@@ -125,28 +126,29 @@ class TritonPythonModel:
                 labels = results.get("labels", [])
 
                 if len(boxes) == 0:
-                    boxes      = np.zeros((0, 4), dtype=np.float32)
-                    scores     = np.zeros((0,),   dtype=np.float32)
-                    labels_arr = np.array([], dtype=object)
+                    boxes  = np.zeros((0, 4), dtype=np.float32)
+                    scores = np.zeros((0,),   dtype=np.float32)
+                    # LABELS: empty → single zero float32
+                    labels_fp32 = np.zeros((1,), dtype=np.float32)
                 else:
-                    labels_arr = np.array(
-                        [lbl.encode() if isinstance(lbl, str) else lbl for lbl in labels],
-                        dtype=object,
-                    )
+                    joined = "\n".join(
+                        lbl if isinstance(lbl, str) else lbl.decode()
+                        for lbl in labels
+                    ).encode()
+                    labels_fp32 = np.frombuffer(joined, dtype=np.uint8).astype(np.float32)
 
                 responses.append(pb_utils.InferenceResponse(output_tensors=[
                     pb_utils.Tensor("BOXES",  boxes),
                     pb_utils.Tensor("SCORES", scores),
-                    pb_utils.Tensor("LABELS", labels_arr),
+                    pb_utils.Tensor("LABELS", labels_fp32),
                 ]))
 
             except Exception as exc:
-                # Return empty detections so the analysis loop keeps running
                 responses.append(pb_utils.InferenceResponse(
                     output_tensors=[
                         pb_utils.Tensor("BOXES",  np.zeros((0, 4), dtype=np.float32)),
                         pb_utils.Tensor("SCORES", np.zeros((0,),   dtype=np.float32)),
-                        pb_utils.Tensor("LABELS", np.array([], dtype=object)),
+                        pb_utils.Tensor("LABELS", np.zeros((1,),   dtype=np.float32)),
                     ],
                     error=pb_utils.TritonError(str(exc)),
                 ))

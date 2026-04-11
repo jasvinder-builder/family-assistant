@@ -78,7 +78,7 @@
     <div class="card-body">
       <div class="d-flex justify-content-between align-items-center mb-3">
         <h6 class="fw-semibold mb-0">Scene Queries</h6>
-        <span class="text-muted small">CLIP matches against these during analysis</span>
+        <span class="text-muted small">Grounding DINO detects these during analysis</span>
       </div>
 
       <div id="queryList" class="d-flex flex-wrap gap-2 mb-3"></div>
@@ -98,15 +98,6 @@
         <span id="thresholdVal" class="small fw-semibold text-nowrap" style="min-width:3rem;">0.15</span>
       </div>
       <div class="small text-muted mt-1">Lower → more matches (risk of false positives) · Higher → fewer, more confident matches</div>
-
-      <div class="d-flex align-items-center gap-3 mt-3" style="max-width:420px;">
-        <label class="form-label mb-0 small fw-semibold text-nowrap">Crop padding</label>
-        <input type="range" class="form-range" id="padSlider"
-               min="0.0" max="1.0" step="0.05" value="0.30"
-               oninput="updatePad(this.value)">
-        <span id="padVal" class="small fw-semibold text-nowrap" style="min-width:3rem;">0.30</span>
-      </div>
-      <div class="small text-muted mt-1">Expands the crop around each detected object — helps CLIP see surrounding context (e.g. "person with stroller")</div>
     </div>
   </div>
 
