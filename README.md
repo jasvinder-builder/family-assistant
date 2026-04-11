@@ -95,39 +95,23 @@ Talk to Bianca (/talk)          Family Dashboard (/dashboard)
 
 ### Local software
 
-- **Python 3.11+**
-- **[Ollama](https://ollama.com)** — runs the Qwen LLM locally
-- **[cloudflared](https://github.com/cloudflare/cloudflared)** — Cloudflare Tunnel; exposes your local server to Twilio webhooks and provides HTTPS for browser mic access. Free with no bandwidth limits.
-- **NVIDIA GPU** (recommended) — Whisper large-v3 and Qwen 2.5:14b together need ~12GB VRAM. CPU-only works but is significantly slower.
-  - If using CPU: set `WHISPER_MODEL_SIZE=base` in `.env` for faster startup
+- **[Docker](https://docs.docker.com/engine/install/) + [Docker Compose](https://docs.docker.com/compose/install/)** — all services run as containers
+- **[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)** — gives containers GPU access
+- **NVIDIA GPU with ~12GB+ VRAM** — Whisper large-v3 (~1.5GB) + Qwen 2.5:14b (~9-10GB) + GDINO (~0.3GB)
+- **[cloudflared](https://github.com/cloudflare/cloudflared)** — Cloudflare Tunnel for Twilio webhooks and browser HTTPS
 
 ---
 
 ## Setup
 
-### 1. Clone and create virtual environment
+### 1. Clone the repo
 
 ```bash
 git clone https://github.com/jasvinder-builder/family-assistant.git
 cd family-assistant
-python3 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
 ```
 
-### 2. Pull the Qwen model via Ollama
-
-```bash
-ollama pull qwen2.5:14b
-```
-
-The model (~9GB) downloads once and is cached locally. Start Ollama before running the app:
-
-```bash
-ollama serve
-```
-
-### 3. Configure environment variables
+### 2. Configure environment variables
 
 ```bash
 cp .env.example .env
@@ -143,11 +127,13 @@ TWILIO_WHATSAPP_FROM=whatsapp:+14155238886 # Twilio sandbox number
 
 TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxx
 
+# These are overridden by docker-compose.yml to use container service names.
+# Set to localhost values here for bare-metal dev runs.
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=qwen2.5:14b
 
-FAMILY_MD_PATH=./family.md
-WHISPER_MODEL_SIZE=large-v3               # use "base" for CPU-only machines
+FAMILY_MD_PATH=/data/family.md
+WHISPER_MODEL_SIZE=large-v3
 
 # JSON mapping of E.164 phone numbers to names
 PHONE_TO_NAME={"+447911123456": "Alice", "+447911987654": "Bob"}
@@ -155,25 +141,31 @@ PHONE_TO_NAME={"+447911123456": "Alice", "+447911987654": "Bob"}
 
 `PHONE_TO_NAME` controls who can call Bianca. Only registered numbers are answered.
 
-### 4. Create your family data file
+### 3. Build and start all containers
 
 ```bash
-cp family.md.example family.md
+docker compose up -d --build
 ```
 
-Bianca reads from and writes to this file. It is excluded from git — your family's data stays local.
+This builds four images and starts them in dependency order:
 
-### 5. Start the server
+```
+bianca-whisper  →  loads faster-whisper large-v3 on GPU  (~30-90s first start)
+bianca-triton   →  loads GDINO Tiny fp16 on GPU           (~60-120s first start)
+bianca-ollama   →  pulls qwen2.5:14b if not cached        (~5 min first start, ~9GB)
+bianca-app      →  starts after all three are healthy
+```
+
+On subsequent starts all models are already cached — startup takes ~30s total.
+
+Check status:
 
 ```bash
-uvicorn main:app --host 0.0.0.0 --port 8000
+docker compose ps
+docker compose logs -f app
 ```
 
-`--host 0.0.0.0` makes the server reachable from other devices on your network (phones, Portal, etc.).
-
-On first startup Whisper and Qwen load into GPU memory (30–60 seconds). Subsequent requests are fast.
-
-### 6. Expose to Twilio and get HTTPS with Cloudflare Tunnel
+### 4. Expose to Twilio and get HTTPS with Cloudflare Tunnel
 
 ```bash
 cloudflared tunnel --url http://localhost:8000
@@ -184,6 +176,32 @@ Copy the `https://` forwarding URL printed in the output (e.g. `https://some-nam
 - **Twilio:** set your phone number's Voice webhook to `https://some-name.trycloudflare.com/voice/incoming` (POST)
 - **Browser mic:** the Talk and Hangman pages require HTTPS — use the cloudflared URL, not the local IP
 - **Note:** quick tunnel URLs change on each restart. For a stable persistent URL, log in with `cloudflared tunnel login` and create a named tunnel.
+
+### Rebuilding after code changes
+
+```bash
+# Rebuild and restart only the app container (fast — no GPU images rebuilt)
+docker compose build app && docker compose up -d app
+
+# Rebuild the GDINO service (e.g. after editing triton_models/gdino_server.py)
+docker compose build triton && docker compose up -d triton
+
+# Full rebuild
+docker compose up -d --build
+```
+
+### Bare-metal dev run (optional, no Docker)
+
+For quick iteration without rebuilding containers:
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.app.txt
+# Start Ollama separately: ollama serve
+# Start Whisper separately: cd whisper_server && uvicorn main:app --port 8080
+# Start GDINO separately:  uvicorn gdino_server:app --app-dir triton_models --port 8082
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
 
 ---
 
@@ -247,7 +265,7 @@ family-assistant/
 │
 ├── services/
 │   ├── qwen.py               # Ollama REST wrapper and all LLM prompt runners
-│   ├── whisper_service.py    # faster-whisper STT, loaded at startup on GPU
+│   ├── whisper_service.py    # REST client to whisper container; httpx POST /transcribe
 │   ├── twilio_service.py     # TwiML and WhatsApp sender
 │   ├── tavily_service.py     # Web and image search with retry
 │   ├── markdown_service.py   # Read/write/parse family.md with filelock
