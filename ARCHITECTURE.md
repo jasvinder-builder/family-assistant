@@ -8,125 +8,46 @@ Bianca is a family productivity assistant with two interfaces: phone calls (via 
 
 ## System Architecture
 
-```
-                    ┌─────────────────┐        ┌──────────────────────┐
-                    │  CALLER'S PHONE │        │  BROWSER (phone /    │
-                    │  (PSTN call)    │        │  Portal / tablet)    │
-                    └────────┬────────┘        └──────────┬───────────┘
-                             │                            │ HTTPS (cloudflared)
-                             ▼                            │ MediaRecorder audio
-                    ┌────────────────┐                    │ JSON responses
-                    │  TWILIO CLOUD  │                    │
-                    │  inbound call  │                    │
-                    │  TTS playback  │                    │
-                    └────────┬───────┘                    │
-                             │ webhooks (HTTP POST)       │
-                             ▼                            ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                     FASTAPI APPLICATION  (uvicorn :8000)               │
-│                                                                        │
-│  Phone routes:                    Browser routes:                      │
-│  POST /voice/incoming             GET  /                               │
-│  POST /voice/transcription        GET  /talk                           │
-│  POST /voice/research-choice      GET  /dashboard                      │
-│  POST /voice/research-whatsapp-   POST /dashboard/add-todo             │
-│       choice                      POST /dashboard/complete-todo        │
-│  GET  /voice/answer/{sid}         POST /dashboard/delete-todo          │
-│                                   POST /dashboard/add-event            │
-│                                   POST /dashboard/delete-event         │
-│                                   POST /transcribe  (Whisper STT)      │
-│                                   POST /chat        (text→JSON)        │
-│                                   GET  /games        (games hub)       │
-│                                   GET  /games/hangman                  │
-│                                   POST /games/hangman/new              │
-│                                   POST /games/hangman/guess            │
-│                                   GET  /games/multiply                 │
-│                                   GET  /games/clock                    │
-│                                   GET  /games/quiz                     │
-│                                   POST /games/quiz/generate            │
-│                                   GET  /games/bulls-cows               │
-│                                   POST /games/bulls-cows/new           │
-│                                   POST /games/bulls-cows/guess         │
-│                                   GET  /games/word-ladder              │
-│                                   POST /games/word-ladder/new          │
-│                                   POST /games/word-ladder/step         │
-│                                   POST /games/word-ladder/hint         │
-│                                   GET  /games/twenty-questions         │
-│                                   POST /games/twenty-questions/new     │
-│                                   POST /games/twenty-questions/start   │
-│                                   POST /games/twenty-questions/answer  │
-│                                   POST /games/twenty-questions/confirm │
-│                                   GET  /cameras                        │
-│                                   POST /cameras/set-stream             │
-│                                   GET  /cameras/stream  (MJPEG)        │
-│                                   GET  /health                         │
-└───────────────┬────────────────────────────────────────────────────────┘
-                │
-                ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│                  LOCAL MACHINE  (RTX 4070 Ti Super, 16GB VRAM)        │
-│                                                                       │
-│  ┌──────────────────────┐    ┌─────────────────────────────────────┐  │
-│  │  faster-whisper      │    │  Ollama  (REST on :11434)           │  │
-│  │  large-v3 / CUDA     │    │  Qwen 2.5:14b  Q4_K_M              │  │
-│  │  int8_float16        │    │  ~9-10GB VRAM                       │  │
-│  │  ~1.5GB VRAM         │    │  Warmed up at startup               │  │
-│  │  Loaded at startup   │    └─────────────────────────────────────┘  │
-│  └──────────────────────┘                                             │
-│                                                                       │
-│  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │  family.md  (pipe-delimited markdown, filelock protected)        │ │
-│  │  ## Todos    — [ ] / [x] items with due date, added_by, etc     │ │
-│  │  ## Events   — ISO datetime | title | added_by                  │ │
-│  └──────────────────────────────────────────────────────────────────┘ │
-│                                                                       │
-│  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │  APScheduler — scans events every 30min                         │ │
-│  │  Sends WhatsApp reminders at 24h and 4h before each event       │ │
-│  └──────────────────────────────────────────────────────────────────┘ │
-│                                                                       │
-│  ┌──────────────────────────────────────────────────────────────────┐ │
-│  │  logs/app.log  (daily rotation, 7 days retention)               │ │
-│  └──────────────────────────────────────────────────────────────────┘ │
-└───────────────────────────────────────────────────────────────────────┘
-                │
-                ▼
-┌───────────────────────────┐       ┌──────────────────────────────────┐
-│  TAVILY API (cloud)       │       │  FAMILY WHATSAPP                 │
-│  Web + image search       │       │  Research results, reminders,    │
-│  (research intents only)  │       │  WhatsApp-choice deliveries      │
-└───────────────────────────┘       └──────────────────────────────────┘
-```
-           │
-           ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                     LOCAL MACHINE  (RTX 4070 Ti Super, 16GB VRAM)   │
-│                                                                      │
-│  ┌─────────────────────┐    ┌──────────────────────────────────────┐ │
-│  │  faster-whisper     │    │  Ollama                              │ │
-│  │  large-v3           │    │  (separate process, REST on :11434)  │ │
-│  │  CUDA               │    │                                      │ │
-│  │  int8_float16       │    │  ┌────────────────────────────────┐  │ │
-│  │  ~1.5GB VRAM        │    │  │  Qwen 2.5:14b  Q4_K_M         │  │ │
-│  │                     │    │  │  ~9-10GB VRAM                  │  │ │
-│  │  Loaded at startup  │    │  │  Warmed up at startup          │  │ │
-│  │  ~1-2s per call     │    │  └────────────────────────────────┘  │ │
-│  └─────────────────────┘    └──────────────────────────────────────┘ │
-│                                                                      │
-│  ┌───────────────────────────────────────────────────────────────┐   │
-│  │  family.md  (pipe-delimited markdown, filelock protected)     │   │
-│  │  ## Todos    — [ ] / [x] items with due date, added_by, etc  │   │
-│  │  ## Events   — ISO datetime | title | added_by               │   │
-│  └───────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────┐
-│     TAVILY API (cloud)       │
-│  Web search, image search    │
-│  (used only for research     │
-│   intents)                   │
-└──────────────────────────────┘
+```mermaid
+graph TD
+    subgraph Callers["External Callers"]
+        PHONE["Caller's Phone (PSTN)"]
+        BROWSER["Browser (phone / portal / tablet)"]
+    end
+
+    subgraph Cloud["Cloud Services"]
+        TWILIO["Twilio Cloud\ninbound call / TTS playback"]
+        TAVILY["Tavily API\nweb + image search"]
+        WHATSAPP["Family WhatsApp\nresearch results / reminders"]
+    end
+
+    subgraph App["FastAPI Application (uvicorn :8000)"]
+        PHONE_ROUTES["Phone routes\nPOST /voice/incoming\nPOST /voice/transcription\nPOST /voice/research-choice\nPOST /voice/research-whatsapp-choice\nGET  /voice/answer/{sid}"]
+        BROWSER_ROUTES["Browser routes\nGET /  GET /talk  GET /dashboard\nPOST /dashboard/* CRUD\nPOST /transcribe  POST /chat\nGET /games/*  POST /games/*\nGET /cameras  POST /cameras/*\nGET /health"]
+    end
+
+    subgraph LocalMachine["Local Machine (RTX 4070 Ti Super, 16 GB VRAM)"]
+        WHISPER["faster-whisper large-v3\nCUDA / int8_float16\n~1.5 GB VRAM — loaded at startup"]
+        OLLAMA["Ollama (REST :11434)\nQwen 2.5:14b Q4_K_M\n~9-10 GB VRAM — warmed at startup"]
+        FAMILYMD["family.md\npipe-delimited markdown\nfilelock protected\n## Todos  ## Events"]
+        SCHEDULER["APScheduler\nscans events every 30 min\nsends WhatsApp at 24h and 4h"]
+        LOGS["logs/app.log\ndaily rotation, 7 days retention"]
+    end
+
+    PHONE -->|PSTN call| TWILIO
+    BROWSER -->|HTTPS via cloudflared\nMediaRecorder audio / JSON| BROWSER_ROUTES
+    TWILIO -->|webhooks HTTP POST| PHONE_ROUTES
+    PHONE_ROUTES --> WHISPER
+    PHONE_ROUTES --> OLLAMA
+    BROWSER_ROUTES --> WHISPER
+    BROWSER_ROUTES --> OLLAMA
+    PHONE_ROUTES --> FAMILYMD
+    BROWSER_ROUTES --> FAMILYMD
+    SCHEDULER --> WHATSAPP
+    PHONE_ROUTES --> TAVILY
+    BROWSER_ROUTES --> TAVILY
+    TAVILY -->|search results| PHONE_ROUTES
+    PHONE_ROUTES -->|WhatsApp delivery| WHATSAPP
 ```
 
 ---
@@ -135,204 +56,114 @@ Bianca is a family productivity assistant with two interfaces: phone calls (via 
 
 ### Flow 1 — Greeting & Speech Capture
 
-```
-Phone call arrives at Twilio
-        │
-        ▼
-POST /voice/incoming
-  call_handler.handle_incoming()
-        │
-        ├─ Phone number in PHONE_TO_NAME? ──No──▶ TwiML: "Not registered. Goodbye." → hangup
-        │
-        └─ Yes ──▶ TwiML: <Say> "Hi {name}, this is Bianca..."
-                          <Record maxLength=15 action=/voice/transcription>
-                   Twilio speaks greeting, records caller, POSTs RecordingUrl
+```mermaid
+flowchart TD
+    A["Phone call arrives at Twilio"] --> B["POST /voice/incoming\ncall_handler.handle_incoming()"]
+    B --> C{Phone number\nin PHONE_TO_NAME?}
+    C -->|No| D["TwiML: 'Not registered. Goodbye.' → hangup"]
+    C -->|Yes| E["TwiML: Say 'Hi {name}, this is Bianca...'\nRecord maxLength=15\naction=/voice/transcription"]
+    E --> F["Twilio speaks greeting,\nrecords caller,\nPOSTs RecordingUrl"]
 ```
 
 ### Flow 2 — Transcription & Intent Routing (Filler + Async)
 
 The transcription route returns a filler phrase **immediately** and computes the answer in parallel, eliminating perceived silence.
 
-```
-POST /voice/transcription  (RecordingUrl, RecordingSid, From)
-  call_handler.handle_transcription()
-        │
-        ├─ Create Session (session_store) keyed by RecordingSid
-        │   Session holds: asyncio.Event + result slot
-        │
-        ├─ asyncio.create_task(_compute_answer(...))  ← runs in background
-        │
-        └─ Return immediately:
-           TwiML: <Say> "Sure, let me check that..." </Say>
-                  <Redirect GET /voice/answer/{sid}>
+```mermaid
+flowchart TD
+    A["POST /voice/transcription\nRecordingUrl, RecordingSid, From"] --> B["Create Session in session_store\nkeyed by RecordingSid\nholds asyncio.Event + result slot"]
+    B --> C["asyncio.create_task(_compute_answer)\nruns in background"]
+    C --> D["Return immediately:\nTwiML: Say filler phrase\nRedirect GET /voice/answer/{sid}"]
 
-                          ┌─────────────────────────────────┐
-                          │  _compute_answer() (background) │
-                          │                                 │
-                          │  httpx download recording       │
-                          │         ↓                       │
-                          │  asyncio.to_thread(             │
-                          │    whisper_service.transcribe)  │
-                          │  confidence = exp(avg_logprob)  │
-                          │         ↓                       │
-                          │  confidence < 0.3 or < 2 words? │
-                          │    → "Could you repeat?" result │
-                          │         ↓                       │
-                          │  asyncio.to_thread(             │
-                          │    qwen.classify_intent)        │
-                          │         ↓                       │
-                          │  asyncio.to_thread(             │
-                          │    intent_handler.route)        │
-                          │         ↓                       │
-                          │  session.result = TwiML         │
-                          │  session.event.set()            │
-                          └─────────────────────────────────┘
+    subgraph BG["_compute_answer() — background task"]
+        E["httpx download recording"] --> F["asyncio.to_thread\nwhisper_service.transcribe\nconfidence = exp(avg_logprob)"]
+        F --> G{confidence < 0.3\nor < 2 words?}
+        G -->|Yes| H["result = 'Could you repeat?'"]
+        G -->|No| I["asyncio.to_thread\nqwen.classify_intent"]
+        I --> J["asyncio.to_thread\nintent_handler.route"]
+        J --> K["session.result = TwiML\nsession.event.set()"]
+    end
 
-GET /voice/answer/{sid}                 ← Twilio calls this after filler plays
-  await session.event (timeout=30s)
-        │
-        ├─ timeout ──▶ "Sorry, that took too long." → hangup
-        └─ result ready ──▶ return TwiML answer → continue conversation
+    D --> L["GET /voice/answer/{sid}\nawait session.event (timeout=30s)"]
+    L --> M{timeout?}
+    M -->|Yes| N["'Sorry, that took too long.' → hangup"]
+    M -->|No| O["return TwiML answer\n→ continue conversation"]
 
-  intent_handler.route() returns:
-        ├─ confidence < 0.6 or unknown ──▶ help message + <Record> (loop)
-        ├─ goodbye ──────────────────────▶ farewell + hangup
-        ├─ add_todo ─────────────────────▶ [Flow 3a]
-        ├─ complete_todo ────────────────▶ [Flow 3b]
-        ├─ add_event ────────────────────▶ [Flow 3c]
-        ├─ query_tasks ──────────────────▶ [Flow 3d]
-        ├─ query_events ─────────────────▶ [Flow 3d]
-        └─ research / research_images ───▶ [Flow 3e]
+    O --> P{intent}
+    P -->|confidence < 0.6 or unknown| Q["help message + Record loop"]
+    P -->|goodbye| R["farewell + hangup"]
+    P -->|add_todo| S["Flow 3a"]
+    P -->|complete_todo| T["Flow 3b"]
+    P -->|add_event| U["Flow 3c"]
+    P -->|query_tasks / query_events| V["Flow 3d"]
+    P -->|research / research_images| W["Flow 3e"]
 ```
 
 **New component:** `services/session_store.py` — thin dict-based store mapping `RecordingSid → Session(event, result)`.
 
 ### Flow 3a — Add Todo
 
-```
-qwen.extract_todo(transcript)
-  Qwen — prompts/todo_extract.txt
-  Returns: { text, due (ISO date or null) }
-        │
-        ▼
-markdown_service.append_todo(item)
-  Sanitize text (strip | and \n)
-  FileLock → write to family.md
-        │
-        ▼
-TwiML: <Say> "Done. I've added '{text}'..." + <Record> (loop)
+```mermaid
+flowchart TD
+    A["qwen.extract_todo(transcript)\nprompts/todo_extract.txt\nReturns: {text, due (ISO date or null)}"]
+    A --> B["markdown_service.append_todo(item)\nSanitize text (strip | and \\n)\nFileLock → write to family.md"]
+    B --> C["TwiML: Say 'Done. I've added {text}...'\n+ Record (loop)"]
 ```
 
 ### Flow 3b — Complete Todo
 
-```
-markdown_service.read_todos()  →  pending todos list
-        │
-        ▼
-qwen.match_todo(transcript, pending_todos)
-  Qwen — prompts/todo_match.txt  (fuzzy semantic match)
-  Returns: matched todo text or null
-        │
-        ├─ no match ──▶ "I couldn't find that. Be more specific?" + <Record>
-        │
-        ▼
-markdown_service.complete_todo(matched_text)
-  FileLock → rewrite - [ ] as - [x] + completed_at timestamp
-        │
-        ▼
-TwiML: <Say> "Done. I've marked '{text}' as complete." + <Record> (loop)
+```mermaid
+flowchart TD
+    A["markdown_service.read_todos()\n→ pending todos list"] --> B["qwen.match_todo(transcript, pending_todos)\nprompts/todo_match.txt (fuzzy semantic match)\nReturns: matched todo text or null"]
+    B --> C{match found?}
+    C -->|No| D["'I couldn't find that. Be more specific?' + Record"]
+    C -->|Yes| E["markdown_service.complete_todo(matched_text)\nFileLock → rewrite - [ ] as - [x]\n+ completed_at timestamp"]
+    E --> F["TwiML: Say 'Done. Marked {text} as complete.'\n+ Record (loop)"]
 ```
 
 ### Flow 3c — Add Event
 
-```
-qwen.extract_event(transcript)
-  Qwen — prompts/event_extract.txt
-  Resolves relative dates ("next Friday") to absolute ISO datetime
-  Returns: { title, event_datetime, human_readable }
-        │
-        ▼
-markdown_service.append_event(item)
-  FileLock → append to ## Events in family.md
-        │
-        ▼
-TwiML: <Say> "Done. Added '{title}' on {human_readable}." + <Record> (loop)
+```mermaid
+flowchart TD
+    A["qwen.extract_event(transcript)\nprompts/event_extract.txt\nResolves relative dates to absolute ISO datetime\nReturns: {title, event_datetime, human_readable}"]
+    A --> B["markdown_service.append_event(item)\nFileLock → append to ## Events in family.md"]
+    B --> C["TwiML: Say 'Done. Added {title} on {human_readable}.'\n+ Record (loop)"]
 ```
 
 ### Flow 3d — Query Todos / Events
 
-```
-markdown_service.read_todos() or read_events()
-  Parses all items from family.md (past + future for events)
-        │
-        ▼
-qwen.answer_family_query(transcript, items, item_type)
-  Qwen — prompts/family_query.txt
-  Knows today's date and time
-  Answers the specific question (not just a list dump)
-  e.g. "when is the birthday?" → finds event, says "14 days from now"
-        │
-        ▼
-TwiML: <Say> {answer} + <Record> (loop)
+```mermaid
+flowchart TD
+    A["markdown_service.read_todos() or read_events()\nParses all items from family.md"]
+    A --> B["qwen.answer_family_query(transcript, items, item_type)\nprompts/family_query.txt\nKnows today's date and time\nAnswers specific question (not a list dump)"]
+    B --> C["TwiML: Say {answer} + Record (loop)"]
 ```
 
 ### Flow 3e — Research
 
-```
-intent.query present and ≥ 2 words?
-        │
-        ├─ No ──▶ "Could you give me more detail?" + <Record>
-        │
-        ▼
-research_images intent?
-        ├─ Yes ──▶ asyncio.create_task(_deliver_images) → Tavily → WhatsApp
-        │           TwiML: "I'll send those images to your WhatsApp." + <Record>
-        │
-        ▼  (research intent)
-qwen.quick_answer(query)   [asyncio.to_thread]
-  Can Qwen answer from knowledge alone?
-        │
-        ├─ Yes ──▶ TwiML: <Say> answer + <Record> (loop)
-        │
-        └─ No ──▶ asyncio.create_task(_do_research(query))
-                       _do_research returns (voice_text, whatsapp_text):
-                         Tavily search → asyncio.gather(
-                           qwen.voice_summarize_research,  ← 2-3 spoken sentences
-                           qwen.synthesize_research,       ← full WhatsApp detail
-                         )
+```mermaid
+flowchart TD
+    A{intent.query present\nand ≥ 2 words?}
+    A -->|No| B["'Could you give me more detail?' + Record"]
+    A -->|Yes| C{research_images intent?}
+    C -->|Yes| D["asyncio.create_task(_deliver_images)\nTavily → WhatsApp\nTwiML: 'I'll send those images to WhatsApp.' + Record"]
+    C -->|No| E["qwen.quick_answer(query)\nCan Qwen answer from knowledge alone?"]
+    E -->|Yes| F["TwiML: Say answer + Record (loop)"]
+    E -->|No| G["asyncio.create_task(_do_research(query))\nTavily search → asyncio.gather(\n  qwen.voice_summarize_research,\n  qwen.synthesize_research\n)"]
+    G --> H["await asyncio.wait_for(shield(task), timeout=10s)"]
+    H -->|Done in time| I["store whatsapp_text in _pending_whatsapp[wid]\nTwiML: Say voice_text (2-3 sentences)\n'Want full details on WhatsApp?'\nRecord action=/voice/research-whatsapp-choice/{wid}"]
+    H -->|Timeout| J["store task in _pending[rid]\nTwiML: 'Still researching... say wait or WhatsApp'\nRecord action=/voice/research-choice/{rid}"]
 
-                  await asyncio.wait_for(shield(task), timeout=10s)
-                        │
-                        ├─ Done in time ──▶ store whatsapp_text in _pending_whatsapp[wid]
-                        │                   TwiML: <Say> voice_text (2-3 sentences)
-                        │                          "Want the full details on WhatsApp?"
-                        │                          <Record action=/voice/research-whatsapp-choice/{wid}>
-                        │
-                        └─ Timeout ──▶ store task in _pending[rid]
-                                       TwiML: "Still researching... say 'wait' or 'WhatsApp'"
-                                              <Record action=/voice/research-choice/{rid}>
+    J --> K["POST /voice/research-choice/{rid}\nDownload audio → Whisper → keyword match"]
+    K -->|WhatsApp| L["asyncio.create_task(_deliver_whatsapp_when_done)\nTwiML: 'I'll send to WhatsApp shortly.' + Record"]
+    K -->|wait| M["await shield(task), timeout=15s"]
+    M -->|Done| N["store whatsapp_text in _pending_whatsapp[wid]\nTwiML: Say voice_text\n'Want full details on WhatsApp?'\nRecord action=/voice/research-whatsapp-choice/{wid}"]
+    M -->|Timeout| O["asyncio.create_task(_deliver_whatsapp_when_done)\nTwiML: 'Taking longer, sending to WhatsApp.' + Record"]
 
-POST /voice/research-choice/{rid}
-  Download audio → Whisper → keyword match ("wait" / "WhatsApp")
-        │
-        ├─ "WhatsApp" ──▶ asyncio.create_task(_deliver_whatsapp_when_done)
-        │                  TwiML: "I'll send to your WhatsApp shortly." + <Record>
-        │
-        └─ "wait" ──▶ await shield(task), timeout=15s
-                            │
-                            ├─ Done ──▶ store whatsapp_text in _pending_whatsapp[wid]
-                            │           TwiML: <Say> voice_text + "Want full details on WhatsApp?"
-                            │                  <Record action=/voice/research-whatsapp-choice/{wid}>
-                            └─ Timeout ──▶ asyncio.create_task(_deliver_whatsapp_when_done)
-                                           TwiML: "Taking longer, sending to WhatsApp." + <Record>
-
-POST /voice/research-whatsapp-choice/{wid}
-  Download audio → Whisper → keyword match ("yes" / "no")
-        │
-        ├─ "yes/sure/send" ──▶ twilio_service.send_whatsapp(full detail text)
-        │                       TwiML: "Sent! Anything else?" + <Record>
-        │
-        └─ "no" ──▶ TwiML: "No problem. Anything else?" + <Record>
+    I --> P["POST /voice/research-whatsapp-choice/{wid}\nDownload audio → Whisper → keyword match"]
+    N --> P
+    P -->|yes/sure/send| Q["twilio_service.send_whatsapp(full detail)\nTwiML: 'Sent! Anything else?' + Record"]
+    P -->|no| R["TwiML: 'No problem. Anything else?' + Record"]
 ```
 
 ---
@@ -341,29 +172,17 @@ POST /voice/research-whatsapp-choice/{wid}
 
 A background scheduler (`APScheduler AsyncIOScheduler`) starts at app startup and scans `family.md` every 30 minutes for upcoming events.
 
-```
-App startup (lifespan)
-        │
-        ▼
-reminder_service.start()
-  Schedules _scan_and_schedule() to run immediately + every 30 min
-        │
-        ▼
-_scan_and_schedule()
-  markdown_service.read_events(after=now, before=now+48h)
-        │
-        ▼
-  For each event in window:
-    For each offset in [24h, 4h]:
-      remind_at = event_datetime - offset
-      if remind_at <= now → skip (already past)
-      job_id = f"reminder_{event_datetime}_{offset_minutes}"
-      if job already exists in scheduler → skip (deduplication)
-      scheduler.add_job(DateTrigger(run_date=remind_at), _send_reminder)
-
-_send_reminder(title, label, event_dt)
-  Formats message: "Reminder: *{title}* is in {label} ({human time})."
-  Sends WhatsApp to every number in PHONE_TO_NAME
+```mermaid
+flowchart TD
+    A["App startup (lifespan)"] --> B["reminder_service.start()\nSchedules _scan_and_schedule()\nto run immediately + every 30 min"]
+    B --> C["_scan_and_schedule()\nmarkdown_service.read_events\n(after=now, before=now+48h)"]
+    C --> D["For each event in window:\nFor each offset in 24h, 4h:\n  remind_at = event_datetime - offset"]
+    D --> E{remind_at <= now?}
+    E -->|Yes| F["skip (already past)"]
+    E -->|No| G{job_id already\nin scheduler?}
+    G -->|Yes| H["skip (deduplication)"]
+    G -->|No| I["scheduler.add_job\nDateTrigger(run_date=remind_at)\n_send_reminder"]
+    I --> J["_send_reminder(title, label, event_dt)\nFormats message\nSends WhatsApp to every number in PHONE_TO_NAME"]
 ```
 
 **Deduplication:** APScheduler job IDs are deterministic (`reminder_{iso_datetime}_{minutes}`). The 30-minute scan simply skips any job ID that already exists. One-off jobs are removed by APScheduler after they fire, so there is no risk of double-sending within a single server run.
@@ -374,25 +193,17 @@ _send_reminder(title, label, event_dt)
 
 ## Web Dashboard Flow
 
-```
-Browser → GET /dashboard
-        markdown_service.read_all_data() → todos + events
-        Annotate events with is_past, sort (pending/upcoming first)
-        Resolve family_names from PHONE_TO_NAME for name dropdowns
-        Jinja2 renders templates/dashboard.html
-        Bootstrap 5 two-column layout, auto-refreshes every 30s
-
-Dashboard is fully editable — all mutations are JSON POSTs, reload on success:
-
-  POST /dashboard/add-todo        {text, due?, added_by}  → append_todo()
-  POST /dashboard/complete-todo   {text}                  → complete_todo()
-  POST /dashboard/delete-todo     {text}                  → delete_todo()
-
-  POST /dashboard/add-event       {title, event_datetime, added_by}  → append_event()
-  POST /dashboard/delete-event    {title, event_datetime}            → delete_event()
-
-Edit (todo or event) is handled client-side:
-  delete-old → add-new (two sequential API calls, single page reload)
+```mermaid
+flowchart TD
+    A["Browser → GET /dashboard"] --> B["markdown_service.read_all_data()\n→ todos + events\nAnnotate events with is_past\nSort (pending/upcoming first)\nResolve family_names from PHONE_TO_NAME"]
+    B --> C["Jinja2 renders dashboard.html\nBootstrap 5 two-column layout\nauto-refreshes every 30s"]
+    C --> D["Dashboard is fully editable\nAll mutations are JSON POSTs\nReload on success"]
+    D --> E["POST /dashboard/add-todo\n{text, due?, added_by}\n→ append_todo()"]
+    D --> F["POST /dashboard/complete-todo\n{text}\n→ complete_todo()"]
+    D --> G["POST /dashboard/delete-todo\n{text}\n→ delete_todo()"]
+    D --> H["POST /dashboard/add-event\n{title, event_datetime, added_by}\n→ append_event()"]
+    D --> I["POST /dashboard/delete-event\n{title, event_datetime}\n→ delete_event()"]
+    D --> J["Edit (todo or event) — client-side:\ndelete-old → add-new\ntwo sequential API calls, single page reload"]
 ```
 
 ---
@@ -401,223 +212,50 @@ Edit (todo or event) is handled client-side:
 
 Family members open the browser interface on any device on the local network. The Talk and Hangman pages require HTTPS (use the cloudflared URL) because mic access and WASM require a secure context.
 
-```
-Browser (Portal / phone / tablet)
-        │
-        ├─ GET /          → home.html  (4 nav cards: Games, Dashboard, Talk, Cameras)
-        │
-        ├─ GET /games      → games.html  (games hub: Hangman, Multiply, Clock, Quiz)
-        │
-        ├─ GET /cameras    → cameras.html
-        │   POST /cameras/set-stream  {url}
-        │     camera_service.set_stream_url(url)
-        │       → also calls scene_service.start_analysis(url) or stop_analysis()
-        │   GET  /cameras/stream      → MJPEG StreamingResponse (local fallback)
-        │   WS   /cameras/ws          → WebSocket stream (works through Cloudflare Tunnel)
-        │
-        │   Singleton reader (camera_service._reader_loop):
-        │     One background thread per active stream URL
-        │     Decode backend selected at first start:
-        │       PyAV software decode (4 CPU threads) — current active backend
-        │         GStreamer code present but disabled: Gst.init() called on reader
-        │         thread violates GStreamer threading contract → SIGSEGV.
-        │         Fix tracked in improvement_ideas.md Step 3.
-        │     Reads frames → draws debug overlay if enabled → encodes JPEG
-        │     Broadcasts JPEG bytes to all subscriber queues (_broadcast)
-        │     Started/stopped by set_stream_url(); shared by all consumers
-        │
-        │   Consumers subscribe via subscribe_frames() → Queue, unsubscribe on disconnect
-        │     mjpeg_generator: wraps frames in multipart/x-mixed-replace chunks
-        │     ws_frame_generator: yields raw JPEG bytes → WebSocket sends as binary
-        │     Browser renders frames on <canvas> via createImageBitmap()
-        │   GET  /cameras/queries     → list of global scene queries
-        │   POST /cameras/queries     {text} → scene_service.add_query()
-        │   DELETE /cameras/queries/{i}      → scene_service.remove_query(i)
-        │   GET  /cameras/events      → last 1-hour events (polled every 5s by browser)
-        │
-        │   GET  /cameras/threshold   → current CLIP similarity threshold
-        │   POST /cameras/threshold   {value} → set threshold (0.0–1.0)
-        │   GET  /cameras/pad         → current crop padding factor
-        │   POST /cameras/pad         {value} → set pad factor (0.0–2.0)
-        │   POST /cameras/debug-overlay {enabled} → toggle bounding-box overlay
-        │
-        │   Single-reader frame sharing:
-        │     camera_service._reader_loop() decodes every frame (GStreamer or PyAV)
-        │       → calls scene_service.push_frame(frame) on each decoded frame
-        │       → encodes JPEG for MJPEG display (with optional debug overlay drawn)
-        │
-        │   Scene analysis pipeline (scene_service.py — background thread):
-        │     Receives frames via push_frame() / _shared_frame — no separate VideoCapture
-        │     Samples at 5 fps (waits on threading.Event, sleeps remainder of interval)
-        │     No PyTorch in main process — all GPU inference runs in GDINO container
-        │       → JPEG-encode frame → httpx.Client POST /infer to GDINO FastAPI service
-        │           Returns JSON: {boxes: [[x1,y1,x2,y2],...], scores: [...], labels: [...]}
-        │       → _SimpleTracker (pure-numpy IoU): assign persistent track IDs
-        │             No supervision/ByteTrack — eliminates pybind11/matplotlib deps
-        │       → _set_latest_detections() updates shared Detection list (used by overlay)
-        │       → For each tracked object:
-        │           if conf ≥ threshold for 30s recheck window → CameraEvent logged
-        │           CameraEvent includes JPEG crop as base64 for event log thumbnails
-        │       → Rolling event log: deque(maxlen=500), filtered to last 1h on read
-        │     Skips inference when no queries defined and debug overlay is off
-        │     GDINO connection: waits up to 60s on start_analysis() via GET /health poll
-        │
-        │   GDINO FastAPI Service (gdino_server.py — runs in "triton" Docker container):
-        │     uvicorn on port 8082, script bind-mounted from ./triton_models/gdino_server.py
-        │     Loads GDINO Tiny (IDEA-Research/grounding-dino-tiny) fp16 on CUDA at startup
-        │     POST /infer: multipart JPEG + JSON queries → JSON {boxes, scores, labels}
-        │       Resize to max 800px wide → run GDINO → post_process to full-res pixel coords
-        │     GET /health: used by Docker Compose healthcheck and scene_service wait loop
-        │     Note: container named "triton"; uses FastAPI not Triton Server — Triton's
-        │       Python backend was abandoned due to a shared-memory IPC bug in 24.04 where
-        │       all tensor elements are overwritten with the first element's value.
-        │
-        ├─ GET /talk       → talk.html
-        │   Page loads → Silero VAD initialises (ONNX model downloaded from CDN,
-        │                 cached after first load, runs on device CPU via WASM)
-        │   VAD listens continuously — no tap required
-        │   User speaks → onSpeechEnd(Float32Array @ 16kHz)
-        │     VAD paused while processing (prevents feedback loop with TTS)
-        │        │
-        │        ▼
-        │   Float32Array encoded to WAV in browser (float32ToWav)
-        │   POST /transcribe  (audio/wav blob)
-        │     asyncio.to_thread(whisper_service.transcribe, bytes, ".wav")
-        │     → {transcript, confidence}
-        │        │
-        │        ▼
-        │   POST /chat  {transcript, caller_name}
-        │     chat_handler.handle_chat()
-        │       classify_intent → route to handler
-        │       research → Tavily + parallel Qwen summaries
-        │       returns {speech, display, intent}
-        │        │
-        │        ▼
-        │   speechSynthesis.speak(speech)     ← browser reads aloud
-        │   VAD resumes after TTS finishes (onend callback)
-        │   Show display text in Full Answer panel (research only)
-        │
-        ├─ GET /dashboard  → dashboard.html
-        │   Editable todos and events (add / complete / edit / delete)
-        │   All mutations via JSON POST, reload on success
-        │   Auto-refreshes every 30s
-        │
-        ├─ GET /games/hangman → hangman.html
-        │   Same VAD auto-detection as /talk
-        │   POST /games/hangman/new    → new HangmanGame (random word)
-        │     hangman_service.new_game() pre-reveals hint letters based on word length:
-        │       ≤4 letters → 0 hints, 5→1, 6→2, 7+→3 (randomly chosen distinct letters)
-        │   POST /games/hangman/guess  {session_id, guess}
-        │     hangman_service.guess()
-        │     Accepts: "letter A", "word elephant", bare single letter
-        │     → {display_word, wrong_letters, figure, speech, won, lost}
-        │   VAD stays active after game over — player can say "new game"
-        │   minSpeechMs: 250ms
-        │   Duration guard: audio > 4s rejected (TTS echo filter)
-        │   Confidence check: transcripts with confidence < 0.30 silently ignored
-        │   speak() has watchdog timer — forces resumeListening() if onend never fires
-        │
-        ├─ GET /games/multiply → multiply.html
-        │   Times Tables practice game for kids
-        │   All logic client-side — no new backend endpoints
-        │   Generates random A×B (A,B ∈ 1–9), speaks question via speechSynthesis
-        │   VAD captures spoken answer → /transcribe → parseSpokenNumber()
-        │     Handles digits ("24") and English words ("twenty four", "eight")
-        │   Confidence check: transcripts with confidence < 0.45 silently ignored
-        │   minSpeechMs: 250ms (numbers are short; duration guard handles echo)
-        │   Tracks correct / answered score; Fresh Start resets
-        │
-        ├─ GET /games/clock → clock.html
-        │   Tell the Time game — 4-option multiple choice
-        │   All logic client-side — no new backend endpoints
-        │   Generates random time (hour 1–12, minute in multiples of 5)
-        │   Renders 4 SVG analogue clock faces (pure JS, no images/libraries):
-        │     white face, 12 tick marks, hour numbers at 12/3/6/9,
-        │     short thick dark hour hand, long thin purple minute hand
-        │   Distractors differ by ≥15 min or different hour (visually distinct)
-        │   VAD captures spoken answer → /transcribe → parseOption()
-        │     Strips filler phrases ("I think", "the answer is", "letter", etc.)
-        │     Matches: bare letter (A/B/C/D), spoken names (ay/bee/see/dee)
-        │     Conservative "A" guard: only accepts "a" when little other content
-        │   Confidence check: transcripts with confidence < 0.30 silently ignored
-        │   minSpeechMs: 250ms (single letters ~150ms; duration guard handles echo)
-        │   Tapping a clock card also accepted as answer
-        │   Speaks human-friendly time: "half past 3", "quarter to 6", "3 o'clock"
-        │   Tracks correct / answered score; Fresh Start resets
-        │
-        └─ GET /games/quiz → quiz.html
-            Knowledge Quiz — subject + grade selection → Qwen-generated questions
-            POST /games/quiz/generate  {subject, grade}
-              asyncio.to_thread(qwen.generate_quiz)
-              Prompt: prompts/quiz_generate.txt — enforces kid-safe content,
-                grade-appropriate difficulty, structured JSON output
-              qwen.generate_quiz() validates each question (4 options, correct index 0-3)
-              Requires ≥5 valid questions or raises error
-              Returns JSON array of up to 10 questions
-            Client flow:
-              Setup screen → pick subject (8 options) + grade (1–8)
-              Loading screen — cycling messages while Qwen generates (~15-25s)
-              Question screen — progress bar, 4 option cards, VAD or tap
-              Funny response phrases (8 correct, 8 wrong) picked at random
-              Final score screen — message scaled to performance, Play Again or New Quiz
-            VAD initialised after questions load (not during setup/loading)
-            Voice answer matching — parseAnswer(transcript, options):
-              1. Option text match: if transcript contains any option text, use it
-              2. Filler stripping: removes "I think", "the answer is", "I choose", etc.
-              3. Spoken letter names: ay→A, bee→B, see/cee→C, dee→D
-              4. Single letter match with conservative "A" guard
-            Confidence check: transcripts with confidence < 0.30 silently ignored
-            minSpeechMs: 250ms (single letters ~150ms; duration guard handles echo)
+```mermaid
+flowchart TD
+    A["Browser (Portal / phone / tablet)"] --> B["GET /\nhome.html\n4 nav cards: Games, Dashboard, Talk, Cameras"]
 
-        ├─ GET /games/bulls-cows → bulls_cows.html
-            Bulls and Cows — 4-digit code-breaking game (no LLM)
-            POST /games/bulls-cows/new   → new BullsCowsGame (4-digit secret, all unique, non-zero first)
-            POST /games/bulls-cows/guess {session_id, guess: "two four one three"}
-              bulls_cows_service.parse_spoken_number() — token-by-token word→digit mapping
-                Handles: digit words, digit characters, homophones (to→2, for→4, ate→8)
-                Returns None if not exactly 4 tokens or any token unrecognised
-              _score(secret, guess) → (bulls, cows): O(n) comparison
-              Max 10 attempts; win = 4 bulls; speech narrates result each turn
-            VAD duration guard: 5s (digit sequences are short)
+    B --> C["GET /games\ngames.html\ngames hub: Hangman, Multiply, Clock, Quiz"]
 
-        ├─ GET /games/word-ladder → word_ladder.html
-            Word Ladder — change one letter at a time from start→target word
-            POST /games/word-ladder/new
-              asyncio.to_thread(qwen.generate_word_ladder) → {"start": ..., "target": ...}
-              Prompt: prompts/word_ladder_generate.txt — 4-letter common kid words, 2-5 step path
-              word_ladder_service.new_game(start, target) validates pair with BFS
-              Falls back to hardcoded pairs if Qwen fails or BFS returns None
-            POST /games/word-ladder/step {session_id, word}
-              Validates: same length, exactly 1 letter different, word in _WORD_SET
-              _WORD_SET: /usr/share/dict/words filtered to lowercase alpha-only 3-5 letters
-                         built as frozenset at module import time; pre-grouped by length
-              5 wrong attempts allowed (bad word OR not in dict counts as wrong)
-            POST /games/word-ladder/hint {session_id}
-              BFS from current_word to target → next_word → reports which letter position to change
-            Chain visualiser: JS renders vertical word→word chain with differing letter underlined
-            VAD: says word aloud → Whisper → submitWord(); "hint" / "new game" also VAD-detected
+    B --> CAM["GET /cameras\ncameras.html"]
+    CAM --> CAM1["POST /cameras/set-stream {url}\ncamera_service.set_stream_url(url)\n→ scene_service.start_analysis(url) or stop"]
+    CAM --> CAM2["GET /cameras/stream\nMJPEG StreamingResponse (local fallback)"]
+    CAM --> CAM3["WS /cameras/ws\nWebSocket stream (works via Cloudflare Tunnel)"]
 
-        └─ GET /games/twenty-questions → twenty_questions.html
-            20 Questions — Bianca asks yes/no questions; kid thinks of something; Bianca guesses
-            POST /games/twenty-questions/new     → TwentyQGame (phase=thinking)
-            POST /games/twenty-questions/start   {session_id}
-              asyncio.to_thread(twenty_questions_service.start_questions)
-              Primes Ollama messages list with system prompt + "I've thought of something"
-              qwen.ask_twenty_questions(messages) → multi-turn /api/chat call (30s timeout)
-              Returns {"type": "question"|"guess", "content": "..."} — JSON strict
-                Fallback on non-JSON: treat raw text as question, log warning
-            POST /games/twenty-questions/answer  {session_id, answer}
-              asyncio.to_thread(twenty_questions_service.answer)
-              Normalises answer (yes/no/maybe) via word-list matching before appending to messages
-              Appends user turn to messages list; calls ask_twenty_questions with full history
-              At MAX_QUESTIONS: calls qwen.force_twenty_questions_guess (appends override user msg)
-              Phase transitions: playing → guessing when Qwen returns type=="guess"
-            POST /games/twenty-questions/confirm {session_id, answer}
-              twenty_questions_service.confirm() — no Qwen call; phase→finished
-            VAD behaviour: paused during thinking/loading/finished phases;
-              active during playing (yes/no/maybe) and guessing (yes/no) phases only
-              Duration guard: 6s (questions are ~3-5s TTS; answers are short)
-            Phase flow: thinking → loading → playing → guessing → finished
+    CAM --> CAM4["Singleton reader camera_service._reader_loop\nOne background thread per active stream URL\nBackend: PyAV software decode (4 CPU threads)\nReads frames → optional debug overlay → JPEG\nBroadcasts JPEG to all subscriber queues"]
+    CAM4 --> CAM5["Consumers via subscribe_frames() → Queue\nmjpeg_generator: multipart/x-mixed-replace\nws_frame_generator: raw JPEG → WebSocket binary\nBrowser renders frames on canvas via createImageBitmap"]
+
+    CAM --> CAM6["GET /cameras/queries\nPOST /cameras/queries {text}\nDELETE /cameras/queries/{i}\nGET /cameras/events (polled every 5s)\nGET|POST /cameras/threshold\nGET|POST /cameras/pad\nPOST /cameras/debug-overlay"]
+
+    CAM4 --> CAM7["scene_service.push_frame(frame)\nBackground thread, samples at 5 fps\nJPEG-encode → httpx POST /infer to GDINO container\nReturns JSON: {boxes, scores, labels}\n_SimpleTracker (pure-numpy IoU): persistent track IDs\nCameraEvent on match (threshold + 30s dedup)\nRolling event log: deque(maxlen=500)"]
+
+    CAM7 --> CAM8["GDINO FastAPI Service\nbianca-triton container (port 8082)\ngdino_server.py — uvicorn\nGDINO Tiny fp16 CUDA\nPOST /infer: resize → run GDINO → pixel coords\nGET /health: healthcheck + scene_service wait loop"]
+
+    B --> TALK["GET /talk\ntalk.html"]
+    TALK --> T1["Page loads → Silero VAD initialises\nONNX model from CDN, cached, runs via WASM"]
+    T1 --> T2["VAD listens continuously — no tap required\nUser speaks → onSpeechEnd(Float32Array @ 16kHz)\nVAD paused while processing"]
+    T2 --> T3["Float32Array encoded to WAV in browser\nPOST /transcribe (audio/wav blob)\nasyncio.to_thread(whisper_service.transcribe)\n→ {transcript, confidence}"]
+    T3 --> T4["POST /chat {transcript, caller_name}\nchat_handler.handle_chat()\nclassify_intent → route to handler\nresearch → Tavily + parallel Qwen summaries\nreturns {speech, display, intent}"]
+    T4 --> T5["speechSynthesis.speak(speech)\nVAD resumes after TTS finishes (onend callback)\nDisplay text in Full Answer panel (research only)"]
+
+    B --> DASH["GET /dashboard\ndashboard.html\nEditable todos and events\nAll mutations via JSON POST, reload on success\nAuto-refreshes every 30s"]
+
+    B --> HM["GET /games/hangman\nhangman.html\nSame VAD auto-detection as /talk"]
+    HM --> HM1["POST /games/hangman/new\nhangman_service.new_game()\nPre-reveals hint letters based on word length:\n≤4→0 hints, 5→1, 6→2, 7+→3 (random distinct)"]
+    HM --> HM2["POST /games/hangman/guess {session_id, guess}\nhangman_service.guess()\nAccepts: 'letter A', 'word elephant', bare letter\n→ {display_word, wrong_letters, figure, speech, won, lost}"]
+
+    B --> MUL["GET /games/multiply\nmultiply.html\nTimes Tables practice — all logic client-side\nRandom A×B (A,B ∈ 1-9), spoken via speechSynthesis\nVAD → /transcribe → parseSpokenNumber()\nTracks correct / answered score"]
+
+    B --> CLK["GET /games/clock\nclock.html\nTell the Time — 4-option multiple choice\nAll logic client-side\nRandom time, 4 SVG analogue clock faces (pure JS)\nVAD → /transcribe → parseOption()\nTracks correct / answered score"]
+
+    B --> QUIZ["GET /games/quiz\nquiz.html\nKnowledge Quiz — subject + grade selection\nPOST /games/quiz/generate {subject, grade}\nasyncio.to_thread(qwen.generate_quiz)\nprompts/quiz_generate.txt\nReturns JSON array of up to 10 questions\nVAD or tap for answers"]
+
+    B --> BC["GET /games/bulls-cows\nbulls_cows.html\nBulls and Cows — 4-digit code-breaking (no LLM)\nPOST /games/bulls-cows/new\nPOST /games/bulls-cows/guess {session_id, guess}\nbulls_cows_service.parse_spoken_number()\n_score → (bulls, cows); max 10 attempts"]
+
+    B --> WL["GET /games/word-ladder\nword_ladder.html\nWord Ladder — change one letter at a time\nPOST /games/word-ladder/new\n  qwen.generate_word_ladder + BFS validation\nPOST /games/word-ladder/step {session_id, word}\nPOST /games/word-ladder/hint {session_id}\nVertical chain visualiser; VAD + tap"]
+
+    B --> TQ["GET /games/twenty-questions\ntwenty_questions.html\n20 Questions — Bianca asks yes/no; kid thinks of something\nPOST /games/twenty-questions/new\nPOST /games/twenty-questions/start {session_id}\n  qwen.ask_twenty_questions — multi-turn /api/chat\nPOST /games/twenty-questions/answer {session_id, answer}\nPOST /games/twenty-questions/confirm {session_id, answer}\nPhase flow: thinking → loading → playing → guessing → finished"]
 ```
 
 ---
@@ -715,38 +353,19 @@ family-assistant/
 
 ## GPU Memory Layout (RTX 4070 Ti Super — 16GB)
 
-```
-┌──────────────────────────────────────────────────┐
-│                  16 GB VRAM                      │
-│                                                  │
-│  ┌────────────────────────┐                      │
-│  │  Qwen 2.5:14b Q4_K_M  │  ~9-10 GB            │
-│  │  (Ollama, always hot)  │                      │
-│  └────────────────────────┘                      │
-│  ┌──────────────┐                                │
-│  │  Whisper     │  ~1.5 GB                       │
-│  │  large-v3    │  (always loaded, not active    │
-│  │  int8_float16│   during Qwen inference)       │
-│  └──────────────┘                                │
-│  ┌──────────────────────────────┐                │
-│  │  Free headroom  ~4.5 GB     │                │
-│  └──────────────────────────────┘                │
-└──────────────────────────────────────────────────┘
+| Allocation | Size | Notes |
+|---|---|---|
+| Qwen 2.5:14b Q4_K_M (Ollama) | ~9–10 GB | Always hot; loaded at startup |
+| Whisper large-v3 int8_float16 | ~1.5 GB | Always loaded; not active during Qwen inference |
+| Free headroom | ~4.5 GB | Available for spikes |
 
-GDINO Docker container (separate CUDA context — no conflict with main process):
-┌──────────────────────────────────────────────────┐
-│  ┌──────────────┐                                │
-│  │  GDINO Tiny  │  ~0.3 GB  (fp16)               │
-│  │  FastAPI svc │                                │
-│  └──────────────┘                                │
-└──────────────────────────────────────────────────┘
+**GDINO Docker container** (separate CUDA context — no conflict with main process):
 
-Note: Whisper and Qwen never run at the same time —
-Whisper transcribes first, then Qwen processes.
-GDINO runs continuously at 5 fps via HTTP POST when a
-camera stream is active. _SimpleTracker runs in the main
-process on CPU (no VRAM needed).
-```
+| Allocation | Size | Notes |
+|---|---|---|
+| GDINO Tiny fp16 (FastAPI svc) | ~0.3 GB | Runs continuously at 5 fps when a camera stream is active |
+
+Note: Whisper and Qwen never run at the same time — Whisper transcribes first, then Qwen processes. GDINO runs continuously at 5 fps via HTTP POST when a camera stream is active. _SimpleTracker runs in the main process on CPU (no VRAM needed).
 
 ---
 
@@ -754,44 +373,27 @@ process on CPU (no VRAM needed).
 
 Bianca runs as four containers on a single host, sharing the GPU via Nvidia Container Toolkit.
 
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                           docker-compose stack                                  │
-│                           host: RTX 4070 Ti Super                               │
-│                                                                                 │
-│  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐              │
-│  │  bianca-whisper  │  │  bianca-triton   │  │  bianca-ollama   │              │
-│  │  :8080           │  │  :8082           │  │  :11434          │              │
-│  │                  │  │                  │  │                  │              │
-│  │  faster-whisper  │  │  gdino_server.py │  │  Ollama          │              │
-│  │  large-v3  fp16  │  │  GDINO Tiny fp16 │  │  Qwen 2.5:14b   │              │
-│  │  ~1.5GB VRAM     │  │  ~0.3GB VRAM     │  │  ~9-10GB VRAM   │              │
-│  │                  │  │                  │  │                  │              │
-│  │  POST /transcribe│  │  POST /infer     │  │  POST /api/chat  │              │
-│  │  GET  /health    │  │  GET  /health    │  │  GET  /api/tags  │              │
-│  └────────┬─────────┘  └────────┬─────────┘  └────────┬─────────┘              │
-│           │                     │                     │                         │
-│           └─────────────────────┴─────────────────────┘                         │
-│                                         │  bianca-net (bridge)                  │
-│                                         │                                       │
-│                          ┌──────────────▼──────────────┐                        │
-│                          │       bianca-app  :8000      │                        │
-│                          │                              │                        │
-│                          │  FastAPI + uvicorn           │                        │
-│                          │  NO GPU  (CPU-only)          │                        │
-│                          │                              │                        │
-│                          │  → Whisper for STT           │                        │
-│                          │  → GDINO for scene detection │                        │
-│                          │  → Ollama/Qwen for LLM       │                        │
-│                          └──────────────────────────────┘                        │
-│                                         │                                        │
-└─────────────────────────────────────────┼────────────────────────────────────────┘
-                                          │ :8000 (host port)
-                                          ▼
-                               ┌─────────────────────┐
-                               │  Browser / Twilio   │
-                               │  cloudflared tunnel │
-                               └─────────────────────┘
+```mermaid
+graph TD
+    subgraph Stack["docker-compose stack — host: RTX 4070 Ti Super"]
+        subgraph whisper["bianca-whisper :8080"]
+            W1["faster-whisper large-v3 fp16\n~1.5 GB VRAM\nPOST /transcribe\nGET  /health"]
+        end
+        subgraph triton["bianca-triton :8082"]
+            T1["gdino_server.py (FastAPI)\nGDINO Tiny fp16\n~0.3 GB VRAM\nPOST /infer\nGET  /health"]
+        end
+        subgraph ollama["bianca-ollama :11434"]
+            O1["Ollama\nQwen 2.5:14b\n~9-10 GB VRAM\nPOST /api/chat\nGET  /api/tags"]
+        end
+        subgraph app["bianca-app :8000"]
+            A1["FastAPI + uvicorn\nNO GPU (CPU-only)\n→ Whisper for STT\n→ GDINO for scene detection\n→ Ollama/Qwen for LLM"]
+        end
+    end
+
+    W1 -- bianca-net --> A1
+    T1 -- bianca-net --> A1
+    O1 -- bianca-net --> A1
+    A1 -->|:8000 host port| EXT["Browser / Twilio\ncloudflared tunnel"]
 ```
 
 ### Container responsibilities
@@ -814,35 +416,13 @@ Bianca runs as four containers on a single host, sharing the GPU via Nvidia Cont
 
 ### Camera inference pipeline
 
-```
-camera_service (app container, CPU)
-        │  push_frame(bgr)
-        ▼
-scene_service (app container, CPU)
-        │  JPEG-encode → httpx POST /infer
-        ▼
-┌─────────────────────────────────┐
-│  bianca-triton container (GPU)  │
-│                                 │
-│  gdino_server.py (FastAPI)      │
-│  ┌───────────────────────────┐  │
-│  │  GDINO Tiny  fp16 CUDA    │  │
-│  │  AutoProcessor             │  │
-│  │  resize → max 800px wide  │  │
-│  │  post_process → pixel     │  │
-│  │  coords (original dims)   │  │
-│  └───────────────────────────┘  │
-│  returns JSON {boxes,scores,    │
-│                labels}          │
-└─────────────┬───────────────────┘
-              │  JSON response
-              ▼
-scene_service
-        │  _SimpleTracker (IoU, pure-numpy)
-        │  → persistent track IDs
-        │  → CameraEvent on match (threshold + 30s dedup)
-        ▼
-cameras.html (browser, polling /cameras/events every 5s)
+```mermaid
+flowchart TD
+    A["camera_service\n(app container, CPU)\npush_frame(bgr)"]
+    A --> B["scene_service\n(app container, CPU)\nJPEG-encode → httpx POST /infer"]
+    B --> C["bianca-triton container (GPU)\ngdino_server.py (FastAPI)\nGDINO Tiny fp16 CUDA\nAutoProcessor\nresize → max 800px wide\npost_process → pixel coords (original dims)\nreturns JSON {boxes, scores, labels}"]
+    C --> D["scene_service\n_SimpleTracker (IoU, pure-numpy)\n→ persistent track IDs\n→ CameraEvent on match\n  (threshold + 30s dedup)"]
+    D --> E["cameras.html (browser)\npolling /cameras/events every 5s"]
 ```
 
 ---
@@ -852,24 +432,12 @@ cameras.html (browser, polling /cameras/events every 5s)
 Current stack works well for a home assistant at 5 fps. The following phases would bring it to
 production-quality, near-zero-latency inference:
 
-```
-CURRENT (Phase 1)                   FUTURE (Phase 2-4)
-─────────────────────               ───────────────────────────────
-PyAV software decode                GStreamer NVDEC hardware decode
-  (CPU, ~1-2 cores)      ──────▶      (GPU DMA, ~0 CPU overhead)
-
-GDINO Tiny (fp16)                   TensorRT engine (.plan file)
-  HuggingFace model      ──────▶      engine = trt.Runtime.deserialize()
-  ~80ms / frame                        ~10-20ms / frame  (4-8× faster)
-
-httpx multipart POST                NVIDIA Triton Inference Server
-  plain HTTP/1.1         ──────▶      gRPC / shared-memory IPC
-                                       batch inference, multi-model
-
-_SimpleTracker (IoU)                NVIDIA DeepStream / DALI pipeline
-  pure Python, CPU       ──────▶      GPU-resident pipeline, cuDNN tracking
-                                       DALI image decoding stays on GPU
-```
+| Aspect | Current (Phase 1) | Future (Phase 2–4) |
+|---|---|---|
+| Video decode | PyAV software decode (CPU, ~1–2 cores) | GStreamer NVDEC hardware decode (GPU DMA, ~0 CPU overhead) |
+| Inference model | GDINO Tiny fp16 — HuggingFace model, ~80ms/frame | TensorRT engine (.plan file) — ~10–20ms/frame (4–8× faster) |
+| Inference transport | httpx multipart POST, plain HTTP/1.1 | NVIDIA Triton Inference Server, gRPC / shared-memory IPC, batch inference, multi-model |
+| Tracking | _SimpleTracker (IoU), pure Python, CPU | NVIDIA DeepStream / DALI pipeline, GPU-resident, cuDNN tracking, DALI image decoding on GPU |
 
 ### Phase 2 — GStreamer NVDEC
 - Replace PyAV in `camera_service.py` with GStreamer NVDEC pipeline
