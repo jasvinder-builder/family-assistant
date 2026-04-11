@@ -8,46 +8,28 @@ A voice-based AI assistant for families. Call a phone number, speak naturally, o
 
 ## UI
 
-```
-┌─────────────────────────────────────────────────────┐
-│  👋 Hi, I'm Bianca                                  │
-│  Your family assistant — voice, todos, events,      │
-│  and games                                          │
-│                                                     │
-│  ┌───────────────┐ ┌───────────────┐ ┌───────────┐ │
-│  │   🎙️          │ │   📋          │ │   🎮      │ │
-│  │ Talk to Bianca│ │   Family      │ │  Hangman  │ │
-│  │               │ │  Dashboard    │ │           │ │
-│  │ Ask questions,│ │ View & manage │ │ Guess the │ │
-│  │ add todos and │ │ todos and     │ │ word with │ │
-│  │ events, search│ │ events        │ │ your voice│ │
-│  └───────────────┘ └───────────────┘ └───────────┘ │
-└─────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    Home["🏠 Home  /"]
 
-Talk to Bianca (/talk)          Family Dashboard (/dashboard)
-┌──────────────────────────┐    ┌──────────────────────────────┐
-│ You are: [Jasvinder ▾]   │    │ Todos          │ Events       │
-│                          │    │ ─────────────────────────────│
-│ Jasvinder                │    │ □ Buy groceries│ ✦ Dentist   │
-│ ╔══════════════════════╗ │    │   Due Apr 3    │   Fri Apr 10│
-│ ║ What's the weather   ║ │    │ □ Call plumber │ ✦ Gymnastics│
-│ ║ in Sunnyvale?        ║ │    │ ──────────────────────────── │
-│ ╚══════════════════════╝ │    │ [✓][✏️][🗑]    │   [✏️][🗑]  │
-│                          │    │                │             │
-│ Bianca                   │    │          [+ Add]│       [+Add]│
-│ ╔══════════════════════╗ │    └──────────────────────────────┘
-│ ║ It's partly cloudy   ║ │
-│ ║ and around 62°F...   ║ │    Hangman (/games/hangman)
-│ ╚══════════════════════╝ │    ┌──────────────────────────────┐
-│  ┌─ Full Answer ───────┐ │    │   +---+                      │
-│  │ Sunnyvale, CA today │ │    │   |   |   _ _ _ _ _ _ _ _   │
-│  │ shows partly cloudy │ │    │   O   |                      │
-│  │ skies with a high...│ │    │   |   |   Wrong: X Z         │
-│  └─────────────────────┘ │    │  /|   |                      │
-│                          │    │       |   💬 No X. 4 guesses  │
-│  Auto-stops after 2s     │    │ say "letter A" or "word X"   │
-│  Just speak — no tap     │    │ Just speak — no tap          │
-└──────────────────────────┘    └──────────────────────────────┘
+    Home --> Talk["🎙️ Talk to Bianca  /talk<br/>Voice chat · Silero VAD · no tap needed"]
+    Home --> Dashboard["📋 Family Dashboard  /dashboard<br/>Todos · Events · add · edit · delete"]
+    Home --> Cameras["📷 Cameras  /cameras<br/>Live RTSP stream · GDINO scene detection"]
+    Home --> Games["🎮 Games  /games"]
+
+    Games --> Hangman["Hangman  /games/hangman"]
+    Games --> Multiply["Times Tables  /games/multiply"]
+    Games --> Clock["Tell the Time  /games/clock"]
+    Games --> Quiz["Knowledge Quiz  /games/quiz<br/>Qwen-generated questions"]
+    Games --> BullsCows["Bulls and Cows  /games/bulls-cows"]
+    Games --> WordLadder["Word Ladder  /games/word-ladder"]
+    Games --> TwentyQ["20 Questions  /games/twenty-questions"]
+
+    style Home fill:#6366f1,color:#fff
+    style Talk fill:#0ea5e9,color:#fff
+    style Dashboard fill:#10b981,color:#fff
+    style Cameras fill:#f59e0b,color:#fff
+    style Games fill:#8b5cf6,color:#fff
 ```
 
 ---
@@ -149,11 +131,16 @@ docker compose up -d --build
 
 This builds four images and starts them in dependency order:
 
-```
-bianca-whisper  →  loads faster-whisper large-v3 on GPU  (~30-90s first start)
-bianca-triton   →  loads GDINO Tiny fp16 on GPU           (~60-120s first start)
-bianca-ollama   →  pulls qwen2.5:14b if not cached        (~5 min first start, ~9GB)
-bianca-app      →  starts after all three are healthy
+```mermaid
+flowchart LR
+    W["bianca-whisper\nfaster-whisper large-v3 on GPU\n~30-90s first start"]
+    T["bianca-triton\nGDINO Tiny fp16 on GPU\n~60-120s first start"]
+    O["bianca-ollama\nQwen 2.5:14b pulled if not cached\n~5 min first start · 9GB"]
+    A["bianca-app\nstarts after all three\nare healthy"]
+
+    W -->|healthy| A
+    T -->|healthy| A
+    O -->|healthy| A
 ```
 
 On subsequent starts all models are already cached — startup takes ~30s total.
