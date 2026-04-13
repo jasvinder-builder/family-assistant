@@ -192,6 +192,7 @@ _debug_overlay:  bool  = False
 
 _query_status:      dict = {"state": "ready", "eta_s": 0}
 _query_status_lock  = threading.Lock()
+_query_update_lock  = threading.Lock()   # serialises concurrent add/remove calls
 
 
 # ── Queries / meta.json ───────────────────────────────────────────────────────
@@ -235,7 +236,13 @@ def _triton_reload_model() -> None:
 
 
 def _query_update_worker(new_queries: list[str]) -> None:
-    """Background thread: update meta.json and reload Triton model."""
+    """Background thread: update meta.json and reload Triton model.
+    Serialised by _query_update_lock so concurrent calls queue up."""
+    with _query_update_lock:
+        _do_query_update(new_queries)
+
+
+def _do_query_update(new_queries: list[str]) -> None:
     with _query_status_lock:
         _query_status["state"] = "updating"
         _query_status["eta_s"] = 10
@@ -253,6 +260,8 @@ def _query_update_worker(new_queries: list[str]) -> None:
         _query_status["eta_s"] = 0
 
     logger.info("Query update complete: %s", new_queries)
+
+
 
 
 def get_query_status() -> dict:
@@ -443,12 +452,11 @@ def _inference_loop() -> None:
             label_ids = resp.as_numpy("LABEL_IDS")
 
             if len(boxes) == 0:
-                _update_detections(cam_id, [], [], [], queries)
+                with _det_lock:
+                    _detections[cam_id] = []
                 continue
 
             class_ids = label_ids.astype(int)
-            _update_detections(cam_id, boxes, scores, class_ids, queries)
-
             tracker = _trackers.setdefault(cam_id, _SimpleTracker())
             t_boxes, t_scores, t_cids, t_tids = tracker.update(
                 boxes.astype(np.float32),
@@ -524,26 +532,6 @@ def _inference_loop() -> None:
         fired = {k: v for k, v in fired.items() if v > cutoff}
 
     logger.info("Inference loop stopped")
-
-
-def _update_detections(cam_id, boxes, scores, class_ids, queries):
-    if len(boxes) == 0:
-        with _det_lock:
-            _detections[cam_id] = []
-        return
-    # Just store raw detections without tracker (used before tracker runs)
-    dets = []
-    for i in range(len(boxes)):
-        q_idx = int(class_ids[i]) if i < len(class_ids) else 0
-        label = queries[q_idx] if q_idx < len(queries) else ""
-        dets.append(Detection(
-            track_id=0,
-            box=tuple(map(int, boxes[i])),
-            scores={label: float(scores[i])} if label else {},
-            label=label,
-            cam_id=cam_id,
-        ))
-    # (tracker will overwrite with proper track IDs on next call)
 
 
 # ── Pipeline ──────────────────────────────────────────────────────────────────
@@ -669,10 +657,18 @@ def _rebuild(new_streams: dict[str, str]) -> None:
     _stop_inference()
     _stop_pipeline()
 
+    removed = set(_streams) - set(new_streams)
+
     with _infer_slots_lock:
         _infer_slots.clear()
     _last_display.clear()
     _last_infer.clear()
+
+    # Clean up state for cameras that are no longer active
+    for cam_id in removed:
+        _trackers.pop(cam_id, None)
+        with _det_lock:
+            _detections.pop(cam_id, None)
 
     _streams = dict(new_streams)
 
