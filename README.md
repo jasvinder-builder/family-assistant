@@ -54,7 +54,7 @@ graph TD
 - **Bulls and Cows** — crack Bianca's secret 4-digit code; say each digit aloud; bulls = right digit right place, cows = right digit wrong place
 - **Word Ladder** — change one letter at a time to climb from the start word to the target; BFS-powered hints; Qwen generates kid-friendly puzzles
 - **20 Questions** — think of an animal, food, object, or place; Bianca asks up to 20 yes/no questions and tries to guess it using Qwen
-- **Cameras** — live view of any RTSP stream or local video file streamed via WebSocket (works through Cloudflare Tunnel); Grounding DINO Tiny (fp16, open-vocabulary) runs in a separate Docker container and detects objects matching user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa"); _SimpleTracker assigns persistent track IDs; matched events are logged with a thumbnail crop
+- **Cameras** — live view of RTSP streams or local video files via DeepStream NVDEC hardware decode; YOLO-World M TRT engine on Triton Inference Server detects objects matching user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa") at ~8ms per frame; _SimpleTracker assigns persistent track IDs; matched events logged in real time
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events
@@ -79,7 +79,7 @@ graph TD
 
 - **[Docker](https://docs.docker.com/engine/install/) + [Docker Compose](https://docs.docker.com/compose/install/)** — all services run as containers
 - **[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)** — gives containers GPU access
-- **NVIDIA GPU with ~12GB+ VRAM** — Whisper large-v3 (~1.5GB) + Qwen 2.5:14b (~9-10GB) + GDINO (~0.3GB)
+- **NVIDIA GPU with ~13GB+ VRAM** — Whisper large-v3 (~1.5GB) + Qwen 2.5:14b (~9-10GB) + YOLO-World M TRT (~0.3GB) + DeepStream buffers (~0.5GB)
 - **[cloudflared](https://github.com/cloudflare/cloudflared)** — Cloudflare Tunnel for Twilio webhooks and browser HTTPS
 
 ---
@@ -129,17 +129,19 @@ PHONE_TO_NAME={"+447911123456": "Alice", "+447911987654": "Bob"}
 docker compose up -d --build
 ```
 
-This builds four images and starts them in dependency order:
+This builds five images and starts them in dependency order:
 
 ```mermaid
 flowchart LR
     W["bianca-whisper\nfaster-whisper large-v3 on GPU\n~30-90s first start"]
-    T["bianca-triton\nGDINO Tiny fp16 on GPU\n~60-120s first start"]
+    T["bianca-triton\nYOLO-World M TRT on GPU\n~60-120s first start"]
+    DS["bianca-deepstream\nDeepStream 7.0 NVDEC\n~30s first start"]
     O["bianca-ollama\nQwen 2.5:14b pulled if not cached\n~5 min first start · 9GB"]
-    A["bianca-app\nstarts after all three\nare healthy"]
+    A["bianca-app\nstarts after all four\nare healthy"]
 
     W -->|healthy| A
-    T -->|healthy| A
+    T -->|healthy| DS
+    DS -->|healthy| A
     O -->|healthy| A
 ```
 
@@ -170,8 +172,13 @@ Copy the `https://` forwarding URL printed in the output (e.g. `https://some-nam
 # Rebuild and restart only the app container (fast — no GPU images rebuilt)
 docker compose build app && docker compose up -d app
 
-# Rebuild the GDINO service (e.g. after editing triton_models/gdino_server.py)
+# Rebuild the Triton service (e.g. after editing triton_models/yoloworld/1/model.py)
+# Delete __pycache__ first so Triton picks up the new model.py
+rm -rf triton_models/yoloworld/1/__pycache__
 docker compose build triton && docker compose up -d triton
+
+# Rebuild the DeepStream service
+docker compose build deepstream && docker compose up -d deepstream
 
 # Full rebuild
 docker compose up -d --build
@@ -229,14 +236,29 @@ family-assistant/
 ├── ARCHITECTURE.md           # Full technical architecture and call flow diagrams
 ├── logs/                     # Daily rotating log files (not in git)
 │
-├── docker-compose.yml        # 4-container stack: app, whisper, triton (GDINO), ollama
+├── docker-compose.yml        # 5-container stack: app, whisper, triton, deepstream, ollama
 ├── Dockerfile.app            # Main app image (CPU-only, no CUDA)
 ├── Dockerfile.whisper        # faster-whisper STT service on GPU
-├── Dockerfile.triton         # GDINO FastAPI inference service on GPU
+├── Dockerfile.triton         # Triton 25.03 + YOLO-World M TRT backend on GPU
+├── Dockerfile.deepstream     # DeepStream 7.0 NVDEC pipeline + Triton client on GPU
 ├── requirements.app.txt      # Python deps for the app container
 │
 ├── triton_models/
-│   └── gdino_server.py       # GDINO FastAPI service (runs in triton container, :8082)
+│   └── yoloworld/
+│       ├── config.pbtxt      # Triton model config (IMAGE UINT8, THRESHOLD FP32 in; BOXES/SCORES/LABEL_IDS out)
+│       └── 1/
+│           └── model.py      # Python backend: loads TRT engine, runs YOLO-World M inference
+│
+├── models/
+│   ├── yoloworld.engine      # TRT engine (gitignored, ~80MB; export with scripts/export_yoloworld_trt.py)
+│   └── yoloworld.meta.json   # Queries baked into engine + imgsz metadata
+│
+├── scripts/
+│   ├── benchmark_yoloworld.py    # Phase 1: YOLO-World PyTorch fp16 benchmark
+│   ├── export_yoloworld_trt.py   # Phase 2: Export to TRT engine
+│   ├── test_deepstream_capture.py    # Phase 3: DeepStream NVDEC decode test
+│   ├── test_deepstream_inference.py  # Phase 4: DeepStream → Triton inference test
+│   └── ollama-entrypoint.sh  # Auto-pulls qwen2.5:14b on first Ollama container start
 │
 ├── scripts/
 │   └── ollama-entrypoint.sh  # Auto-pulls qwen2.5:14b on first Ollama container start

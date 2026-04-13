@@ -339,10 +339,10 @@ family-assistant/
 | Messaging | Twilio WhatsApp API | Async research + reminder delivery |
 | Storage | Markdown file (`family.md`) | Human-readable, editable, no DB setup |
 | File locking | `filelock` | Prevents concurrent write corruption |
-| RTSP streaming | PyAV (FFmpeg software decode) + WebSocket canvas | GStreamer present but disabled (Gst.init thread-safety bug); browser receives JPEG frames over WebSocket |
-| Scene detection | Grounding DINO Tiny (fp16, HuggingFace) via GDINO FastAPI | Open-vocabulary detection in one pass; ~0.3GB VRAM in gdino container |
+| RTSP/file streaming | DeepStream 7.0 (NVDEC hardware decode) + WebSocket canvas | nvurisrcbin → nvstreammux → appsink; leaky queue decouples decode (48fps) from inference |
+| Scene detection | YOLO-World M TRT engine via Triton 25.03 | Open-vocabulary detection; 8ms median @ 1280×720; queries mapped from meta.json at runtime |
 | Object tracking | _SimpleTracker (pure-numpy IoU) | Persistent track IDs, deduplication; CPU-only; no pybind11/supervision |
-| Inference serving | FastAPI/uvicorn (Docker, port 8082) | Isolated CUDA context; plain HTTP replaces Triton Python backend (bug) |
+| Inference serving | NVIDIA Triton Inference Server 25.03 (Python backend + TRT) | Model management API (unload/load for query changes); HTTP :8002, gRPC :8001, metrics :8003 |
 | Scheduler | APScheduler `AsyncIOScheduler` | Proactive reminders without Celery/Redis |
 | Backend | FastAPI + uvicorn | Async, fast, minimal boilerplate |
 | Templates | Jinja2 + Bootstrap 5 | No build step, zero JS framework needed |
@@ -357,21 +357,17 @@ family-assistant/
 |---|---|---|
 | Qwen 2.5:14b Q4_K_M (Ollama) | ~9–10 GB | Always hot; loaded at startup |
 | Whisper large-v3 int8_float16 | ~1.5 GB | Always loaded; not active during Qwen inference |
-| Free headroom | ~4.5 GB | Available for spikes |
+| YOLO-World M TRT engine (Triton) | ~0.3 GB | Loaded at triton startup; persistent |
+| DeepStream pipeline buffers | ~0.5 GB | nvstreammux frame batches; scales with camera count |
+| **Steady-state total** | **~12.3 GB** | ~3.7 GB headroom |
 
-**GDINO Docker container** (separate CUDA context — no conflict with main process):
-
-| Allocation | Size | Notes |
-|---|---|---|
-| GDINO Tiny fp16 (FastAPI svc) | ~0.3 GB | Runs continuously at 5 fps when a camera stream is active |
-
-Note: Whisper and Qwen never run at the same time — Whisper transcribes first, then Qwen processes. GDINO runs continuously at 5 fps via HTTP POST when a camera stream is active. _SimpleTracker runs in the main process on CPU (no VRAM needed).
+Note: Whisper and Qwen never run at the same time. YOLO-World inference runs on the Triton container's CUDA context (separate from the main app process). _SimpleTracker runs CPU-only. TRT re-export (if needed) peaks at ~4GB extra — do not trigger while Qwen is running a long generation.
 
 ---
 
 ## Docker Compose Architecture
 
-Bianca runs as four containers on a single host, sharing the GPU via Nvidia Container Toolkit.
+Bianca runs as five containers on a single host, sharing the GPU via Nvidia Container Toolkit.
 
 ```mermaid
 graph TD
@@ -379,19 +375,23 @@ graph TD
         subgraph whisper["bianca-whisper :8080"]
             W1["faster-whisper large-v3 fp16\n~1.5 GB VRAM\nPOST /transcribe\nGET  /health"]
         end
-        subgraph triton["bianca-triton :8082"]
-            T1["gdino_server.py (FastAPI)\nGDINO Tiny fp16\n~0.3 GB VRAM\nPOST /infer\nGET  /health"]
+        subgraph triton["bianca-triton :8001/8002/8003"]
+            T1["Triton Inference Server 25.03\nYOLO-World M TRT backend\n~0.3 GB VRAM\nHTTP :8002  gRPC :8001\nmetrics :8003"]
+        end
+        subgraph deepstream["bianca-deepstream :8090"]
+            DS1["DeepStream 7.0 pipeline\nNVDEC hardware decode\nnvurisrcbin → nvstreammux\n→ appsink → Triton HTTP\nWebSocket frame broadcast"]
         end
         subgraph ollama["bianca-ollama :11434"]
             O1["Ollama\nQwen 2.5:14b\n~9-10 GB VRAM\nPOST /api/chat\nGET  /api/tags"]
         end
         subgraph app["bianca-app :8000"]
-            A1["FastAPI + uvicorn\nNO GPU (CPU-only)\n→ Whisper for STT\n→ GDINO for scene detection\n→ Ollama/Qwen for LLM"]
+            A1["FastAPI + uvicorn\nNO GPU (CPU-only)\n→ Whisper for STT\n→ DeepStream for video/events\n→ Ollama/Qwen for LLM"]
         end
     end
 
     W1 -- bianca-net --> A1
-    T1 -- bianca-net --> A1
+    DS1 -- bianca-net --> A1
+    T1 -- bianca-net --> DS1
     O1 -- bianca-net --> A1
     A1 -->|:8000 host port| EXT["Browser / Twilio\ncloudflared tunnel"]
 ```
@@ -401,66 +401,46 @@ graph TD
 | Container | Image | GPU | Purpose |
 |---|---|---|---|
 | `bianca-whisper` | `bianca-whisper` (Dockerfile.whisper) | Yes | faster-whisper STT; exposes REST `/transcribe` |
-| `bianca-triton` | `bianca-triton` (Dockerfile.triton) | Yes | GDINO FastAPI (gdino_server.py); object detection `/infer` |
+| `bianca-triton` | `bianca-triton` (Dockerfile.triton) | Yes | Triton 25.03 + YOLO-World M TRT; HTTP :8002, gRPC :8001 |
+| `bianca-deepstream` | `bianca-deepstream` (Dockerfile.deepstream) | Yes | DeepStream 7.0 NVDEC pipeline; WebSocket frame broadcast :8090 |
 | `bianca-ollama` | `ollama/ollama:latest` | Yes | Qwen 2.5:14b LLM; entrypoint auto-pulls model |
 | `bianca-app` | `bianca-app` (Dockerfile.app) | **No** | Main FastAPI app; explicitly CUDA-free |
 
 ### Key Docker Compose design decisions
 
 - **App has no GPU reservation** — enforces CUDA-free constraint on the main process; any accidental PyTorch/CUDA import will fail fast rather than silently consuming VRAM
-- **All four on one bridge network** (`bianca-net`) — containers reach each other by service name (e.g. `http://whisper:8080`); no host networking needed
-- **`depends_on` with `service_healthy`** — app waits for all three AI services to pass their healthchecks before starting; avoids race conditions on startup
-- **Bind-mounts for AI weights** — `~/.cache/huggingface` bind-mounted into whisper and triton containers; weights downloaded once to host, reused across rebuilds
-- **Named volume for Ollama models** (`ollama-models`) — `qwen2.5:14b` (~9GB) persists across container restarts and rebuilds
-- **Named volumes for app data** — `family-data` (family.md) and `app-logs` survive app container rebuilds
+- **All five on one bridge network** (`bianca-net`) — containers reach each other by service name; no host networking needed
+- **`depends_on` with `service_healthy`** — deepstream waits for triton; app waits for deepstream + whisper + ollama
+- **Bind-mounts for AI weights** — `~/.cache/huggingface` into whisper; `~/.cache/ultralytics` into triton and deepstream; weights downloaded once to host
+- **TRT engine bind-mount** — `./models:/trt_engines` in triton; `./models:/app/models` in deepstream; engine updated on host triggers Triton unload/load
+- **Named volume for Ollama models** (`ollama-models`) — `qwen2.5:14b` (~9GB) persists across restarts
 
 ### Camera inference pipeline
 
 ```mermaid
 flowchart TD
-    A["camera_service\n(app container, CPU)\npush_frame(bgr)"]
-    A --> B["scene_service\n(app container, CPU)\nJPEG-encode → httpx POST /infer"]
-    B --> C["bianca-triton container (GPU)\ngdino_server.py (FastAPI)\nGDINO Tiny fp16 CUDA\nAutoProcessor\nresize → max 800px wide\npost_process → pixel coords (original dims)\nreturns JSON {boxes, scores, labels}"]
-    C --> D["scene_service\n_SimpleTracker (IoU, pure-numpy)\n→ persistent track IDs\n→ CameraEvent on match\n  (threshold + 30s dedup)"]
-    D --> E["cameras.html (browser)\npolling /cameras/events every 5s"]
+    A["RTSP / file source"]
+    A --> B["bianca-deepstream\nnvurisrcbin (NVDEC)\n→ nvstreammux (batch)\n→ appsink callback\n→ leaky queue (max 1 frame)\n→ inference thread"]
+    B --> C["bianca-triton\nTriton 25.03 HTTP :8002\nYOLO-World M TRT engine\nmodels/yoloworld.engine\n~8ms median @ 1280×720"]
+    C --> D["inference thread\nLABEL_IDS (FP32) → query strings\n_SimpleTracker (IoU)\n→ CameraEvent (threshold + 30s dedup)\n→ shared_detections dict"]
+    D --> E["cameras.html (browser)\nWebSocket JPEG frames :8090\npolling /cameras/events"]
 ```
 
----
+### Query change flow
 
-## Camera Inference — Future Roadmap
+```
+POST /cameras/queries
+  → update models/yoloworld.meta.json (queries list)
+  → POST triton:8002/v2/repository/models/yoloworld/unload
+  → POST triton:8002/v2/repository/models/yoloworld/load
+  → model.py re-reads meta.json at init (~4s total)
+  → GET /cameras/queries/status returns {state: "ready"}
+```
 
-Current stack works well for a home assistant at 5 fps. The following phases would bring it to
-production-quality, near-zero-latency inference:
-
-| Aspect | Current (Phase 1) | Future (Phase 2–4) |
-|---|---|---|
-| Video decode | PyAV software decode (CPU, ~1–2 cores) | GStreamer NVDEC hardware decode (GPU DMA, ~0 CPU overhead) |
-| Inference model | GDINO Tiny fp16 — HuggingFace model, ~80ms/frame | TensorRT engine (.plan file) — ~10–20ms/frame (4–8× faster) |
-| Inference transport | httpx multipart POST, plain HTTP/1.1 | NVIDIA Triton Inference Server, gRPC / shared-memory IPC, batch inference, multi-model |
-| Tracking | _SimpleTracker (IoU), pure Python, CPU | NVIDIA DeepStream / DALI pipeline, GPU-resident, cuDNN tracking, DALI image decoding on GPU |
-
-### Phase 2 — GStreamer NVDEC
-- Replace PyAV in `camera_service.py` with GStreamer NVDEC pipeline
-- Pipeline: `uridecodebin → nvv4l2decoder → nvvidconv → appsink`
-- For local files use `decodebin` (auto-selects nvv4l2decoder); for RTSP use `rtspsrc`
-- `appsink sync=true` for local files (correct playback speed); `sync=false` for RTSP (live, no buffer)
-- GStreamer must be initialised from the main thread — not from a reader thread (SIGSEGV otherwise)
-
-### Phase 3 — TensorRT for GDINO / replacement model
-- GDINO Tiny cannot currently be exported to ONNX/TRT — data-dependent Python loops in the
-  text encoder block all export paths (investigated 2026-04-03, see `scripts/export_gdino_onnx.py`)
-- **Option A:** Wait for HuggingFace/IDEA-Research to add TRT support upstream
-- **Option B:** Replace GDINO with `YOLOWorld` (YOLOv8 + open-vocab) — fully ONNX-exportable,
-  TRT-compatible, similar open-vocabulary detection capability
-- Once a TRT engine is available: load in `gdino_server.py` with `tensorrt` Python bindings;
-  keep the same `/infer` HTTP API — app container unchanged
-
-### Phase 4 — NVIDIA Triton + DALI/DeepStream
-- Move TRT engine into Triton model repository (proper `config.pbtxt`, no Python backend)
-- Use Triton's gRPC shared-memory API for zero-copy frame transfer from app → Triton
-- DALI pipeline: GPU-resident decode → resize → normalise → GDINO/YOLOWorld → NMS
-- DeepStream: full pipeline from RTSP ingest to analytics on GPU with no CPU round-trips
-- Expected: sub-5ms per frame end-to-end, 30+ fps capable
+Note: query changes do NOT require TRT re-export because the queries are mapped to
+LABEL_IDS at inference time by model.py. The TRT engine is query-agnostic — it outputs
+class indices which model.py maps to the current query list. Re-export is only needed
+if the number of classes changes beyond the engine's capacity.
 
 ---
 

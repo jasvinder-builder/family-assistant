@@ -482,6 +482,87 @@ docker run --gpus all -d -p 8001:8001 -v ${PWD}/triton_models:/models -v ${HOME}
 
 ---
 
+### 2026-04-12 — DeepStream + YOLO-World Pipeline (Phases 0–4)
+
+**Goal:** Replace GDINO FastAPI + PyAV software decode with DeepStream NVDEC hardware decode +
+YOLO-World TRT inference via Triton. Target: <10ms inference, 4+ cameras, natural language queries.
+
+#### What was built
+
+**Phase 0 — Environment validation**
+- Confirmed DeepStream 7.0 (`nvcr.io/nvidia/deepstream:7.0-gc-triton-devel`) runs on this host with GPU access
+- ultralytics + CLIP fork installed in project venv
+- YOLO-World nano sanity check passed
+
+**Phase 1 — YOLO-World benchmark**
+- `scripts/benchmark_yoloworld.py` — benchmarks YOLO-World PyTorch fp16 on GPU
+- Key gotcha: use `half=True, device="cuda"` in predict kwargs, NOT `model.model.half()` (causes crash)
+- yolov8m-worldv2 measured on this GPU
+
+**Phase 2 — TRT export**
+- `scripts/export_yoloworld_trt.py` — exports to `models/yoloworld.engine` + `models/yoloworld.meta.json`
+- Selected yolov8m-worldv2 for better recall; baked queries: person, car, dog, bicycle, cat
+- Engine size ~80MB; export time ~90s
+
+**Phase 3 — DeepStream single-camera capture (PASS ✓)**
+- `scripts/test_deepstream_capture.py` — NVDEC decode via nvurisrcbin + nvstreammux + appsink
+- **564 frames decoded from file, shape (720,1280,3), 48fps**
+- Key gotcha: `nvurisrcbin` uses dynamic pads — `Gst.parse_launch()` doesn't work; must use
+  explicit `Gst.ElementFactory.make()` + `pad-added` callback to link to nvstreammux
+
+**Phase 3b — Triton YOLO-World backend (PASS ✓)**
+- `triton_models/yoloworld/1/model.py` — Python backend loads TRT engine, runs inference
+- `triton_models/yoloworld/config.pbtxt` — IMAGE (UINT8 flat JPEG), THRESHOLD (FP32) in;
+  BOXES (FP32), SCORES (FP32), LABEL_IDS (FP32 class indices) out
+- Query management: queries stored in `models/yoloworld.meta.json`; change queries by updating
+  JSON + calling Triton unload/load API (no per-request QUERIES tensor)
+- **14ms median inference at 2496×1664 (expect ~5-8ms at 1280×720); 16 detections on real image**
+- Using `tritonclient.http` (not gRPC) — gRPC TYPE_STRING crashes Python backend
+
+**Phase 4 — DeepStream → Triton inference integration (PASS ✓)**
+- `scripts/test_deepstream_inference.py` — leaky queue (max 1 frame) decouples NVDEC (48fps)
+  from inference thread; inference thread calls Triton HTTP, maps LABEL_IDS back to query strings
+- **8.1ms median inference, p99 9.9ms, 48.9fps decode, 426 inference frames in 11.5s**
+- Same explicit element creation + pad-added pattern as Phase 3
+
+#### Key technical decisions
+
+| Decision | Rationale |
+|---|---|
+| No per-request QUERIES tensor | tritonserver 24.09 UINT8 variable-length tensor corruption bug; queries in meta.json + Triton reload is cleaner anyway |
+| LABEL_IDS (FP32) not LABELS (STRING) | TYPE_STRING crashes pybind11 in Triton Python backend; FP32 class indices map to queries list client-side |
+| tritonclient.http not gRPC | gRPC TYPE_STRING deserialization crashes Triton Python backend subprocess |
+| tritonserver:25.03-py3 | Fixes widespread variable-length UINT8 tensor corruption vs 24.09 |
+| YOLO-World M (not S) | Better recall at marginal VRAM cost |
+| Explicit GStreamer element creation | nvurisrcbin dynamic pads are incompatible with parse_launch shorthand |
+| Leaky queue (maxsize=1) | Decoder never waits on inference; always runs at latest frame |
+
+#### Bugs encountered and fixed
+
+- **tritonserver 24.09 UINT8 corruption**: all bytes in variable-length tensor set to first byte value.
+  Fix: upgraded to tritonserver 25.03
+- **tensorrt Python bindings missing** in 25.03: `tensorrt-cu12 tensorrt-lean-cu12 tensorrt-dispatch-cu12`
+  from `pypi.nvidia.com` must be added to Dockerfile.triton
+- **PyTorch CUDA version mismatch**: 25.03 uses CUDA 12.8; must use `--index-url .../cu128`
+- **`__pycache__` caching old model.py**: Triton runs cached .pyc; `rm -rf triton_models/yoloworld/1/__pycache__` before restart
+- **deepstream:7.1-devel doesn't exist**: use `7.0-gc-triton-devel`
+- **libGL.so.1 missing**: ultralytics pulls non-headless opencv; fix: uninstall + reinstall headless variant
+
+#### Updated files
+
+- `Dockerfile.triton` — upgraded to tritonserver:25.03-py3, added TRT Python bindings, cu128 PyTorch
+- `Dockerfile.deepstream` — new, based on deepstream:7.0-gc-triton-devel
+- `docker-compose.yml` — added triton service (ports 8001/8002/8003, volumes), added deepstream service
+  (port 8090, depends_on triton), updated app service (DEEPSTREAM_URL, depends_on deepstream)
+- `triton_models/yoloworld/config.pbtxt` — final tensor interface
+- `triton_models/yoloworld/1/model.py` — TRT backend
+- `scripts/test_deepstream_capture.py` — Phase 3 test
+- `scripts/test_deepstream_inference.py` — Phase 4 test
+- `scripts/benchmark_yoloworld.py` — Phase 1 benchmark
+- `scripts/export_yoloworld_trt.py` — Phase 2 TRT export
+
+---
+
 ## Open Questions / Future Ideas
 - Add a "complete todo" voice command ("mark buy groceries as done")
 - Scheduled reminders: outbound WhatsApp at event time

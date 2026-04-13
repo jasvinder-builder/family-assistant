@@ -1,0 +1,49 @@
+name: "yoloworld"
+backend: "python"
+max_batch_size: 0
+
+# max_batch_size: 0 means we handle batching ourselves in model.py.
+# The Python backend receives one request at a time; batching across
+# cameras is done by the deepstream_service inference worker.
+
+input [
+  {
+    name: "IMAGE"
+    data_type: TYPE_UINT8
+    dims: [ -1 ]          # JPEG-encoded frame as flat byte array
+  },
+  {
+    name: "THRESHOLD"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  }
+]
+
+output [
+  {
+    name: "BOXES"
+    data_type: TYPE_FP32
+    dims: [ -1, 4 ]       # xyxy pixel coordinates
+  },
+  {
+    name: "SCORES"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+  },
+  {
+    name: "LABEL_IDS"
+    data_type: TYPE_FP32
+    dims: [ -1 ]   # class index per detection; map to string via meta.json queries list
+  }
+]
+
+instance_group [
+  {
+    kind: KIND_GPU
+    count: 1
+    gpus: [ 0 ]
+  }
+]
+
+# Keep model loaded between requests
+dynamic_batching { }

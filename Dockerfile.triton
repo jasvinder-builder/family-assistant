@@ -1,40 +1,46 @@
-# Triton Inference Server with Grounding DINO dependencies.
+# Triton Inference Server — YOLO-World Python backend.
+#
+# Replaces the previous GDINO FastAPI server.
+# Serves the yoloworld model from triton_models/yoloworld/.
 #
 # Build:
-#   docker build -f Dockerfile.triton -t family-assistant-triton .
+#   docker compose build triton
 #
-# Run:
-#   docker run --gpus all --rm -d \
-#     -p 8001:8001 \
-#     -v ${PWD}/triton_models:/models \
-#     -v ${HOME}/.cache/huggingface:/root/.cache/huggingface \
-#     --name triton-gdino \
-#     family-assistant-triton
-#
-# The HuggingFace cache mount avoids re-downloading GDINO Tiny (~900MB)
-# on every container start.  On the very first start it will download
-# automatically; subsequent starts use the cached weights.
+# The model repository is bind-mounted so model.py changes don't require
+# a container rebuild (Triton reloads on unload/load API call).
 
-# 24.04 uses CUDA 12.4 runtime — compatible with driver version 12040 (CUDA 12.4).
-# Upgrade to 24.12+ once the host NVIDIA driver is updated to support CUDA 12.6+.
-FROM nvcr.io/nvidia/tritonserver:24.04-py3
+FROM nvcr.io/nvidia/tritonserver:25.03-py3
 
-# Install CUDA-enabled PyTorch from PyTorch's own index (cu124 = CUDA 12.4).
-# Must use --index-url so pip picks the GPU wheel, not the CPU-only wheel on PyPI.
+# TensorRT Python bindings — tritonserver base has TRT C++ libs but not the Python package.
+# Use the NVIDIA PyPI index; cu12 matches CUDA 12.x in tritonserver 25.x base images.
 RUN pip install --no-cache-dir \
-    torch \
-    --index-url https://download.pytorch.org/whl/cu124
+    tensorrt-cu12 tensorrt-lean-cu12 tensorrt-dispatch-cu12 \
+    --extra-index-url https://pypi.nvidia.com
 
-# Install remaining GDINO dependencies from PyPI.
+# PyTorch with CUDA (must match the CUDA version in the tritonserver base image)
 RUN pip install --no-cache-dir \
-    "transformers==5.5.0" \
-    "Pillow>=10.0" \
-    "opencv-python-headless>=4.9" \
-    "fastapi>=0.111" \
-    "uvicorn[standard]>=0.29" \
-    "python-multipart>=0.0.9"
+    torch torchvision \
+    --index-url https://download.pytorch.org/whl/cu128
 
-# Run the FastAPI GDINO server (bind-mounted from ./triton_models/gdino_server.py).
-# tritonserver is no longer used — it has a Python backend bug in 24.04 where
-# every tensor element is overwritten with the first element's value via shm IPC.
-CMD ["python3", "-m", "uvicorn", "gdino_server:app", "--host", "0.0.0.0", "--port", "8082", "--app-dir", "/models", "--log-level", "warning"]
+# YOLO-World and inference dependencies
+# Force headless opencv — ultralytics may pull in the GUI variant as a dep
+RUN pip install --no-cache-dir \
+    "ultralytics>=8.4" \
+    "numpy<2.0" \
+ && pip uninstall -y opencv-python 2>/dev/null || true \
+ && pip install --no-cache-dir "opencv-python-headless>=4.9"
+
+# ultralytics CLIP fork (required for set_classes)
+RUN pip install --no-cache-dir \
+    "git+https://github.com/ultralytics/CLIP.git"
+
+# Model repository at /models (bind-mounted from triton_models/ in docker-compose)
+# TRT engine (if exported) placed at /models/yoloworld.engine
+CMD ["tritonserver", \
+     "--model-repository=/models", \
+     "--http-port=8002", \
+     "--grpc-port=8001", \
+     "--metrics-port=8003", \
+     "--log-verbose=0", \
+     "--model-control-mode=explicit", \
+     "--load-model=yoloworld"]

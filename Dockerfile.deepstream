@@ -1,0 +1,43 @@
+# DeepStream 7.1 + Python bridge for RTSP → NVDEC → appsink → Triton gRPC
+#
+# Build:
+#   docker compose build deepstream
+#
+# This container handles:
+#   - RTSP/file video ingestion via NVDEC (hardware decode)
+#   - Multi-camera batching via nvstreammux
+#   - Frame delivery to Triton via gRPC (tritonclient)
+#   - WebSocket broadcast of annotated JPEG frames to cameras.html
+#
+# It does NOT load any AI models — that stays in the triton container.
+
+FROM nvcr.io/nvidia/deepstream:7.0-gc-triton-devel
+
+# Install pyds (DeepStream Python bindings) — pre-built wheel in devel image
+RUN find /opt/nvidia/deepstream -name "pyds*.whl" 2>/dev/null \
+    | head -1 \
+    | xargs -r pip install --no-cache-dir \
+    || echo "pyds wheel not found in image — install manually if needed"
+
+# Triton gRPC client + service dependencies
+RUN pip install --no-cache-dir \
+    "tritonclient[grpc]>=2.45" \
+    "opencv-python-headless>=4.9" \
+    "fastapi>=0.111" \
+    "uvicorn[standard]>=0.29" \
+    "websockets>=12.0" \
+    "httpx>=0.27" \
+    "numpy<2.0" \
+    "python-multipart>=0.0.9"
+
+WORKDIR /app
+
+# Service code is bind-mounted in docker-compose for development.
+# For production, COPY services/ /app/services/
+# COPY services/ /app/services/
+
+ENV PYTHONUNBUFFERED=1
+ENV GST_DEBUG=2
+
+CMD ["python3", "-m", "uvicorn", "services.deepstream_service:app",
+     "--host", "0.0.0.0", "--port", "8090", "--log-level", "info"]

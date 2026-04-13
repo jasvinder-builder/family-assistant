@@ -34,7 +34,7 @@ services:
       start_period: 120s
       retries: 3
 
-  # ── Triton / GDINO ──────────────────────────────────────────────────────────
+  # ── Triton / YOLO-World ─────────────────────────────────────────────────────
   triton:
     build:
       context: .
@@ -45,12 +45,16 @@ services:
     networks:
       - bianca-net
     ports:
-      - "8082:8082"
+      - "8001:8001"   # gRPC (used by deepstream service)
+      - "8002:8002"   # HTTP model management + metrics
+      - "8003:8003"   # Prometheus metrics
     volumes:
       - ./triton_models:/models
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ${HOME}/.cache/ultralytics:/root/.cache/ultralytics
+      - ./models:/trt_engines           # TRT engine files — mounted at /trt_engines
     environment:
-      HF_HUB_OFFLINE: "1"
+      YOLOWORLD_MODEL: "yolov8m-worldv2"
+      YOLO_CONFIG_DIR: "/root/.cache/ultralytics"
       PYTHONIOENCODING: "utf-8"
       LANG: "C.UTF-8"
     deploy:
@@ -62,10 +66,48 @@ services:
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "python3", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8082/health')"]
+             "import urllib.request; urllib.request.urlopen('http://localhost:8002/v2/health/ready')"]
       interval: 30s
       timeout: 10s
-      start_period: 180s
+      start_period: 240s
+      retries: 3
+
+  # ── DeepStream pipeline ──────────────────────────────────────────────────────
+  deepstream:
+    build:
+      context: .
+      dockerfile: Dockerfile.deepstream
+    image: bianca-deepstream:latest
+    container_name: bianca-deepstream
+    restart: unless-stopped
+    networks:
+      - bianca-net
+    ports:
+      - "8090:8090"   # WebSocket frame broadcast + control API
+    volumes:
+      - ./services:/app/services
+      - ./models:/app/models          # TRT engine + metadata JSON
+      - ${HOME}/.cache/ultralytics:/root/.cache/ultralytics
+    environment:
+      TRITON_URL: "triton:8001"
+      PYTHONUNBUFFERED: "1"
+      GST_DEBUG: "2"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      triton:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
       retries: 3
 
   # ── Ollama / Qwen ───────────────────────────────────────────────────────────
@@ -120,7 +162,8 @@ services:
       # Override bare-metal localhost defaults from .env with Docker service names.
       # These four vars are the only differences between bare-metal and Docker runs.
       WHISPER_URL: http://whisper:8080
-      TRITON_URL: triton:8082
+      TRITON_URL: triton:8001
+      DEEPSTREAM_URL: http://deepstream:8090
       OLLAMA_BASE_URL: http://ollama:11434
       FAMILY_MD_PATH: /data/family.md
     # App intentionally has NO GPU reservation — it must be CUDA-free.
@@ -128,7 +171,7 @@ services:
     depends_on:
       whisper:
         condition: service_healthy
-      triton:
+      deepstream:
         condition: service_healthy
       ollama:
         condition: service_healthy
@@ -152,3 +195,5 @@ volumes:
   # so both whisper and triton use already-downloaded weights — no named volume needed.
   # Ollama model storage — qwen2.5:14b (~9GB) persists across restarts
   ollama-models:
+  # ultralytics model cache (YOLO-World weights ~80MB, downloaded once)
+  # bind-mounted from host so both triton and deepstream share them
