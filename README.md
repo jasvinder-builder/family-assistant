@@ -1,6 +1,6 @@
-# Bianca — Voice Family Assistant
+# Bianca — Family Assistant
 
-A voice-based AI assistant for families. Call a phone number, speak naturally, or open the browser interface — Bianca manages todos, events, and answers research questions. All AI runs locally on GPU. No cloud AI services.
+Bianca is a family assistant that runs entirely on local hardware — no cloud AI, no subscriptions. It handles day-to-day task and event management, acts as a household knowledge base powered by a local LLM with web search, sends proactive reminders via WhatsApp, and runs a production-grade real-time home surveillance pipeline. Video is decoded and processed entirely on the GPU — from RTSP ingest through object detection — using NVIDIA DeepStream for hardware-accelerated NVDEC decoding and NVIDIA Triton Inference Server serving a YOLO-World TRT engine, so the CPU is never involved in the video path. Surveillance alerts are defined in plain English: type a query like "person near the gate" or "child in the garden" and Bianca starts alerting on it immediately — no retraining required.
 
 **Full architecture and call flow:** see [`ARCHITECTURE.md`](ARCHITECTURE.md)
 
@@ -14,7 +14,7 @@ graph TD
 
     Home --> Talk["🎙️ Talk to Bianca  /talk<br/>Voice chat · Silero VAD · no tap needed"]
     Home --> Dashboard["📋 Family Dashboard  /dashboard<br/>Todos · Events · add · edit · delete"]
-    Home --> Cameras["📷 Cameras  /cameras<br/>Live RTSP stream · GDINO scene detection"]
+    Home --> Cameras["📷 Cameras  /cameras<br/>Live RTSP stream · YOLO-World TRT · natural language alerts"]
     Home --> Games["🎮 Games  /games"]
 
     Games --> Hangman["Hangman  /games/hangman"]
