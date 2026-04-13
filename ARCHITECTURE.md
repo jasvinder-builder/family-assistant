@@ -2,7 +2,124 @@
 
 ## Overview
 
-Bianca is a family productivity assistant with two interfaces: phone calls (via Twilio) and a browser interface (any device on the local network). She handles todos, events, research, and games. Research results are delivered via WhatsApp. Proactive event reminders are sent automatically. All AI runs locally on GPU — no cloud AI services.
+Bianca is a family assistant that runs entirely on local hardware. It handles day-to-day task and event management, acts as a household knowledge base powered by a local LLM with web search, sends proactive reminders via WhatsApp, and runs a production-grade real-time home surveillance pipeline.
+
+**Key characteristics:**
+- All AI runs locally on GPU — no cloud AI services, no subscriptions
+- Video decoding and ML inference happen entirely on the GPU (CPU never touches video frames)
+- Surveillance alerts are defined in plain English — no retraining required
+- Five Docker containers on one machine, managed by Docker Compose
+
+The stack is built on five GPU-capable containers:
+
+| Container | Role | GPU | Key tech |
+|---|---|---|---|
+| `bianca-app` | FastAPI app, all routes, browser UI | No (CPU-only) | FastAPI, uvicorn, Jinja2 |
+| `bianca-whisper` | Speech-to-text | Yes | faster-whisper large-v3 |
+| `bianca-deepstream` | Video ingest + frame broadcast | Yes | DeepStream 7.0, GStreamer NVDEC |
+| `bianca-triton` | Object detection inference | Yes | Triton 25.03, YOLO-World M TRT |
+| `bianca-ollama` | LLM for NLU and generation | Yes | Ollama, Qwen 2.5:14b |
+
+Inter-container communication:
+
+```
+Browser/Twilio ──HTTPS──► app:8000 ──HTTP──► whisper:8080      (STT)
+                                    ──HTTP──► deepstream:8090   (video frames + events)
+                                    ──HTTP──► ollama:11434      (LLM)
+                                    ──HTTP──► triton:8002       (Triton model management)
+                                    ──HTTP──► triton:8004       (TRT re-export trigger)
+                    deepstream:8090 ──HTTP──► triton:8002       (YOLO inference)
+```
+
+---
+
+## Technology Stack
+
+| Layer | Technology | Why |
+|---|---|---|
+| Phone calls | Twilio (inbound PSTN) | Handles carrier complexity, webhooks, TTS |
+| Phone TTS | AWS Polly via Twilio (`Polly.Joanna`) | Natural voice, no extra integration |
+| Browser mic + VAD | `@ricky0123/vad-web` (Silero VAD, ONNX Runtime Web) | ML-based voice detection, runs on device, no tap needed |
+| Browser TTS | `speechSynthesis` API | Built-in, no server round-trip |
+| Speech-to-text | faster-whisper `large-v3` on CUDA | Free, accurate, used for both phone and browser |
+| LLM | Qwen 2.5:14b via Ollama | Strong reasoning, runs fully locally |
+| Web search | Tavily API | Clean results API, image search support |
+| Messaging | Twilio WhatsApp API | Async research + reminder delivery |
+| Storage | Markdown file (`family.md`) | Human-readable, editable, no DB setup |
+| File locking | `filelock` | Prevents concurrent write corruption |
+| Video ingest | DeepStream 7.0 — nvurisrcbin → nvstreammux → nvmultistreamtiler → appsink | 100% NVDEC GPU decode; CPU never touches video data; leaky queue decouples decode (48fps) from inference (10fps) |
+| Scene detection | YOLO-World M TRT via Triton 25.03 | Open-vocabulary detection; 8ms median @ 1280×720; queries updated without TRT re-export |
+| Object tracking | `_SimpleTracker` (pure-numpy IoU) | Persistent track IDs, deduplication; CPU-only; no pybind11/supervision |
+| Inference serving | NVIDIA Triton Inference Server 25.03 (Python backend + TRT) | Model management API enables live query swaps; HTTP :8002 for inference + model control |
+| Scheduler | APScheduler `AsyncIOScheduler` | Proactive reminders without Celery/Redis |
+| Backend | FastAPI + uvicorn | Async, fast, minimal boilerplate |
+| Templates | Jinja2 + Bootstrap 5 | No build step, zero JS framework needed |
+| Logging | `TimedRotatingFileHandler` | Daily log files, 7-day retention |
+| Tunnel (dev) | Cloudflare Tunnel (`cloudflared`) | Twilio webhooks + HTTPS for browser mic; no bandwidth limits |
+
+---
+
+## GPU Memory Layout (RTX 4070 Ti Super — 16GB)
+
+| Allocation | Size | Notes |
+|---|---|---|
+| Qwen 2.5:14b Q4_K_M (Ollama) | ~9–10 GB | Always hot; loaded at startup |
+| Whisper large-v3 int8_float16 | ~1.5 GB | Always loaded; not active during Qwen inference |
+| YOLO-World M TRT engine (Triton) | ~0.3 GB | Loaded at triton startup; persistent |
+| DeepStream pipeline buffers | ~0.5 GB | nvstreammux frame batches; scales with camera count |
+| **Steady-state total** | **~12.3 GB** | ~3.7 GB headroom |
+
+Note: Whisper and Qwen never run at the same time. TRT re-export (if needed) peaks at ~4GB extra — do not trigger while Qwen is running a long generation.
+
+---
+
+## Docker Compose Architecture
+
+```mermaid
+graph TD
+    subgraph Stack["docker-compose stack — host: RTX 4070 Ti Super"]
+        subgraph whisper["bianca-whisper :8080"]
+            W1["faster-whisper large-v3 fp16\n~1.5 GB VRAM\nPOST /transcribe\nGET  /health"]
+        end
+        subgraph triton["bianca-triton :8001/8002/8003/8004"]
+            T1["Triton Inference Server 25.03\nYOLO-World M TRT backend\n~0.3 GB VRAM\nHTTP :8002  gRPC :8001  metrics :8003\nManagement sidecar FastAPI :8004\n(TRT re-export API)"]
+        end
+        subgraph deepstream["bianca-deepstream :8090"]
+            DS1["DeepStream 7.0 pipeline\nNVDEC hardware decode\nnvurisrcbin → nvstreammux\n→ appsink → Triton HTTP :8002\nFastAPI REST + WebSocket :8090"]
+        end
+        subgraph ollama["bianca-ollama :11434"]
+            O1["Ollama\nQwen 2.5:14b\n~9-10 GB VRAM\nPOST /api/chat\nGET  /api/tags"]
+        end
+        subgraph app["bianca-app :8000"]
+            A1["FastAPI + uvicorn\nNO GPU (CPU-only)\nProxies camera routes → deepstream\nCalls whisper + ollama directly"]
+        end
+    end
+
+    W1 -- bianca-net --> A1
+    DS1 -- bianca-net --> A1
+    T1 -- bianca-net --> DS1
+    O1 -- bianca-net --> A1
+    A1 -->|:8000 host port| EXT["Browser / Twilio\ncloudflared tunnel"]
+```
+
+### Container responsibilities
+
+| Container | Image | GPU | Purpose |
+|---|---|---|---|
+| `bianca-whisper` | `bianca-whisper` (Dockerfile.whisper) | Yes | faster-whisper STT; exposes REST `/transcribe` |
+| `bianca-triton` | `bianca-triton` (Dockerfile.triton) | Yes | Triton 25.03 + YOLO-World M TRT; HTTP :8002, gRPC :8001; management sidecar FastAPI :8004 (TRT re-export) |
+| `bianca-deepstream` | `bianca-deepstream` (Dockerfile.deepstream) | Yes | DeepStream 7.0 NVDEC pipeline; FastAPI REST + WS :8090 |
+| `bianca-ollama` | `ollama/ollama:latest` | Yes | Qwen 2.5:14b LLM; entrypoint auto-pulls model |
+| `bianca-app` | `bianca-app` (Dockerfile.app) | **No** | Main FastAPI app; explicitly CUDA-free; proxies camera routes |
+
+### Key Docker Compose design decisions
+
+- **App has no GPU reservation** — enforces CUDA-free constraint; any accidental PyTorch/CUDA import fails fast
+- **All five on one bridge network** (`bianca-net`) — containers reach each other by service name
+- **`depends_on` with `service_healthy`** — deepstream waits for triton; app waits for deepstream + whisper + ollama
+- **Bind-mounts for AI weights** — `~/.cache/huggingface` into whisper; `./models` into triton and deepstream; weights downloaded once to host
+- **Named volume for Ollama models** (`ollama-models`) — `qwen2.5:14b` (~9GB) persists across restarts
+- **App proxies camera routes** — `main.py` forwards `/cameras/*` to `deepstream:8090` via httpx; app container never imports GStreamer or DeepStream
 
 ---
 
@@ -325,125 +442,6 @@ family-assistant/
 
 ---
 
-## Technology Stack
-
-| Layer | Technology | Why |
-|---|---|---|
-| Phone calls | Twilio (inbound PSTN) | Handles carrier complexity, webhooks, TTS |
-| Phone TTS | AWS Polly via Twilio (`Polly.Joanna`) | Natural voice, no extra integration |
-| Browser mic + VAD | `@ricky0123/vad-web` (Silero VAD, ONNX Runtime Web) | ML-based voice detection, runs on device, no tap needed |
-| Browser TTS | `speechSynthesis` API | Built-in, no server round-trip |
-| Speech-to-text | faster-whisper `large-v3` on CUDA | Free, accurate, used for both phone and browser |
-| LLM | Qwen 2.5:14b via Ollama | Strong reasoning, runs fully locally |
-| Web search | Tavily API | Clean results API, image search support |
-| Messaging | Twilio WhatsApp API | Async research + reminder delivery |
-| Storage | Markdown file (`family.md`) | Human-readable, editable, no DB setup |
-| File locking | `filelock` | Prevents concurrent write corruption |
-| RTSP/file streaming | DeepStream 7.0 (NVDEC hardware decode) + WebSocket canvas | nvurisrcbin → nvstreammux → appsink; leaky queue decouples decode (48fps) from inference |
-| Scene detection | YOLO-World M TRT engine via Triton 25.03 | Open-vocabulary detection; 8ms median @ 1280×720; queries mapped from meta.json at runtime |
-| Object tracking | _SimpleTracker (pure-numpy IoU) | Persistent track IDs, deduplication; CPU-only; no pybind11/supervision |
-| Inference serving | NVIDIA Triton Inference Server 25.03 (Python backend + TRT) | Model management API (unload/load for query changes); HTTP :8002, gRPC :8001, metrics :8003 |
-| Scheduler | APScheduler `AsyncIOScheduler` | Proactive reminders without Celery/Redis |
-| Backend | FastAPI + uvicorn | Async, fast, minimal boilerplate |
-| Templates | Jinja2 + Bootstrap 5 | No build step, zero JS framework needed |
-| Logging | `TimedRotatingFileHandler` | Daily log files, 7-day retention |
-| Tunnel (dev) | Cloudflare Tunnel (`cloudflared`) | Twilio webhooks + HTTPS for browser mic; no bandwidth limits |
-
----
-
-## GPU Memory Layout (RTX 4070 Ti Super — 16GB)
-
-| Allocation | Size | Notes |
-|---|---|---|
-| Qwen 2.5:14b Q4_K_M (Ollama) | ~9–10 GB | Always hot; loaded at startup |
-| Whisper large-v3 int8_float16 | ~1.5 GB | Always loaded; not active during Qwen inference |
-| YOLO-World M TRT engine (Triton) | ~0.3 GB | Loaded at triton startup; persistent |
-| DeepStream pipeline buffers | ~0.5 GB | nvstreammux frame batches; scales with camera count |
-| **Steady-state total** | **~12.3 GB** | ~3.7 GB headroom |
-
-Note: Whisper and Qwen never run at the same time. YOLO-World inference runs on the Triton container's CUDA context (separate from the main app process). _SimpleTracker runs CPU-only. TRT re-export (if needed) peaks at ~4GB extra — do not trigger while Qwen is running a long generation.
-
----
-
-## Docker Compose Architecture
-
-Bianca runs as five containers on a single host, sharing the GPU via Nvidia Container Toolkit.
-
-```mermaid
-graph TD
-    subgraph Stack["docker-compose stack — host: RTX 4070 Ti Super"]
-        subgraph whisper["bianca-whisper :8080"]
-            W1["faster-whisper large-v3 fp16\n~1.5 GB VRAM\nPOST /transcribe\nGET  /health"]
-        end
-        subgraph triton["bianca-triton :8001/8002/8003"]
-            T1["Triton Inference Server 25.03\nYOLO-World M TRT backend\n~0.3 GB VRAM\nHTTP :8002  gRPC :8001\nmetrics :8003"]
-        end
-        subgraph deepstream["bianca-deepstream :8090"]
-            DS1["DeepStream 7.0 pipeline\nNVDEC hardware decode\nnvurisrcbin → nvstreammux\n→ appsink → Triton HTTP\nWebSocket frame broadcast"]
-        end
-        subgraph ollama["bianca-ollama :11434"]
-            O1["Ollama\nQwen 2.5:14b\n~9-10 GB VRAM\nPOST /api/chat\nGET  /api/tags"]
-        end
-        subgraph app["bianca-app :8000"]
-            A1["FastAPI + uvicorn\nNO GPU (CPU-only)\n→ Whisper for STT\n→ DeepStream for video/events\n→ Ollama/Qwen for LLM"]
-        end
-    end
-
-    W1 -- bianca-net --> A1
-    DS1 -- bianca-net --> A1
-    T1 -- bianca-net --> DS1
-    O1 -- bianca-net --> A1
-    A1 -->|:8000 host port| EXT["Browser / Twilio\ncloudflared tunnel"]
-```
-
-### Container responsibilities
-
-| Container | Image | GPU | Purpose |
-|---|---|---|---|
-| `bianca-whisper` | `bianca-whisper` (Dockerfile.whisper) | Yes | faster-whisper STT; exposes REST `/transcribe` |
-| `bianca-triton` | `bianca-triton` (Dockerfile.triton) | Yes | Triton 25.03 + YOLO-World M TRT; HTTP :8002, gRPC :8001 |
-| `bianca-deepstream` | `bianca-deepstream` (Dockerfile.deepstream) | Yes | DeepStream 7.0 NVDEC pipeline; WebSocket frame broadcast :8090 |
-| `bianca-ollama` | `ollama/ollama:latest` | Yes | Qwen 2.5:14b LLM; entrypoint auto-pulls model |
-| `bianca-app` | `bianca-app` (Dockerfile.app) | **No** | Main FastAPI app; explicitly CUDA-free |
-
-### Key Docker Compose design decisions
-
-- **App has no GPU reservation** — enforces CUDA-free constraint on the main process; any accidental PyTorch/CUDA import will fail fast rather than silently consuming VRAM
-- **All five on one bridge network** (`bianca-net`) — containers reach each other by service name; no host networking needed
-- **`depends_on` with `service_healthy`** — deepstream waits for triton; app waits for deepstream + whisper + ollama
-- **Bind-mounts for AI weights** — `~/.cache/huggingface` into whisper; `~/.cache/ultralytics` into triton and deepstream; weights downloaded once to host
-- **TRT engine bind-mount** — `./models:/trt_engines` in triton; `./models:/app/models` in deepstream; engine updated on host triggers Triton unload/load
-- **Named volume for Ollama models** (`ollama-models`) — `qwen2.5:14b` (~9GB) persists across restarts
-
-### Camera inference pipeline
-
-```mermaid
-flowchart TD
-    A["RTSP / file source"]
-    A --> B["bianca-deepstream\nnvurisrcbin (NVDEC)\n→ nvstreammux (batch)\n→ appsink callback\n→ leaky queue (max 1 frame)\n→ inference thread"]
-    B --> C["bianca-triton\nTriton 25.03 HTTP :8002\nYOLO-World M TRT engine\nmodels/yoloworld.engine\n~8ms median @ 1280×720"]
-    C --> D["inference thread\nLABEL_IDS (FP32) → query strings\n_SimpleTracker (IoU)\n→ CameraEvent (threshold + 30s dedup)\n→ shared_detections dict"]
-    D --> E["cameras.html (browser)\nWebSocket JPEG frames :8090\npolling /cameras/events"]
-```
-
-### Query change flow
-
-```
-POST /cameras/queries
-  → update models/yoloworld.meta.json (queries list)
-  → POST triton:8002/v2/repository/models/yoloworld/unload
-  → POST triton:8002/v2/repository/models/yoloworld/load
-  → model.py re-reads meta.json at init (~4s total)
-  → GET /cameras/queries/status returns {state: "ready"}
-```
-
-Note: query changes do NOT require TRT re-export because the queries are mapped to
-LABEL_IDS at inference time by model.py. The TRT engine is query-agnostic — it outputs
-class indices which model.py maps to the current query list. Re-export is only needed
-if the number of classes changes beyond the engine's capacity.
-
----
-
 ## Data Schema (family.md)
 
 ```markdown
@@ -480,3 +478,6 @@ if the number of classes changes beyond the engine's capacity.
 | Whisper loaded at startup | Eliminates cold-start delay on first call |
 | Qwen warmed up at startup via dummy `_chat("hi")` | Ollama lazy-loads model; warmup ensures GPU is ready |
 | Few-shot examples in intent classifier | Significantly reduces misclassifications vs zero-shot |
+| DeepStream → Triton via HTTP not gRPC | gRPC TYPE_STRING/pybind11 crash in tritonserver ≤24.09; UINT8+FP32 inputs mean gRPC could work on 25.03, but HTTP is simpler to debug (curl, browser) and required anyway for the model management API (`/v2/repository/models/yoloworld/load`); at 10fps with ~8ms GPU inference the ~0.9ms HTTP overhead is negligible; gRPC worth revisiting only at 10+ cameras |
+| TRT inference always; query changes trigger full re-export via management sidecar | TRT bakes CLIP text embeddings at export time — changing queries without re-exporting fires the engine on old class slots but maps to new labels (silent wrong results). PyTorch fallback is not used after initial engine creation; instead the management sidecar (`triton:8004`) re-exports a new TRT engine (~90s) in the background. The old engine keeps running until the new one is ready. |
+| App-level cross-service orchestration for query changes | When the user changes detection queries, `main.py` owns the full lifecycle: (1) pause Qwen (`keep_alive=0` so VRAM is freed), (2) trigger TRT re-export via `POST triton:8004/reexport`, (3) poll status every 3s up to 180s, (4) reload Triton model via `triton:8002` management API, (5) commit updated queries to deepstream via `POST deepstream:8090/queries/commit`, (6) resume Qwen. During re-export all LLM routes return HTTP 503. `deepstream_service` has no knowledge of Ollama. |

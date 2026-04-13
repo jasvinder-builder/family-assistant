@@ -48,6 +48,7 @@ services:
       - "8001:8001"   # gRPC (used by deepstream service)
       - "8002:8002"   # HTTP model management + metrics
       - "8003:8003"   # Prometheus metrics
+      - "8004:8004"   # Management sidecar — TRT re-export API
     volumes:
       - ./triton_models:/models
       - ${HOME}/.cache/ultralytics:/root/.cache/ultralytics
@@ -88,6 +89,7 @@ services:
       - ./services:/app/services
       - ./models:/app/models          # TRT engine + metadata JSON
       - ${HOME}/.cache/ultralytics:/root/.cache/ultralytics
+      - .:/workspace:ro               # host project dir → /workspace (test videos)
     environment:
       TRITON_URL: "triton:8001"
       PYTHONUNBUFFERED: "1"

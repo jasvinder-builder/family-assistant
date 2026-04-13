@@ -34,13 +34,12 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     "git+https://github.com/ultralytics/CLIP.git"
 
+# Management sidecar dependencies (re-export API on port 8004)
+RUN pip install --no-cache-dir "fastapi>=0.111" "uvicorn[standard]>=0.29"
+
+COPY scripts/triton_start.sh /triton_start.sh
+RUN chmod +x /triton_start.sh
+
 # Model repository at /models (bind-mounted from triton_models/ in docker-compose)
-# TRT engine (if exported) placed at /models/yoloworld.engine
-CMD ["tritonserver", \
-     "--model-repository=/models", \
-     "--http-port=8002", \
-     "--grpc-port=8001", \
-     "--metrics-port=8003", \
-     "--log-verbose=0", \
-     "--model-control-mode=explicit", \
-     "--load-model=yoloworld"]
+# TRT engine (if exported) placed at /trt_engines/yoloworld.engine (bind-mounted from ./models)
+CMD ["/triton_start.sh"]

@@ -13,7 +13,6 @@ from handlers.call_handler import handle_incoming, handle_transcription
 from handlers.research_handler import handle_research_choice, handle_research_whatsapp_choice
 from handlers.response_handler import voice_say_hangup
 from handlers import chat_handler
-from services import camera_service, scene_service
 from services import whisper_service, reminder_service
 from services import hangman_service, bulls_cows_service, word_ladder_service, twenty_questions_service
 from config import settings as app_settings
@@ -21,6 +20,18 @@ from services import markdown_service, session_store
 from services import qwen
 from services.qwen import _chat
 from models.schemas import TodoItem, EventItem
+
+DEEPSTREAM_URL  = os.environ.get("DEEPSTREAM_URL",  "http://localhost:8090").rstrip("/")
+_triton_host    = os.environ.get("TRITON_URL",      "localhost:8001").split(":")[0]
+TRITON_HTTP_URL = f"http://{_triton_host}:8002"
+TRITON_MGMT_URL = f"http://{_triton_host}:8004"
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL",    "qwen2.5:14b")
+
+# ── Re-export state (owned here — app orchestrates cross-service lifecycle) ────
+# Qwen-dependent routes read ollama_paused directly; no HTTP hop needed.
+_reexport_state: dict = {"state": "ready", "eta_s": 0, "ollama_paused": False}
+_reexport_running = False   # guard against concurrent re-exports
 
 os.makedirs("logs", exist_ok=True)
 _log_fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s — %(message)s")
@@ -83,110 +94,282 @@ async def games_hub(request: Request):
 
 @app.get("/cameras", response_class=HTMLResponse)
 async def cameras_page(request: Request):
-    return templates.TemplateResponse(
-        request=request,
-        name="cameras.html",
-        context={"current_url": camera_service.get_stream_url()},
-    )
+    return templates.TemplateResponse(request=request, name="cameras.html", context={})
+
+
+async def _ds_proxy(method: str, path: str, payload: dict | None = None):
+    """Proxy an HTTP request to the deepstream service."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        url = f"{DEEPSTREAM_URL}{path}"
+        if method == "GET":
+            r = await client.get(url)
+        elif method == "DELETE":
+            r = await client.delete(url)
+        else:
+            r = await client.request(method, url, json=payload)
+    return JSONResponse(r.json(), status_code=r.status_code)
+
+
+async def _ds_ws_proxy(websocket: WebSocket, ds_path: str):
+    """Forward a WebSocket connection to the deepstream service."""
+    import websockets as _ws_lib
+    await websocket.accept()
+    ds_url = DEEPSTREAM_URL.replace("http://", "ws://").replace("https://", "wss://") + ds_path
+    try:
+        async with _ws_lib.connect(ds_url) as ds_ws:
+            async def _to_client():
+                async for msg in ds_ws:
+                    if isinstance(msg, bytes):
+                        await websocket.send_bytes(msg)
+                    else:
+                        await websocket.send_text(msg)
+
+            async def _to_ds():
+                while True:
+                    try:
+                        data = await websocket.receive_bytes()
+                        await ds_ws.send(data)
+                    except Exception:
+                        break
+
+            done, pending = await asyncio.wait(
+                [asyncio.ensure_future(_to_client()), asyncio.ensure_future(_to_ds())],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+    except Exception as exc:
+        logger.debug("WS proxy closed: %s", exc)
+
+
+# ── Re-export orchestration ───────────────────────────────────────────────────
+
+async def _pause_ollama() -> None:
+    """Evict Qwen from GPU to free ~10 GB VRAM for TRT workspace."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            await c.post(f"{OLLAMA_BASE_URL}/api/generate",
+                         json={"model": OLLAMA_MODEL, "keep_alive": 0})
+        logger.info("Ollama: Qwen unloaded from GPU")
+    except Exception as exc:
+        logger.warning("Could not unload Ollama (proceeding anyway): %s", exc)
+
+
+async def _resume_ollama() -> None:
+    """Reload Qwen and warm it up so the first post-export request is fast."""
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as c:
+            await c.post(f"{OLLAMA_BASE_URL}/api/generate",
+                         json={"model": OLLAMA_MODEL, "prompt": "hi",
+                               "keep_alive": -1, "stream": False})
+        logger.info("Ollama: Qwen reloaded and warmed up")
+    except Exception as exc:
+        logger.warning("Could not reload Ollama: %s — will load on next request", exc)
+
+
+async def _triton_reload() -> None:
+    """Unload then load the yoloworld model so Triton picks up the new TRT engine."""
+    base = f"{TRITON_HTTP_URL}/v2/repository/models/yoloworld"
+    for action in ("unload", "load"):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as c:
+                await c.post(f"{base}/{action}", content=b"{}")
+            logger.info("Triton: yoloworld %s OK", action)
+        except Exception as exc:
+            logger.warning("Triton %s failed: %s", action, exc)
+        await asyncio.sleep(1)
+
+
+async def _run_reexport(queries: list[str]) -> None:
+    """Full re-export lifecycle: pause Qwen → TRT build → reload Triton → resume Qwen."""
+    global _reexport_running
+    try:
+        _reexport_state.update({"state": "updating", "eta_s": 90, "ollama_paused": False})
+
+        # 1. Free VRAM
+        logger.info("Re-export: unloading Qwen to free VRAM (queries=%s)", queries)
+        await _pause_ollama()
+        _reexport_state["ollama_paused"] = True
+
+        # 2. Kick off TRT build on triton management sidecar
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as c:
+                r = await c.post(f"{TRITON_MGMT_URL}/reexport", json={"queries": queries})
+                r.raise_for_status()
+            logger.info("Re-export: TRT build started")
+        except Exception as exc:
+            logger.error("Re-export: failed to start TRT build: %s", exc)
+            await _resume_ollama()
+            _reexport_state.update({"state": "ready", "eta_s": 0, "ollama_paused": False})
+            return
+
+        # 3. Poll until done (up to 180 s)
+        deadline = asyncio.get_event_loop().time() + 180
+        export_ok = False
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(3)
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as c:
+                    st = (await c.get(f"{TRITON_MGMT_URL}/reexport/status")).json()
+            except Exception:
+                continue
+            _reexport_state["eta_s"] = max(0, int(deadline - asyncio.get_event_loop().time()))
+            if st.get("state") == "done":
+                logger.info("Re-export: TRT build complete")
+                export_ok = True
+                break
+            if st.get("state") == "error":
+                logger.error("Re-export: TRT build failed: %s", st.get("error"))
+                break
+        else:
+            logger.warning("Re-export: TRT build timed out after 180 s")
+
+        # 4. Reload Triton so it picks up the new engine
+        if export_ok:
+            await _triton_reload()
+            # Tell deepstream to sync its in-memory label mapping
+            await _ds_proxy("POST", "/queries/commit", {"queries": queries})
+
+        # 5. Reload Qwen regardless of export outcome
+        logger.info("Re-export: reloading Qwen into GPU")
+        await _resume_ollama()
+
+    except Exception as exc:
+        logger.error("Re-export: unexpected error: %s", exc)
+        await _resume_ollama()   # always resume Qwen
+    finally:
+        _reexport_state.update({"state": "ready", "eta_s": 0, "ollama_paused": False})
+        _reexport_running = False
+        logger.info("Re-export: done (queries=%s)", queries)
 
 
 @app.post("/cameras/set-stream")
 async def cameras_set_stream(payload: dict):
-    url = payload.get("url", "").strip()
-    # Accept rtsp://, http://, https://, and absolute file paths for local testing
-    if url and not any(url.startswith(p) for p in ("rtsp://", "http://", "https://", "/")):
-        return JSONResponse({"error": "Enter an RTSP URL (rtsp://...) or absolute file path (/path/to/video.mp4)"}, status_code=400)
-    camera_service.set_stream_url(url)
-    return JSONResponse({"ok": True})
+    return await _ds_proxy("POST", "/set-stream", payload)
 
 
 @app.post("/cameras/debug-overlay")
 async def cameras_debug_overlay(payload: dict):
-    enabled = bool(payload.get("enabled", False))
-    camera_service.set_debug_overlay(enabled)
-    return JSONResponse({"ok": True, "enabled": enabled})
-
-
-@app.get("/cameras/stream")
-async def cameras_stream():
-    url = camera_service.get_stream_url()
-    if not url:
-        return JSONResponse({"error": "No stream configured"}, status_code=404)
-    return StreamingResponse(
-        camera_service.mjpeg_generator(url),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
+    return await _ds_proxy("POST", "/debug-overlay", payload)
 
 
 @app.websocket("/cameras/ws")
 async def cameras_ws(websocket: WebSocket):
-    await websocket.accept()
-    logger.info("WebSocket camera client connected")
-    try:
-        async for jpeg_bytes in camera_service.ws_frame_generator():
-            await websocket.send_bytes(jpeg_bytes)
-    except WebSocketDisconnect:
-        pass
-    logger.info("WebSocket camera client disconnected")
+    logger.info("WebSocket camera client connected (cam0)")
+    await _ds_ws_proxy(websocket, "/ws")
+    logger.info("WebSocket camera client disconnected (cam0)")
 
 
 @app.get("/cameras/queries")
 async def cameras_get_queries():
-    return JSONResponse({"queries": scene_service.get_queries()})
+    return await _ds_proxy("GET", "/queries")
+
+
+async def _get_current_queries() -> list[str]:
+    """Fetch the current query list from deepstream."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get(f"{DEEPSTREAM_URL}/queries")
+            return r.json().get("queries", [])
+    except Exception:
+        return []
 
 
 @app.post("/cameras/queries")
 async def cameras_add_query(payload: dict):
-    text = payload.get("text", "").strip()
-    if not text:
-        return JSONResponse({"error": "text is required"}, status_code=400)
-    added = scene_service.add_query(text)
-    return JSONResponse({"ok": True, "added": added, "queries": scene_service.get_queries()})
+    global _reexport_running
+    # Step 1: update deepstream's in-memory queries + meta.json immediately
+    r = await _ds_proxy("POST", "/queries", payload)
+    if r.status_code != 200:
+        return r
+    queries = await _get_current_queries()
+    if not _reexport_running:
+        _reexport_running = True
+        asyncio.create_task(_run_reexport(queries))
+    return JSONResponse({"ok": True, "queries": queries,
+                         "state": "updating", "eta_s": 90})
 
 
 @app.delete("/cameras/queries/{index}")
 async def cameras_remove_query(index: int):
-    removed = scene_service.remove_query(index)
-    if not removed:
-        return JSONResponse({"error": "index out of range"}, status_code=404)
-    return JSONResponse({"ok": True, "queries": scene_service.get_queries()})
+    global _reexport_running
+    r = await _ds_proxy("DELETE", f"/queries/{index}")
+    if r.status_code != 200:
+        return r
+    queries = await _get_current_queries()
+    if not _reexport_running:
+        _reexport_running = True
+        asyncio.create_task(_run_reexport(queries))
+    return JSONResponse({"ok": True, "queries": queries,
+                         "state": "updating", "eta_s": 90})
 
 
 @app.get("/cameras/events")
 async def cameras_get_events():
-    return JSONResponse({"events": scene_service.get_events()})
+    return await _ds_proxy("GET", "/events")
 
 
 @app.post("/cameras/threshold")
 async def cameras_set_threshold(payload: dict):
-    value = payload.get("value")
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return JSONResponse({"error": "value must be a number"}, status_code=400)
-    scene_service.set_threshold(value)
-    return JSONResponse({"ok": True, "threshold": scene_service.get_threshold()})
+    return await _ds_proxy("POST", "/threshold", payload)
 
 
 @app.get("/cameras/threshold")
 async def cameras_get_threshold():
-    return JSONResponse({"threshold": scene_service.get_threshold()})
+    return await _ds_proxy("GET", "/threshold")
 
 
 @app.post("/cameras/pad")
 async def cameras_set_pad(payload: dict):
-    value = payload.get("value")
-    try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return JSONResponse({"error": "value must be a number"}, status_code=400)
-    scene_service.set_pad_factor(value)
-    return JSONResponse({"ok": True, "pad": scene_service.get_pad_factor()})
+    return JSONResponse({"ok": True, "pad": 0.0})
 
 
 @app.get("/cameras/pad")
 async def cameras_get_pad():
-    return JSONResponse({"pad": scene_service.get_pad_factor()})
+    return JSONResponse({"pad": 0.0})
+
+
+@app.get("/cameras/queries/status")
+async def cameras_query_status():
+    return JSONResponse(_reexport_state)
+
+
+@app.post("/cameras/streams")
+async def cameras_add_stream(payload: dict):
+    return await _ds_proxy("POST", "/streams", payload)
+
+
+@app.delete("/cameras/streams/{cam_id}")
+async def cameras_remove_stream(cam_id: str):
+    return await _ds_proxy("DELETE", f"/streams/{cam_id}")
+
+
+@app.get("/cameras/streams")
+async def cameras_list_streams():
+    return await _ds_proxy("GET", "/streams")
+
+
+@app.websocket("/cameras/ws/{cam_id}")
+async def cameras_ws_cam(websocket: WebSocket, cam_id: str):
+    logger.info("WebSocket camera client connected: %s", cam_id)
+    await _ds_ws_proxy(websocket, f"/ws/{cam_id}")
+    logger.info("WebSocket camera client disconnected: %s", cam_id)
+
+
+# ── LLM availability guard ────────────────────────────────────────────────────
+
+def _llm_busy_json():
+    eta = _reexport_state.get("eta_s", 0)
+    msg = f"Bianca is updating her vision system and will be back in about {eta} seconds. Please try again shortly."
+    return JSONResponse({"error": msg, "llm_busy": True}, status_code=503)
+
+def _llm_busy_twiml():
+    return Response(
+        content=voice_say_hangup(
+            "Bianca is updating her vision system. Please call back in a couple of minutes."
+        ),
+        media_type="application/xml",
+    )
 
 
 @app.post("/transcribe")
@@ -205,6 +388,8 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
 @app.post("/chat")
 async def chat(payload: dict):
+    if _reexport_state.get("ollama_paused"):
+        return _llm_busy_json()
     transcript = payload.get("transcript", "").strip()
     caller_name = payload.get("caller_name", "Family").strip()
     result = await chat_handler.handle_chat(transcript, caller_name)
@@ -233,6 +418,8 @@ async def quiz_page(request: Request):
 
 @app.post("/games/resolve-answer")
 async def resolve_answer(payload: dict):
+    if _reexport_state.get("ollama_paused"):
+        return _llm_busy_json()
     transcript = payload.get("transcript", "").strip()
     options = payload.get("options", [])
     if not transcript or len(options) != 4:
@@ -247,6 +434,8 @@ async def resolve_answer(payload: dict):
 
 @app.post("/games/quiz/generate")
 async def quiz_generate(payload: dict):
+    if _reexport_state.get("ollama_paused"):
+        return _llm_busy_json()
     subject = payload.get("subject", "").strip()
     grade = payload.get("grade")
     if not subject or grade is None:
@@ -316,6 +505,8 @@ async def word_ladder_page(request: Request):
 
 @app.post("/games/word-ladder/new")
 async def word_ladder_new():
+    if _reexport_state.get("ollama_paused"):
+        return _llm_busy_json()
     start = target = None
     try:
         pair = await asyncio.to_thread(qwen.generate_word_ladder)
@@ -366,6 +557,8 @@ async def twenty_questions_new():
 
 @app.post("/games/twenty-questions/start")
 async def twenty_questions_start(payload: dict):
+    if _reexport_state.get("ollama_paused"):
+        return _llm_busy_json()
     session_id = payload.get("session_id", "")
     result = await asyncio.to_thread(twenty_questions_service.start_questions, session_id)
     return JSONResponse(result)
@@ -373,6 +566,8 @@ async def twenty_questions_start(payload: dict):
 
 @app.post("/games/twenty-questions/answer")
 async def twenty_questions_answer(payload: dict):
+    if _reexport_state.get("ollama_paused"):
+        return _llm_busy_json()
     session_id = payload.get("session_id", "")
     answer_text = payload.get("answer", "").strip()
     result = await asyncio.to_thread(twenty_questions_service.answer, session_id, answer_text)
@@ -399,6 +594,8 @@ async def voice_transcription(
     RecordingUrl: str = Form(default=""),
     RecordingSid: str = Form(default=""),
 ):
+    if _reexport_state.get("ollama_paused"):
+        return _llm_busy_twiml()
     twiml = handle_transcription(From=From, RecordingUrl=RecordingUrl, RecordingSid=RecordingSid)
     return Response(content=twiml, media_type="application/xml")
 

@@ -22,6 +22,10 @@ __pycache__/
 .ultralytics/
 *.pt
 
+# TRT engine files — large binary, exported at runtime
+models/*.engine
+models/*.meta.json
+
 # Test videos — local only
 *.mp4
 *.mov

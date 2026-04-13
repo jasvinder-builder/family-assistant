@@ -19,9 +19,11 @@ RUN find /opt/nvidia/deepstream -name "pyds*.whl" 2>/dev/null \
     | xargs -r pip install --no-cache-dir \
     || echo "pyds wheel not found in image — install manually if needed"
 
-# Triton gRPC client + service dependencies
+# Triton HTTP client (tritonclient.http) + service dependencies
+# Note: HTTP is used deliberately over gRPC — avoids TYPE_STRING pybind11 crash
+#       in Triton Python backend. gRPC extra kept for potential future use.
 RUN pip install --no-cache-dir \
-    "tritonclient[grpc]>=2.45" \
+    "tritonclient[grpc,http]>=2.45" \
     "opencv-python-headless>=4.9" \
     "fastapi>=0.111" \
     "uvicorn[standard]>=0.29" \
@@ -39,5 +41,4 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV GST_DEBUG=2
 
-CMD ["python3", "-m", "uvicorn", "services.deepstream_service:app",
-     "--host", "0.0.0.0", "--port", "8090", "--log-level", "info"]
+CMD ["python3", "-m", "uvicorn", "services.deepstream_service:app", "--host", "0.0.0.0", "--port", "8090", "--log-level", "info"]

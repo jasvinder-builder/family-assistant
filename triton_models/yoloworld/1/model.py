@@ -36,35 +36,32 @@ class TritonPythonModel:
         self._load_model()
 
     def _load_model(self) -> None:
-        model_name = os.environ.get("YOLOWORLD_MODEL", "yolov8m-worldv2")
+        model_name  = os.environ.get("YOLOWORLD_MODEL", "yolov8m-worldv2")
         engine_path = pathlib.Path("/trt_engines/yoloworld.engine")
         meta_path   = pathlib.Path("/trt_engines/yoloworld.meta.json")
+
+        queries = ["person", "dog", "car"]
+        if meta_path.exists():
+            try:
+                queries = json.loads(meta_path.read_text()).get("queries", queries)
+            except Exception:
+                pass
 
         if engine_path.exists():
             from ultralytics import YOLO
             print(f"[yoloworld] Loading TRT engine: {engine_path}", flush=True)
             self._model = YOLO(str(engine_path), task="detect")
             self._using_trt = True
-            if meta_path.exists():
-                self._current_queries = json.loads(meta_path.read_text()).get(
-                    "queries", ["person", "dog", "car"]
-                )
-            else:
-                self._current_queries = ["person", "dog", "car"]
         else:
+            # TRT engine not yet exported — PyTorch fallback until first export
             from ultralytics import YOLOWorld
-            default_queries = ["person", "dog", "car"]
-            if meta_path.exists():
-                default_queries = json.loads(meta_path.read_text()).get(
-                    "queries", default_queries
-                )
-            print(f"[yoloworld] Loading PyTorch model: {model_name}", flush=True)
+            print(f"[yoloworld] No TRT engine — loading PyTorch: {model_name}", flush=True)
             self._model = YOLOWorld(f"{model_name}.pt")
-            self._model.set_classes(default_queries)
-            self._current_queries = default_queries
+            self._model.set_classes(queries)
             self._using_trt = False
 
-        print(f"[yoloworld] Ready. Queries: {self._current_queries}", flush=True)
+        self._current_queries = queries
+        print(f"[yoloworld] Ready. queries={self._current_queries}  trt={self._using_trt}", flush=True)
 
     def execute(self, requests):
         responses = []

@@ -11,7 +11,7 @@ Handles:
 
 Public API is backward-compatible with camera_service + scene_service:
   set_stream_url / get_stream_url / ws_frame_generator / mjpeg_generator
-  get_queries / add_query / remove_query / get_query_status
+  get_queries / add_query / remove_query
   get_threshold / set_threshold / get_debug_overlay / set_debug_overlay
   get_latest_detections / get_events / start_analysis / stop_analysis
 
@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # Derive Triton HTTP host from TRITON_URL env var (default port gRPC 8001 → HTTP 8002)
 _triton_raw  = os.environ.get("TRITON_URL", "localhost:8001")
 _triton_host = _triton_raw.split(":")[0]
-TRITON_HTTP_URL = f"{_triton_host}:8002"
+TRITON_HTTP_URL  = f"{_triton_host}:8002"
 
 META_JSON_PATH    = os.environ.get("META_JSON_PATH", "/app/models/yoloworld.meta.json")
 
@@ -156,6 +156,7 @@ class CameraEvent:
 # ── Module-level state ────────────────────────────────────────────────────────
 
 _pipeline_lock = threading.Lock()
+_rebuild_lock  = threading.Lock()      # serialises concurrent _rebuild calls
 _streams: dict[str, str] = {}          # cam_id → uri (ordered by insertion)
 _pipeline      = None                   # Gst.Pipeline | None
 _pipeline_stop = threading.Event()
@@ -190,8 +191,6 @@ _queries_lock  = threading.Lock()
 _threshold:      float = 0.3
 _debug_overlay:  bool  = False
 
-_query_status:      dict = {"state": "ready", "eta_s": 0}
-_query_status_lock  = threading.Lock()
 _query_update_lock  = threading.Lock()   # serialises concurrent add/remove calls
 
 
@@ -209,6 +208,8 @@ def _save_queries_to_meta(new_queries: list[str]) -> None:
         existing = json.loads(open(META_JSON_PATH).read())
     except Exception:
         existing = {"queries": [], "imgsz": 640}
+    # Only update active queries — never touch engine_queries (baked TRT text embeddings).
+    # model.py compares queries vs engine_queries to decide whether to use TRT or PyTorch.
     existing["queries"] = new_queries
     tmp = META_JSON_PATH + ".tmp"
     with open(tmp, "w") as f:
@@ -216,53 +217,17 @@ def _save_queries_to_meta(new_queries: list[str]) -> None:
     os.replace(tmp, META_JSON_PATH)
 
 
-def _triton_reload_model() -> None:
-    """Unload then load the yoloworld model so Triton re-reads meta.json."""
-    import urllib.request
-    base = f"http://{TRITON_HTTP_URL}/v2/repository/models/yoloworld"
-    for action in ("unload", "load"):
-        req = urllib.request.Request(
-            f"{base}/{action}",
-            data=b"{}",
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            urllib.request.urlopen(req, timeout=30)
-            logger.info("Triton model yoloworld %s OK", action)
-        except Exception as exc:
-            logger.warning("Triton model %s failed: %s", action, exc)
-        time.sleep(1)
-
-
-def _query_update_worker(new_queries: list[str]) -> None:
-    """Background thread: update meta.json and reload Triton model.
-    Serialised by _query_update_lock so concurrent calls queue up."""
+def _commit_queries(new_queries: list[str]) -> None:
+    """Update in-memory query list and persist to meta.json.
+    Called by add_query/remove_query immediately, and also by main.py after
+    a successful TRT re-export to keep the local label-mapping in sync."""
     with _query_update_lock:
-        _do_query_update(new_queries)
+        _queries.clear()
+        _queries.extend(new_queries)
+        _save_queries_to_meta(new_queries)
+    logger.info("Queries committed: %s", new_queries)
 
 
-def _do_query_update(new_queries: list[str]) -> None:
-    with _query_status_lock:
-        _query_status["state"] = "updating"
-        _query_status["eta_s"] = 10
-
-    logger.info("Updating queries to %s", new_queries)
-    _save_queries_to_meta(new_queries)
-    _triton_reload_model()
-
-    with _query_status_lock:
-        _query_status["state"] = "ready"
-        _query_status["eta_s"] = 0
-
-    logger.info("Query update complete: %s", new_queries)
-
-
-
-
-def get_query_status() -> dict:
-    with _query_status_lock:
-        return dict(_query_status)
 
 
 # ── GStreamer appsink callback ─────────────────────────────────────────────────
@@ -289,9 +254,10 @@ def _on_new_sample(appsink, _userdata):
     if not ok:
         return Gst.FlowReturn.OK
 
+    # nvvideoconvert outputs RGBA; convert to BGR for cv2 compatibility
     tiled = (
         np.frombuffer(minfo.data, dtype=np.uint8)
-        .reshape(h, w, 4)[:, :, :3]
+        .reshape(h, w, 4)[:, :, 2::-1]   # RGBA → BGR (channels 2,1,0)
         .copy()
     )
     buf.unmap(minfo)
@@ -372,7 +338,11 @@ def unsubscribe_frames(q: queue.Queue, cam_id: str = "cam0") -> None:
 # ── Inference loop ────────────────────────────────────────────────────────────
 
 def _inference_loop() -> None:
-    import tritonclient.http as triton_http
+    try:
+        import tritonclient.http as triton_http
+    except Exception as exc:
+        logger.error("Failed to import tritonclient.http — inference disabled: %s", exc)
+        return
 
     logger.info("Inference loop starting, connecting to Triton at %s", TRITON_HTTP_URL)
     client = triton_http.InferenceServerClient(TRITON_HTTP_URL)
@@ -616,23 +586,41 @@ def _build_and_start_pipeline(stream_map: dict[str, str]) -> None:
     _pipeline = pipeline
     logger.info("DeepStream pipeline started (%d camera(s))", n)
 
-    # Watch bus for EOS — restart pipeline so file sources loop
-    def _bus_watch(bus, msg, pipeline_ref):
+    # Poll the bus in a background thread — bus.add_watch() needs a GLib main
+    # loop which uvicorn/asyncio never starts, so callbacks would never fire.
+    # On EOS, restart the whole pipeline rather than seeking: nvurisrcbin does
+    # not reliably support seek for file sources in this DeepStream build.
+    def _bus_poll(pipeline_ref):
         from gi.repository import Gst as _Gst
-        if msg.type == _Gst.MessageType.EOS:
-            logger.info("Pipeline EOS — seeking to start for loop")
-            pipeline_ref.seek_simple(
-                _Gst.Format.TIME,
-                _Gst.SeekFlags.FLUSH | _Gst.SeekFlags.KEY_UNIT,
-                0,
+        bus = pipeline_ref.get_bus()
+        while True:
+            msg = bus.timed_pop_filtered(
+                100 * _Gst.MSECOND,
+                _Gst.MessageType.EOS | _Gst.MessageType.ERROR,
             )
-        elif msg.type == _Gst.MessageType.ERROR:
-            err, dbg = msg.parse_error()
-            logger.warning("Pipeline error: %s (%s)", err, dbg)
-        return True  # keep watching
+            if msg is None:
+                if pipeline_ref.get_state(0)[1] == _Gst.State.NULL:
+                    break
+                continue
+            if msg.type == _Gst.MessageType.EOS:
+                logger.info("Pipeline EOS — restarting pipeline for file loop")
+                # Snapshot the stream map at EOS time so the restart uses the
+                # same sources even if add_stream/remove_stream races in.
+                streams_snapshot = dict(_streams)
+                threading.Thread(
+                    target=_rebuild,
+                    args=(streams_snapshot,),
+                    daemon=True,
+                    name="ds-eos-restart",
+                ).start()
+                break  # new bus poll thread started by _rebuild/_build_and_start_pipeline
+            elif msg.type == _Gst.MessageType.ERROR:
+                err, dbg = msg.parse_error()
+                logger.warning("Pipeline error: %s (%s)", err, dbg)
+                break
 
-    bus = pipeline.get_bus()
-    bus.add_watch(0, _bus_watch, pipeline)
+    threading.Thread(target=_bus_poll, args=(pipeline,), daemon=True,
+                     name="ds-bus-poll").start()
 
 
 def _stop_pipeline() -> None:
@@ -668,30 +656,37 @@ def _rebuild(new_streams: dict[str, str]) -> None:
     """Stop everything, update state, restart with new stream set."""
     global _streams
 
-    _stop_inference()
-    _stop_pipeline()
+    # Prevent concurrent rebuilds (e.g. EOS restart racing with add_stream)
+    if not _rebuild_lock.acquire(blocking=False):
+        logger.debug("_rebuild: already in progress, skipping concurrent call")
+        return
 
-    removed = set(_streams) - set(new_streams)
+    try:
+        _stop_inference()
+        _stop_pipeline()
 
-    with _infer_slots_lock:
-        _infer_slots.clear()
-    _last_display.clear()
-    _last_infer.clear()
+        removed = set(_streams) - set(new_streams)
 
-    # Clean up state for cameras that are no longer active
-    for cam_id in removed:
-        _trackers.pop(cam_id, None)
-        with _det_lock:
-            _detections.pop(cam_id, None)
+        with _infer_slots_lock:
+            _infer_slots.clear()
+        _last_display.clear()
+        _last_infer.clear()
 
-    _streams = dict(new_streams)
+        for cam_id in removed:
+            _trackers.pop(cam_id, None)
+            with _det_lock:
+                _detections.pop(cam_id, None)
 
-    if _streams:
-        _build_and_start_pipeline(_streams)
-        _start_inference()
-        logger.info("DeepStream service running: %s", list(_streams.keys()))
-    else:
-        logger.info("DeepStream service idle — no streams")
+        _streams = dict(new_streams)
+
+        if _streams:
+            _build_and_start_pipeline(_streams)
+            _start_inference()
+            logger.info("DeepStream service running: %s", list(_streams.keys()))
+        else:
+            logger.info("DeepStream service idle — no streams")
+    finally:
+        _rebuild_lock.release()
 
 
 # ── Public stream management ──────────────────────────────────────────────────
@@ -775,6 +770,7 @@ def get_queries() -> list[str]:
 
 
 def add_query(text: str) -> bool:
+    """Add a query and persist to meta.json. Re-export is orchestrated by the app."""
     text = text.strip()
     if not text:
         return False
@@ -782,24 +778,17 @@ def add_query(text: str) -> bool:
         if text in _queries:
             return False
         new = list(_queries) + [text]
-        _queries.clear()
-        _queries.extend(new)   # update in-memory immediately
-    threading.Thread(
-        target=_query_update_worker, args=(new,), daemon=True, name="query-update"
-    ).start()
+    _commit_queries(new)
     return True
 
 
 def remove_query(index: int) -> bool:
+    """Remove a query and persist to meta.json. Re-export is orchestrated by the app."""
     with _queries_lock:
         if not (0 <= index < len(_queries)):
             return False
         new = [q for i, q in enumerate(_queries) if i != index]
-        _queries.clear()
-        _queries.extend(new)   # update in-memory immediately
-    threading.Thread(
-        target=_query_update_worker, args=(new,), daemon=True, name="query-update"
-    ).start()
+    _commit_queries(new)
     return True
 
 
@@ -880,3 +869,133 @@ def _init_queries() -> None:
 
 
 _init_queries()
+
+
+# ── FastAPI app (served by the deepstream container on port 8090) ─────────────
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
+from fastapi.responses import JSONResponse as _JSONResponse   # noqa: E402
+
+app = FastAPI(title="DeepStream Service")
+
+
+@app.get("/health")
+async def _health():
+    return {"ok": True}
+
+
+@app.get("/streams")
+async def _list_streams():
+    return _JSONResponse({"streams": get_streams()})
+
+
+@app.post("/streams")
+async def _add_stream(payload: dict):
+    cam_id = payload.get("cam_id", "").strip()
+    url    = payload.get("url", "").strip()
+    if not cam_id:
+        return _JSONResponse({"error": "cam_id is required"}, status_code=400)
+    if not url:
+        return _JSONResponse({"error": "url is required"}, status_code=400)
+    add_stream(cam_id, url)
+    return _JSONResponse({"ok": True, "streams": get_streams()})
+
+
+@app.delete("/streams/{cam_id}")
+async def _remove_stream(cam_id: str):
+    if cam_id not in get_streams():
+        return _JSONResponse({"error": f"stream '{cam_id}' not found"}, status_code=404)
+    remove_stream(cam_id)
+    return _JSONResponse({"ok": True, "streams": get_streams()})
+
+
+@app.get("/queries")
+async def _list_queries():
+    return _JSONResponse({"queries": get_queries()})
+
+
+@app.post("/queries")
+async def _add_query(payload: dict):
+    text = payload.get("text", "").strip()
+    if not text:
+        return _JSONResponse({"error": "text is required"}, status_code=400)
+    added = add_query(text)
+    return _JSONResponse({"ok": True, "added": added, "queries": get_queries()})
+
+
+@app.delete("/queries/{index}")
+async def _remove_query(index: int):
+    removed = remove_query(index)
+    if not removed:
+        return _JSONResponse({"error": "index out of range"}, status_code=404)
+    return _JSONResponse({"ok": True, "queries": get_queries()})
+
+
+@app.get("/queries/status")
+async def _queries_status_route():
+    # Re-export status is owned by the app container (main.py). Return current queries only.
+    return _JSONResponse({"state": "ready", "eta_s": 0, "queries": get_queries()})
+
+
+@app.post("/queries/commit")
+async def _queries_commit_route(payload: dict):
+    """Called by main.py after a successful TRT re-export to sync the label mapping."""
+    queries = payload.get("queries", [])
+    if not isinstance(queries, list):
+        return _JSONResponse({"error": "queries must be a list"}, status_code=400)
+    _commit_queries(queries)
+    return _JSONResponse({"ok": True, "queries": get_queries()})
+
+
+@app.get("/events")
+async def _events_route():
+    return _JSONResponse({"events": get_events()})
+
+
+@app.get("/threshold")
+async def _get_threshold():
+    return _JSONResponse({"threshold": get_threshold()})
+
+
+@app.post("/threshold")
+async def _set_threshold(payload: dict):
+    try:
+        value = float(payload.get("value"))
+    except (TypeError, ValueError):
+        return _JSONResponse({"error": "value must be a number"}, status_code=400)
+    set_threshold(value)
+    return _JSONResponse({"ok": True, "threshold": get_threshold()})
+
+
+@app.post("/debug-overlay")
+async def _debug_overlay(payload: dict):
+    enabled = bool(payload.get("enabled", False))
+    set_debug_overlay(enabled)
+    return _JSONResponse({"ok": True, "enabled": enabled})
+
+
+@app.post("/set-stream")
+async def _set_stream(payload: dict):
+    url = payload.get("url", "").strip()
+    set_stream_url(url)
+    return _JSONResponse({"ok": True})
+
+
+@app.websocket("/ws/{cam_id}")
+async def _ws_cam(websocket: WebSocket, cam_id: str):
+    await websocket.accept()
+    try:
+        async for jpeg_bytes in ws_frame_generator(cam_id):
+            await websocket.send_bytes(jpeg_bytes)
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/ws")
+async def _ws_default(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        async for jpeg_bytes in ws_frame_generator("cam0"):
+            await websocket.send_bytes(jpeg_bytes)
+    except WebSocketDisconnect:
+        pass

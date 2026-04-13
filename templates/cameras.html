@@ -11,7 +11,12 @@
     .hero-text h1 { font-size: 1.4rem; font-weight: 700; margin: 0; }
     .hero-text p  { opacity: 0.85; font-size: 0.85rem; margin: 0.15rem 0 0; }
     .card { border: none; border-radius: 16px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); }
-    #videoFeed { width: 100%; max-height: 480px; object-fit: contain; border-radius: 10px; background: #0f172a; display: block; }
+    .cam-tile { border-radius: 12px; background: #0f172a; overflow: hidden; position: relative; }
+    .cam-tile img { width: 100%; max-height: 360px; object-fit: contain; display: block; background: #0f172a; }
+    .cam-tile .cam-label { position: absolute; top: 8px; left: 10px; background: rgba(0,0,0,0.6); color: #e2e8f0; font-size: 0.78rem; padding: 2px 8px; border-radius: 6px; }
+    .cam-tile .cam-remove { position: absolute; top: 6px; right: 8px; background: rgba(239,68,68,0.85); color: white; border: none; border-radius: 6px; font-size: 0.75rem; padding: 2px 8px; cursor: pointer; }
+    .cam-tile .cam-remove:hover { background: #dc2626; }
+    .cam-placeholder { min-height: 200px; display: flex; align-items: center; justify-content: center; color: #64748b; font-size: 0.88rem; }
     .query-badge {
       display: flex; align-items: center; gap: 0.5rem;
       background: #eff6ff; border: 1px solid #bfdbfe;
@@ -20,13 +25,14 @@
     }
     .query-badge button { padding: 0; border: none; background: none; color: #94a3b8; line-height: 1; font-size: 1rem; }
     .query-badge button:hover { color: #ef4444; }
+    .query-updating { background: #fefce8; border: 1px solid #fde047; border-radius: 8px; padding: 0.5rem 0.75rem; font-size: 0.85rem; color: #854d0e; }
     .event-row { border-left: 3px solid #6366f1; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; background: white; border-radius: 0 8px 8px 0; font-size: 0.88rem; display: flex; align-items: flex-start; gap: 0.6rem; }
     .event-thumb { width: 56px; height: 80px; object-fit: cover; border-radius: 6px; flex-shrink: 0; background: #e2e8f0; }
     .event-thumb-placeholder { width: 56px; height: 80px; border-radius: 6px; flex-shrink: 0; background: #e2e8f0; }
     .event-ts { color: #64748b; font-size: 0.78rem; font-variant-numeric: tabular-nums; }
     .event-conf { color: #94a3b8; font-size: 0.75rem; }
+    .event-cam { color: #6366f1; font-size: 0.75rem; font-weight: 600; }
     .empty-hint { color: #94a3b8; font-size: 0.88rem; }
-    .stream-error { display: none; color: #ef4444; font-size: 0.85rem; margin-top: 0.5rem; }
   </style>
 </head>
 <body>
@@ -35,40 +41,43 @@
   <a href="/" class="btn btn-light btn-sm fw-semibold">← Home</a>
   <div class="hero-text">
     <h1>📷 Cameras</h1>
-    <p>Live stream · AI event detection</p>
+    <p>Live streams · YOLO-World TRT detection · Natural language alerts</p>
   </div>
 </div>
 
-<div class="container py-4" style="max-width:860px;">
+<div class="container py-4" style="max-width:1100px;">
 
-  <!-- ── Stream URL ─────────────────────────────────────────────────────── -->
+  <!-- ── Add camera ──────────────────────────────────────────────────────── -->
   <div class="card mb-4">
     <div class="card-body">
-      <h6 class="fw-semibold mb-3">Camera Stream</h6>
-      <div class="input-group">
-        <input type="text" id="rtspUrl" class="form-control font-monospace"
-               placeholder="rtsp://user:pass@host:554/stream  or  /path/to/video.mp4"
-               value="{{ current_url or '' }}">
-        <button class="btn btn-primary"   id="connectBtn"    onclick="connectStream()">Connect</button>
-        <button class="btn btn-outline-danger d-none" id="disconnectBtn" onclick="disconnectStream()">Disconnect</button>
+      <h6 class="fw-semibold mb-3">Add Camera</h6>
+      <div class="row g-2 align-items-end">
+        <div class="col-auto">
+          <label class="form-label small mb-1">Camera ID</label>
+          <input type="text" id="newCamId" class="form-control form-control-sm font-monospace"
+                 placeholder="cam0" style="width:100px;">
+        </div>
+        <div class="col">
+          <label class="form-label small mb-1">Stream URL</label>
+          <input type="text" id="newCamUrl" class="form-control form-control-sm font-monospace"
+                 placeholder="rtsp://user:pass@host:554/stream  or  file:///path/to/video.mp4"
+                 onkeydown="if(event.key==='Enter') addCamera()">
+        </div>
+        <div class="col-auto">
+          <button class="btn btn-primary btn-sm" onclick="addCamera()">+ Add</button>
+        </div>
       </div>
-      <div id="statusMsg" class="mt-2 small"></div>
+      <div id="addCamStatus" class="mt-2 small"></div>
     </div>
   </div>
 
-  <!-- ── Live video ─────────────────────────────────────────────────────── -->
-  <div id="videoSection" class="card mb-4 {% if not current_url %}d-none{% endif %}">
-    <div class="card-body">
-      <div class="d-flex justify-content-between align-items-center mb-3">
-        <h6 class="fw-semibold mb-0">Live View</h6>
-        <div class="form-check form-switch mb-0">
-          <input class="form-check-input" type="checkbox" id="debugToggle" onchange="toggleDebug(this.checked)">
-          <label class="form-check-label small" for="debugToggle">Debug overlay</label>
+  <!-- ── Camera grid ─────────────────────────────────────────────────────── -->
+  <div id="cameraGrid" class="row g-3 mb-4">
+    <div class="col-12">
+      <div class="card">
+        <div class="card-body cam-placeholder">
+          No cameras connected. Add a stream above to get started.
         </div>
-      </div>
-      <img id="videoFeed" alt="Camera feed">
-      <div id="streamError" class="stream-error">
-        Stream unavailable — check the RTSP URL and camera connectivity.
       </div>
     </div>
   </div>
@@ -78,8 +87,10 @@
     <div class="card-body">
       <div class="d-flex justify-content-between align-items-center mb-3">
         <h6 class="fw-semibold mb-0">Scene Queries</h6>
-        <span class="text-muted small">Grounding DINO detects these during analysis</span>
+        <span class="text-muted small">YOLO-World detects these in real time</span>
       </div>
+
+      <div id="queryStatusMsg" class="query-updating mb-3 d-none"></div>
 
       <div id="queryList" class="d-flex flex-wrap gap-2 mb-3"></div>
 
@@ -101,12 +112,27 @@
     </div>
   </div>
 
+  <!-- ── Debug overlay ─────────────────────────────────────────────────── -->
+  <div class="card mb-4">
+    <div class="card-body py-2">
+      <div class="form-check form-switch mb-0">
+        <input class="form-check-input" type="checkbox" id="debugToggle" onchange="toggleDebug(this.checked)">
+        <label class="form-check-label small" for="debugToggle">Debug overlay (show detection boxes on stream)</label>
+      </div>
+    </div>
+  </div>
+
   <!-- ── Event log ──────────────────────────────────────────────────────── -->
   <div class="card">
     <div class="card-body">
       <div class="d-flex justify-content-between align-items-center mb-3">
         <h6 class="fw-semibold mb-0">Detected Events <span class="text-muted fw-normal small">(last hour)</span></h6>
-        <span id="eventCount" class="badge bg-indigo text-white" style="background:#6366f1;"></span>
+        <div class="d-flex align-items-center gap-3">
+          <select id="camFilter" class="form-select form-select-sm" style="width:auto;" onchange="filterEvents()">
+            <option value="">All cameras</option>
+          </select>
+          <span id="eventCount" class="badge text-white" style="background:#6366f1;"></span>
+        </div>
       </div>
       <div id="eventLog">
         <p class="empty-hint">No events yet. Connect a stream and add scene queries to start detection.</p>
@@ -117,99 +143,135 @@
 </div><!-- /container -->
 
 <script>
-  const videoFeed    = document.getElementById('videoFeed');
-  const videoSection = document.getElementById('videoSection');
-  const statusMsg    = document.getElementById('statusMsg');
-  const streamError  = document.getElementById('streamError');
+  // ── WebSocket management ───────────────────────────────────────────────────
+  // wsMap: {cam_id: WebSocket}
+  // blobMap: {cam_id: current blob URL}
 
-  // ── WebSocket stream ─────────────────────────────────────────────────────
+  const wsMap   = {};
+  const blobMap = {};
 
-  let ws = null;
-  let prevBlobUrl = null;
-
-  function startWebSocket() {
+  function startCamWs(camId) {
+    if (wsMap[camId]) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${location.host}/cameras/ws`;
-    console.log('[WS] connecting to', wsUrl);
-    ws = new WebSocket(wsUrl);
+    const url   = `${proto}//${location.host}/cameras/ws/${camId}`;
+    const ws    = new WebSocket(url);
     ws.binaryType = 'blob';
+    wsMap[camId]  = ws;
 
-    ws.onopen  = () => { console.log('[WS] open'); streamError.style.display = 'none'; };
-    ws.onerror = (e) => { console.error('[WS] error', e); streamError.style.display = 'block'; };
-    ws.onclose = (e) => { console.log('[WS] closed — code:', e.code, 'reason:', e.reason); ws = null; };
-
-    let frameCount = 0;
+    ws.onopen  = () => console.log(`[WS:${camId}] open`);
+    ws.onerror = (e) => console.error(`[WS:${camId}] error`, e);
+    ws.onclose = (e) => {
+      console.log(`[WS:${camId}] closed code=${e.code}`);
+      delete wsMap[camId];
+    };
     ws.onmessage = (e) => {
-      frameCount++;
-      if (frameCount <= 3) console.log('[WS] frame', frameCount, 'size:', e.data.size, 'bytes');
-      const url = URL.createObjectURL(new Blob([e.data], {type: 'image/jpeg'}));
-      videoFeed.onload = () => {
-        if (prevBlobUrl) URL.revokeObjectURL(prevBlobUrl);
-        prevBlobUrl = url;
+      const img = document.getElementById(`feed-${camId}`);
+      if (!img) return;
+      const newUrl = URL.createObjectURL(new Blob([e.data], {type: 'image/jpeg'}));
+      img.onload = () => {
+        if (blobMap[camId]) URL.revokeObjectURL(blobMap[camId]);
+        blobMap[camId] = newUrl;
       };
-      videoFeed.onerror = (err) => { console.error('[WS] img load error', err); URL.revokeObjectURL(url); };
-      videoFeed.src = url;
+      img.src = newUrl;
     };
   }
 
-  function stopWebSocket() {
-    if (ws) { ws.close(); ws = null; }
+  function stopCamWs(camId) {
+    if (wsMap[camId]) { wsMap[camId].close(); delete wsMap[camId]; }
+    if (blobMap[camId]) { URL.revokeObjectURL(blobMap[camId]); delete blobMap[camId]; }
   }
 
-  // ── Stream connection ────────────────────────────────────────────────────
+  // ── Camera grid ───────────────────────────────────────────────────────────
 
-  async function connectStream() {
-    const url = document.getElementById('rtspUrl').value.trim();
-    if (!url) { showStatus('Please enter an RTSP URL.', 'danger'); return; }
+  let activeCams = {};   // {cam_id: url}
 
-    showStatus('Connecting…', 'muted');
-    setConnectBtns(true);
-
-    const res = await fetch('/cameras/set-stream', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url}),
-    }).catch(() => null);
-
-    setConnectBtns(false);
-    if (!res || !res.ok) {
-      const err = res ? (await res.json()).error : 'Network error';
-      showStatus(err, 'danger'); return;
+  function renderGrid() {
+    const grid   = document.getElementById('cameraGrid');
+    const camIds = Object.keys(activeCams);
+    if (camIds.length === 0) {
+      grid.innerHTML = `<div class="col-12">
+        <div class="card"><div class="card-body cam-placeholder">
+          No cameras connected. Add a stream above to get started.
+        </div></div></div>`;
+      return;
     }
 
-    streamError.style.display = 'none';
-    videoSection.classList.remove('d-none');
-    document.getElementById('connectBtn').classList.add('d-none');
-    document.getElementById('disconnectBtn').classList.remove('d-none');
-    showStatus('Connected — AI analysis starting in background.', 'success');
-    startWebSocket();
+    // Choose column width based on count
+    const colClass = camIds.length === 1 ? 'col-12' : camIds.length <= 2 ? 'col-md-6' : 'col-md-6 col-xl-4';
+
+    grid.innerHTML = camIds.map(id => `
+      <div class="${colClass}">
+        <div class="cam-tile">
+          <img id="feed-${escAttr(id)}" alt="Feed ${escHtml(id)}">
+          <span class="cam-label">${escHtml(id)}</span>
+          <button class="cam-remove" onclick="removeCamera('${escAttr(id)}')">✕ Remove</button>
+        </div>
+      </div>`).join('');
+
+    // Start WebSocket for any new cameras
+    camIds.forEach(id => startCamWs(id));
   }
 
-  async function disconnectStream() {
-    stopWebSocket();
-    videoSection.classList.add('d-none');
-    streamError.style.display = 'none';
-    document.getElementById('connectBtn').classList.remove('d-none');
-    document.getElementById('disconnectBtn').classList.add('d-none');
-    showStatus('', 'muted');
-    await fetch('/cameras/set-stream', {
+  // ── Add / remove cameras ──────────────────────────────────────────────────
+
+  async function addCamera() {
+    const camId = document.getElementById('newCamId').value.trim();
+    const url   = document.getElementById('newCamUrl').value.trim();
+    if (!camId) { showAddStatus('Camera ID is required.', 'danger'); return; }
+    if (!url)   { showAddStatus('Stream URL is required.', 'danger'); return; }
+
+    showAddStatus('Connecting…', 'muted');
+    const res = await fetch('/cameras/streams', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({url: ''}),
-    });
+      body: JSON.stringify({cam_id: camId, url}),
+    }).catch(() => null);
+    if (!res || !res.ok) {
+      const err = res ? (await res.json()).error : 'Network error';
+      showAddStatus(err, 'danger'); return;
+    }
+    const data = await res.json();
+    activeCams = data.streams;
+    renderGrid();
+    updateCamFilter();
+    document.getElementById('newCamId').value = '';
+    document.getElementById('newCamUrl').value = '';
+    showAddStatus(`Connected: ${camId}`, 'success');
   }
 
-  function showStatus(msg, type) {
-    statusMsg.className = `mt-2 small text-${type}`;
-    statusMsg.textContent = msg;
+  async function removeCamera(camId) {
+    stopCamWs(camId);
+    const res = await fetch(`/cameras/streams/${encodeURIComponent(camId)}`, {
+      method: 'DELETE',
+    }).catch(() => null);
+    if (res && res.ok) {
+      const data = await res.json();
+      activeCams = data.streams;
+    } else {
+      delete activeCams[camId];
+    }
+    renderGrid();
+    updateCamFilter();
   }
 
-  function setConnectBtns(disabled) {
-    document.getElementById('connectBtn').disabled    = disabled;
-    document.getElementById('disconnectBtn').disabled = disabled;
+  async function loadStreams() {
+    const res = await fetch('/cameras/streams').catch(() => null);
+    if (!res || !res.ok) return;
+    const data = await res.json();
+    activeCams = data.streams || {};
+    renderGrid();
+    updateCamFilter();
+  }
+
+  function showAddStatus(msg, type) {
+    const el = document.getElementById('addCamStatus');
+    el.className = `mt-2 small text-${type}`;
+    el.textContent = msg;
   }
 
   // ── Query management ──────────────────────────────────────────────────────
 
   let queries = [];
+  let allEvents = [];
 
   function renderQueries() {
     const el = document.getElementById('queryList');
@@ -227,8 +289,7 @@
   async function loadQueries() {
     const res  = await fetch('/cameras/queries').catch(() => null);
     if (!res || !res.ok) return;
-    const data = await res.json();
-    queries = data.queries;
+    queries = (await res.json()).queries;
     renderQueries();
   }
 
@@ -236,41 +297,63 @@
     const input = document.getElementById('queryInput');
     const text  = input.value.trim();
     if (!text) return;
-    const res  = await fetch('/cameras/queries', {
+    const res = await fetch('/cameras/queries', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({text}),
     }).catch(() => null);
     if (!res || !res.ok) return;
-    const data = await res.json();
-    queries = data.queries;
+    queries = (await res.json()).queries;
     renderQueries();
     input.value = '';
+    pollQueryStatus();
   }
 
   async function removeQuery(index) {
-    const res  = await fetch(`/cameras/queries/${index}`, {method: 'DELETE'}).catch(() => null);
+    const res = await fetch(`/cameras/queries/${index}`, {method: 'DELETE'}).catch(() => null);
+    if (!res || !res.ok) return;
+    queries = (await res.json()).queries;
+    renderQueries();
+    pollQueryStatus();
+  }
+
+  // ── Query status ──────────────────────────────────────────────────────────
+
+  let queryStatusTimer = null;
+
+  async function pollQueryStatus() {
+    const res = await fetch('/cameras/queries/status').catch(() => null);
     if (!res || !res.ok) return;
     const data = await res.json();
-    queries = data.queries;
-    renderQueries();
+    const el   = document.getElementById('queryStatusMsg');
+
+    if (data.state === 'updating') {
+      const eta = data.eta_s ? ` (~${data.eta_s}s remaining)` : '';
+      el.textContent = `⏳ Updating query engine${eta} — detection continues with current queries.`;
+      el.classList.remove('d-none');
+      // Poll again in 3s while updating
+      clearTimeout(queryStatusTimer);
+      queryStatusTimer = setTimeout(pollQueryStatus, 3000);
+    } else {
+      el.classList.add('d-none');
+    }
   }
 
   // ── Event log ─────────────────────────────────────────────────────────────
 
   function renderEvents(events) {
-    const el    = document.getElementById('eventLog');
     const badge = document.getElementById('eventCount');
     badge.textContent = events.length ? `${events.length} event${events.length > 1 ? 's' : ''}` : '';
 
+    const el = document.getElementById('eventLog');
     if (events.length === 0) {
       el.innerHTML = '<p class="empty-hint mb-0">No events yet. Connect a stream and add scene queries to start detection.</p>';
       return;
     }
 
-    // Show most recent first
     const rows = [...events].reverse().map(e => {
-      const ts   = e.timestamp.replace('T', ' ');
-      const conf = `${Math.round(e.confidence * 100)}% match`;
+      const ts    = e.timestamp.replace('T', ' ');
+      const conf  = `${Math.round(e.confidence * 100)}% match`;
+      const camId = e.cam_id || '';
       const thumb = e.image_b64
         ? `<img class="event-thumb" src="data:image/jpeg;base64,${e.image_b64}" alt="crop">`
         : `<div class="event-thumb-placeholder"></div>`;
@@ -281,18 +364,35 @@
             <span>🔍 ${escHtml(e.query)}</span>
             <span class="event-conf">${conf}</span>
           </div>
-          <div class="event-ts">${ts}</div>
+          <div class="d-flex gap-2 mt-1">
+            ${camId ? `<span class="event-cam">${escHtml(camId)}</span>` : ''}
+            <span class="event-ts">${ts}</span>
+          </div>
         </div>
       </div>`;
     }).join('');
     el.innerHTML = rows;
   }
 
+  function filterEvents() {
+    const camId = document.getElementById('camFilter').value;
+    const filtered = camId ? allEvents.filter(e => e.cam_id === camId) : allEvents;
+    renderEvents(filtered);
+  }
+
+  function updateCamFilter() {
+    const sel  = document.getElementById('camFilter');
+    const cur  = sel.value;
+    const cams = Object.keys(activeCams);
+    sel.innerHTML = '<option value="">All cameras</option>' +
+      cams.map(id => `<option value="${escAttr(id)}"${cur === id ? ' selected' : ''}>${escHtml(id)}</option>`).join('');
+  }
+
   async function pollEvents() {
     const res = await fetch('/cameras/events').catch(() => null);
     if (res && res.ok) {
-      const data = await res.json();
-      renderEvents(data.events);
+      allEvents = (await res.json()).events;
+      filterEvents();
     }
     setTimeout(pollEvents, 5000);
   }
@@ -300,7 +400,10 @@
   // ── Utilities ─────────────────────────────────────────────────────────────
 
   function escHtml(str) {
-    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+  function escAttr(str) {
+    return String(str).replace(/"/g,'&quot;').replace(/'/g,'&#39;');
   }
 
   // ── Debug overlay ─────────────────────────────────────────────────────────
@@ -331,38 +434,13 @@
     document.getElementById('thresholdVal').textContent = threshold.toFixed(2);
   }
 
-  // ── Crop padding ──────────────────────────────────────────────────────────
-
-  async function updatePad(val) {
-    const v = parseFloat(val);
-    document.getElementById('padVal').textContent = v.toFixed(2);
-    await fetch('/cameras/pad', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({value: v}),
-    });
-  }
-
-  async function loadPad() {
-    const res = await fetch('/cameras/pad').catch(() => null);
-    if (!res || !res.ok) return;
-    const {pad} = await res.json();
-    document.getElementById('padSlider').value = pad;
-    document.getElementById('padVal').textContent = pad.toFixed(2);
-  }
-
   // ── Init ─────────────────────────────────────────────────────────────────
 
+  loadStreams();
   loadQueries();
   loadThreshold();
-  loadPad();
   pollEvents();
-
-  {% if current_url %}
-  document.getElementById('connectBtn').classList.add('d-none');
-  document.getElementById('disconnectBtn').classList.remove('d-none');
-  showStatus('Stream active — AI analysis running.', 'success');
-  startWebSocket();
-  {% endif %}
+  pollQueryStatus();
 </script>
 
 </body>

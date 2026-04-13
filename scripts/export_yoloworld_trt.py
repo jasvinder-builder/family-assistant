@@ -67,10 +67,11 @@ def export(model_name: str, queries: list[str], img_size: int) -> None:
 
     shutil.move(engine_path, dest_engine)
     dest_meta.write_text(json.dumps({
-        "model":   model_name,
-        "queries": queries,
-        "imgsz":   img_size,
-        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "model":          model_name,
+        "queries":        queries,   # active queries (what the user wants)
+        "engine_queries": queries,   # queries baked into TRT at export time — do NOT update on query change
+        "imgsz":          img_size,
+        "exported_at":    time.strftime("%Y-%m-%dT%H:%M:%S"),
     }, indent=2))
 
     size_mb = dest_engine.stat().st_size / 1e6

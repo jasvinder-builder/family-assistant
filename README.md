@@ -1,6 +1,6 @@
 # Bianca — Family Assistant
 
-Bianca is a family assistant that runs entirely on local hardware — no cloud AI, no subscriptions. It handles day-to-day task and event management, acts as a household knowledge base powered by a local LLM with web search, sends proactive reminders via WhatsApp, and runs a production-grade real-time home surveillance pipeline. Video is decoded and processed entirely on the GPU — from RTSP ingest through object detection — using NVIDIA DeepStream for hardware-accelerated NVDEC decoding and NVIDIA Triton Inference Server serving a YOLO-World TRT engine, so the CPU is never involved in the video path. Surveillance alerts are defined in plain English: type a query like "person near the gate" or "child in the garden" and Bianca starts alerting on it immediately — no retraining required.
+Bianca is a family assistant that runs entirely on local hardware — no cloud AI, no subscriptions. It handles day-to-day task and event management, acts as a household knowledge base powered by a local LLM with web search, sends proactive reminders via WhatsApp, and runs a production-grade real-time home surveillance pipeline. Video is decoded and processed entirely on the GPU — from RTSP ingest through object detection — using NVIDIA DeepStream for hardware-accelerated NVDEC decoding and NVIDIA Triton Inference Server serving a YOLO-World TRT engine, so the CPU is never involved in the video path. Surveillance alerts are defined in plain English: type a query like "person near the gate" or "child in the garden"; Bianca re-exports the YOLO-World TRT engine with the new text embeddings (~90s, Qwen temporarily paused to free VRAM) and starts alerting on it — no retraining required.
 
 **Full architecture and call flow:** see [`ARCHITECTURE.md`](ARCHITECTURE.md)
 
@@ -54,7 +54,7 @@ graph TD
 - **Bulls and Cows** — crack Bianca's secret 4-digit code; say each digit aloud; bulls = right digit right place, cows = right digit wrong place
 - **Word Ladder** — change one letter at a time to climb from the start word to the target; BFS-powered hints; Qwen generates kid-friendly puzzles
 - **20 Questions** — think of an animal, food, object, or place; Bianca asks up to 20 yes/no questions and tries to guess it using Qwen
-- **Cameras** — live view of RTSP streams or local video files via DeepStream NVDEC hardware decode; YOLO-World M TRT engine on Triton Inference Server detects objects matching user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa") at ~8ms per frame; _SimpleTracker assigns persistent track IDs; matched events logged in real time
+- **Cameras** — live view of RTSP streams or local video files via DeepStream NVDEC hardware decode; YOLO-World M TRT engine on Triton Inference Server detects objects matching user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa") at ~8ms per frame; _SimpleTracker assigns persistent track IDs; matched events logged in real time; changing queries triggers a ~90s TRT re-export (Qwen temporarily paused to free VRAM) after which the new classes are active
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events
@@ -254,14 +254,14 @@ family-assistant/
 │   └── yoloworld.meta.json   # Queries baked into engine + imgsz metadata
 │
 ├── scripts/
-│   ├── benchmark_yoloworld.py    # Phase 1: YOLO-World PyTorch fp16 benchmark
-│   ├── export_yoloworld_trt.py   # Phase 2: Export to TRT engine
-│   ├── test_deepstream_capture.py    # Phase 3: DeepStream NVDEC decode test
-│   ├── test_deepstream_inference.py  # Phase 4: DeepStream → Triton inference test
-│   └── ollama-entrypoint.sh  # Auto-pulls qwen2.5:14b on first Ollama container start
-│
-├── scripts/
-│   └── ollama-entrypoint.sh  # Auto-pulls qwen2.5:14b on first Ollama container start
+│   ├── benchmark_yoloworld.py        # Phase 1: YOLO-World PyTorch fp16 benchmark
+│   ├── export_yoloworld_trt.py       # Phase 2: Export YOLO-World M to TRT engine
+│   ├── test_deepstream_capture.py    # Phase 3: DeepStream NVDEC single-camera decode test
+│   ├── test_deepstream_inference.py  # Phase 4: DeepStream → Triton YOLO-World inference test
+│   ├── test_deepstream_multicam.py   # Phase 5: DeepStream multi-camera (nvmultistreamtiler) test
+│   ├── test_service.py               # Phase 6: deepstream_service standalone API test (37/37)
+│   ├── test_service_quality.py       # Phase 6 QA: colour correctness, EOS looping, FastAPI app
+│   └── ollama-entrypoint.sh          # Auto-pulls qwen2.5:14b on first Ollama container start
 │
 ├── handlers/
 │   ├── call_handler.py       # Twilio webhooks, async filler+compute pattern
@@ -281,8 +281,7 @@ family-assistant/
 │   ├── session_store.py      # In-memory sessions for async phone call flow
 │   ├── reminder_service.py   # APScheduler — proactive WhatsApp event reminders
 │   ├── hangman_service.py    # Hangman game logic and in-memory game state
-│   ├── camera_service.py     # RTSP/file VideoCapture → MJPEG generator; shares frames with scene_service
-│   ├── scene_service.py      # Grounding DINO Tiny via GDINO FastAPI (httpx POST) + _SimpleTracker (IoU); query management; event log
+│   ├── deepstream_service.py # DeepStream NVDEC pipeline + YOLO-World TRT inference; replaces camera_service + scene_service
 │   ├── bulls_cows_service.py # Bulls and Cows game state and spoken-digit parser
 │   ├── word_ladder_service.py # Word Ladder — BFS validation, system dictionary word set, hint generation
 │   └── twenty_questions_service.py # 20 Questions — multi-turn Qwen session, phase management
