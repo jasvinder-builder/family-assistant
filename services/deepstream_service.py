@@ -44,7 +44,7 @@ _triton_raw  = os.environ.get("TRITON_URL", "localhost:8001")
 _triton_host = _triton_raw.split(":")[0]
 TRITON_HTTP_URL = f"{_triton_host}:8002"
 
-META_JSON_PATH    = "/app/models/yoloworld.meta.json"
+META_JSON_PATH    = os.environ.get("META_JSON_PATH", "/app/models/yoloworld.meta.json")
 
 DISPLAY_FPS       = 25
 INFER_FPS         = 10       # max inference calls per camera per second
@@ -250,10 +250,6 @@ def _do_query_update(new_queries: list[str]) -> None:
     logger.info("Updating queries to %s", new_queries)
     _save_queries_to_meta(new_queries)
     _triton_reload_model()
-
-    with _queries_lock:
-        _queries.clear()
-        _queries.extend(new_queries)
 
     with _query_status_lock:
         _query_status["state"] = "ready"
@@ -768,6 +764,8 @@ def add_query(text: str) -> bool:
         if text in _queries:
             return False
         new = list(_queries) + [text]
+        _queries.clear()
+        _queries.extend(new)   # update in-memory immediately
     threading.Thread(
         target=_query_update_worker, args=(new,), daemon=True, name="query-update"
     ).start()
@@ -779,6 +777,8 @@ def remove_query(index: int) -> bool:
         if not (0 <= index < len(_queries)):
             return False
         new = [q for i, q in enumerate(_queries) if i != index]
+        _queries.clear()
+        _queries.extend(new)   # update in-memory immediately
     threading.Thread(
         target=_query_update_worker, args=(new,), daemon=True, name="query-update"
     ).start()

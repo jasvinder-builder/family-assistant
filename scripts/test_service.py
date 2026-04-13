@@ -36,14 +36,15 @@ parser.add_argument("--triton",   default="localhost:8002",
 parser.add_argument("--duration", type=int, default=60)
 args = parser.parse_args()
 
-# Inject TRITON_URL so the service derives HTTP URL correctly
+# Inject env vars before service import so module-level constants pick them up
 triton_host = args.triton.split(":")[0]
-os.environ["TRITON_URL"] = f"{triton_host}:8001"
+os.environ["TRITON_URL"]     = f"{triton_host}:8001"
+os.environ["META_JSON_PATH"] = "/workspace/models/yoloworld.meta.json"
 
 # Add project root to path
 sys.path.insert(0, "/workspace")
 
-import deepstream_service as ds  # noqa: E402 (import after env setup)
+from services import deepstream_service as ds  # noqa: E402 (import after env setup)
 
 
 PASS = "\033[32mPASS\033[0m"
