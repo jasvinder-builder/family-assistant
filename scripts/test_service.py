@@ -218,16 +218,29 @@ if got_events:
 # ── Test 7: ws_frame_generator (async) ───────────────────────────────────────
 print("\n=== Test 7: ws_frame_generator yields JPEG frames ===")
 
+# File sources hit EOS — restart the stream before testing the generator
+print("  Restarting stream (file may have hit EOS)...")
+ds.add_stream("cam0", args.source)
+time.sleep(3)   # let pipeline reach PLAYING
+
 async def _test_ws_gen():
     frames = []
     gen = ds.ws_frame_generator("cam0")
-    try:
+
+    async def _collect():
         async for chunk in gen:
             frames.append(chunk)
             if len(frames) >= 5:
                 break
+
+    try:
+        await asyncio.wait_for(_collect(), timeout=10.0)
+    except asyncio.TimeoutError:
+        pass
     except Exception as exc:
         return False, str(exc)
+    finally:
+        await gen.aclose()
     return len(frames) >= 5, f"{len(frames)} frames"
 
 ok_ws, detail_ws = asyncio.run(_test_ws_gen())

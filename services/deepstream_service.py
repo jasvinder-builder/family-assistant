@@ -616,6 +616,24 @@ def _build_and_start_pipeline(stream_map: dict[str, str]) -> None:
     _pipeline = pipeline
     logger.info("DeepStream pipeline started (%d camera(s))", n)
 
+    # Watch bus for EOS — restart pipeline so file sources loop
+    def _bus_watch(bus, msg, pipeline_ref):
+        from gi.repository import Gst as _Gst
+        if msg.type == _Gst.MessageType.EOS:
+            logger.info("Pipeline EOS — seeking to start for loop")
+            pipeline_ref.seek_simple(
+                _Gst.Format.TIME,
+                _Gst.SeekFlags.FLUSH | _Gst.SeekFlags.KEY_UNIT,
+                0,
+            )
+        elif msg.type == _Gst.MessageType.ERROR:
+            err, dbg = msg.parse_error()
+            logger.warning("Pipeline error: %s (%s)", err, dbg)
+        return True  # keep watching
+
+    bus = pipeline.get_bus()
+    bus.add_watch(0, _bus_watch, pipeline)
+
 
 def _stop_pipeline() -> None:
     global _pipeline
