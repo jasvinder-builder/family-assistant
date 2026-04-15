@@ -25,6 +25,9 @@ import json
 import logging
 import os
 import queue
+import subprocess
+import struct
+import sys
 import threading
 import time
 from collections import deque
@@ -158,13 +161,15 @@ class CameraEvent:
 _pipeline_lock = threading.Lock()
 _rebuild_lock  = threading.Lock()      # serialises concurrent _rebuild calls
 _streams: dict[str, str] = {}          # cam_id → uri (ordered by insertion)
-_pipeline      = None                   # Gst.Pipeline | None
-_pipeline_stop = threading.Event()
+
+# Subprocess that owns the GStreamer pipeline (isolated from asyncio)
+_worker_proc:         Optional[subprocess.Popen] = None
+_frame_reader_thread: Optional[threading.Thread] = None
 
 _inference_thread: Optional[threading.Thread] = None
 _infer_stop        = threading.Event()
 
-# Leaky inference slots: cam_id → (frame, timestamp) | None
+# Leaky inference slots: cam_id → (jpeg_bytes | ndarray, timestamp) | None
 _infer_slots:      dict[str, Optional[tuple]] = {}
 _infer_slots_lock  = threading.Lock()
 _infer_event       = threading.Event()
@@ -230,79 +235,104 @@ def _commit_queries(new_queries: list[str]) -> None:
 
 
 
-# ── GStreamer appsink callback ─────────────────────────────────────────────────
+# ── Frame-reader helpers (subprocess stdout → broadcast + inference) ──────────
 
-def _on_new_sample(appsink, _userdata):
+def _read_exactly(buf, n: int) -> Optional[bytes]:
+    """Read exactly n bytes from a binary file-like object. Returns None on EOF."""
+    data = b""
+    while len(data) < n:
+        chunk = buf.read(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+def _apply_debug_overlay(cam_id: str, jpeg_bytes: bytes) -> bytes:
+    """Decode JPEG, draw detection boxes, re-encode. Used when debug overlay is on."""
+    frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        return jpeg_bytes
+    with _det_lock:
+        dets = list(_detections.get(cam_id, []))
+    for det in dets:
+        x1, y1, x2, y2 = det.box
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            frame, f"{det.label} #{det.track_id}",
+            (x1, max(0, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+        )
+    ok_jpg, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    return buf.tobytes() if ok_jpg else jpeg_bytes
+
+
+def _frame_reader(proc: subprocess.Popen, streams_snapshot: dict) -> None:
     """
-    Receives one tiled frame (height × width*N_cams).
-    Slices into per-camera frames.
-    Throttled broadcast at DISPLAY_FPS; throttled inference push at INFER_FPS.
+    Read JPEG frames from the pipeline subprocess stdout.
+    Each frame: [4B cam_id len][cam_id][4B jpeg len][jpeg]
+    EOS marker:  [4B = 0]
+
+    On subprocess exit (including EOS), trigger a pipeline restart so that
+    file sources loop and RTSP sources reconnect.
     """
-    sample = appsink.emit("pull-sample")
-    if not sample:
-        from gi.repository import Gst
-        return Gst.FlowReturn.OK
+    src = proc.stdout
+    try:
+        while True:
+            hdr = _read_exactly(src, 4)
+            if hdr is None:
+                break
+            cam_id_len = struct.unpack(">I", hdr)[0]
+            if cam_id_len == 0:
+                logger.info("Pipeline worker sent EOS")
+                break
 
-    buf  = sample.get_buffer()
-    caps = sample.get_caps()
-    s    = caps.get_structure(0)
-    w    = s.get_int("width").value
-    h    = s.get_int("height").value
+            cam_id_bytes = _read_exactly(src, cam_id_len)
+            if cam_id_bytes is None:
+                break
+            cam_id = cam_id_bytes.decode("utf-8")
 
-    from gi.repository import Gst
-    ok, minfo = buf.map(Gst.MapFlags.READ)
-    if not ok:
-        return Gst.FlowReturn.OK
+            jpeg_len_hdr = _read_exactly(src, 4)
+            if jpeg_len_hdr is None:
+                break
+            jpeg_len = struct.unpack(">I", jpeg_len_hdr)[0]
 
-    # nvvideoconvert outputs RGBA; convert to BGR for cv2 compatibility
-    tiled = (
-        np.frombuffer(minfo.data, dtype=np.uint8)
-        .reshape(h, w, 4)[:, :, 2::-1]   # RGBA → BGR (channels 2,1,0)
-        .copy()
-    )
-    buf.unmap(minfo)
+            jpeg_bytes = _read_exactly(src, jpeg_len)
+            if jpeg_bytes is None or len(jpeg_bytes) != jpeg_len:
+                break
 
-    cam_ids = list(_streams.keys())
-    n       = len(cam_ids)
-    if n == 0:
-        return Gst.FlowReturn.OK
-
-    now     = time.monotonic()
-    cam_w   = CAM_WIDTH   # each slice is CAM_WIDTH wide
-
-    for i, cam_id in enumerate(cam_ids):
-        frame = tiled[:, i * cam_w : (i + 1) * cam_w, :]
-
-        # ── Display broadcast (25fps) ────────────────────────────────────────
-        if now - _last_display.get(cam_id, 0.0) >= 1.0 / DISPLAY_FPS:
-            _last_display[cam_id] = now
-            disp = frame
+            # Optional debug overlay (decode → draw → re-encode)
             if _debug_overlay:
-                disp = frame.copy()
-                with _det_lock:
-                    dets = list(_detections.get(cam_id, []))
-                for det in dets:
-                    x1, y1, x2, y2 = det.box
-                    cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(
-                        disp, f"{det.label} #{det.track_id}",
-                        (x1, max(0, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
-                    )
-            ok_jpg, jpeg = cv2.imencode(
-                ".jpg", disp, [cv2.IMWRITE_JPEG_QUALITY, 70]
-            )
-            if ok_jpg:
-                _broadcast(cam_id, jpeg.tobytes())
+                jpeg_bytes = _apply_debug_overlay(cam_id, jpeg_bytes)
 
-        # ── Inference slot (10fps) ───────────────────────────────────────────
-        if now - _last_infer.get(cam_id, 0.0) >= 1.0 / INFER_FPS:
-            _last_infer[cam_id] = now
-            with _infer_slots_lock:
-                _infer_slots[cam_id] = (frame.copy(), now)
-            _infer_event.set()
+            _broadcast(cam_id, jpeg_bytes)
 
-    return Gst.FlowReturn.OK
+            # Inference slot throttled to INFER_FPS
+            now = time.monotonic()
+            if now - _last_infer.get(cam_id, 0.0) >= 1.0 / INFER_FPS:
+                _last_infer[cam_id] = now
+                with _infer_slots_lock:
+                    _infer_slots[cam_id] = (jpeg_bytes, now)
+                _infer_event.set()
+
+    except Exception as exc:
+        logger.error("Frame reader error: %s", exc)
+    finally:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    # Restart if this is still the active worker (not a superseded one)
+    global _worker_proc
+    if _worker_proc is proc and streams_snapshot:
+        logger.info("Pipeline worker exited — restarting for file-loop / RTSP reconnect")
+        threading.Thread(
+            target=_rebuild,
+            args=(streams_snapshot,),
+            daemon=True,
+            name="ds-eos-restart",
+        ).start()
 
 
 # ── Subscriber management ─────────────────────────────────────────────────────
@@ -389,14 +419,22 @@ def _inference_loop() -> None:
         if not queries:
             continue
 
-        for cam_id, (frame, _ts) in slots.items():
+        for cam_id, (frame_or_jpeg, _ts) in slots.items():
             if _infer_stop.is_set():
                 return
 
-            ok, jpeg_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if not ok:
-                continue
-            jpeg_bytes = jpeg_buf.tobytes()
+            # _infer_slots stores either JPEG bytes (subprocess path) or numpy
+            # arrays (legacy in-process path).  Normalise to jpeg_bytes for Triton;
+            # keep frame=None so numpy is only decoded when actually needed (crops).
+            if isinstance(frame_or_jpeg, bytes):
+                jpeg_bytes = frame_or_jpeg
+                frame      = None   # lazy-decoded below only if needed
+            else:
+                frame = frame_or_jpeg
+                ok, jpeg_buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if not ok:
+                    continue
+                jpeg_bytes = jpeg_buf.tobytes()
 
             img_in = triton_http.InferInput("IMAGE", [len(jpeg_bytes)], "UINT8")
             img_in.set_data_from_numpy(
@@ -430,6 +468,13 @@ def _inference_loop() -> None:
                 class_ids,
             )
 
+            # Decode JPEG to numpy only if we need pixel dimensions / crops
+            if frame is None:
+                frame = cv2.imdecode(
+                    np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR
+                )
+            if frame is None:
+                continue
             h, w = frame.shape[:2]
             now  = time.monotonic()
             dets: list[Detection] = []
@@ -500,138 +545,65 @@ def _inference_loop() -> None:
     logger.info("Inference loop stopped")
 
 
-# ── Pipeline ──────────────────────────────────────────────────────────────────
+# ── Pipeline subprocess management ───────────────────────────────────────────
 
-def _build_and_start_pipeline(stream_map: dict[str, str]) -> None:
-    """Build a new DeepStream pipeline for all streams and start it."""
-    global _pipeline
+# Path to pipeline_worker.py — same directory as this service file
+_WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "pipeline_worker.py")
 
-    import gi
-    gi.require_version("Gst", "1.0")
-    from gi.repository import Gst
-    Gst.init(None)
 
-    n = len(stream_map)
-    if n == 0:
+def _start_pipeline_worker(stream_map: dict[str, str]) -> None:
+    """Spawn pipeline_worker.py as a subprocess, start the frame-reader thread."""
+    global _worker_proc, _frame_reader_thread
+
+    if not stream_map:
         return
 
-    cam_ids = list(stream_map.keys())
+    cmd = [sys.executable, _WORKER_SCRIPT, json.dumps(stream_map)]
+    logger.info("Spawning pipeline worker: %s", cmd)
 
-    pipeline   = Gst.Pipeline.new("ds-pipeline")
-    streammux  = Gst.ElementFactory.make("nvstreammux",        "mux")
-    tiler      = Gst.ElementFactory.make("nvmultistreamtiler", "tiler")
-    convert    = Gst.ElementFactory.make("nvvideoconvert",     "convert")
-    capsfilter = Gst.ElementFactory.make("capsfilter",         "caps")
-    sink       = Gst.ElementFactory.make("appsink",            "sink")
-
-    for name, el in [("nvstreammux", streammux), ("nvmultistreamtiler", tiler),
-                     ("nvvideoconvert", convert), ("capsfilter", capsfilter),
-                     ("appsink", sink)]:
-        if el is None:
-            logger.error("Could not create GStreamer element '%s'", name)
-            return
-
-    streammux.set_property("batch-size",           n)
-    streammux.set_property("width",                CAM_WIDTH)
-    streammux.set_property("height",               CAM_HEIGHT)
-    streammux.set_property("batched-push-timeout", 40000)
-
-    tiler.set_property("rows",    1)
-    tiler.set_property("columns", n)
-    tiler.set_property("width",   CAM_WIDTH * n)
-    tiler.set_property("height",  CAM_HEIGHT)
-
-    capsfilter.set_property(
-        "caps", Gst.Caps.from_string("video/x-raw,format=RGBA")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stdin=subprocess.PIPE,
+        # stderr inherits — logs appear in `docker logs bianca-deepstream`
     )
-    sink.set_property("emit-signals", True)
-    sink.set_property("max-buffers",  2)
-    sink.set_property("drop",         True)
-    sink.set_property("sync",         False)
-    sink.connect("new-sample", _on_new_sample, None)
+    _worker_proc = proc
+    logger.info("Pipeline worker started PID=%d", proc.pid)
 
-    for el in [streammux, tiler, convert, capsfilter, sink]:
-        pipeline.add(el)
-    streammux.link(tiler)
-    tiler.link(convert)
-    convert.link(capsfilter)
-    capsfilter.link(sink)
-
-    for i, (cam_id, uri) in enumerate(stream_map.items()):
-        src = Gst.ElementFactory.make("nvurisrcbin", f"src-{cam_id}")
-        if src is None:
-            logger.error("Could not create nvurisrcbin for %s", cam_id)
-            return
-        src.set_property("uri", uri)
-
-        def on_pad_added(src_bin, new_pad, sink_id=i):
-            try:
-                sp = streammux.request_pad_simple(f"sink_{sink_id}")
-            except AttributeError:
-                sp = streammux.get_request_pad(f"sink_{sink_id}")
-            if sp and not sp.is_linked():
-                ret = new_pad.link(sp)
-                if ret == Gst.PadLinkReturn.OK:
-                    logger.info("cam%d → nvstreammux:sink_%d linked", sink_id, sink_id)
-
-        src.connect("pad-added", on_pad_added)
-        pipeline.add(src)
-
-    ret = pipeline.set_state(Gst.State.PLAYING)
-    if ret == Gst.StateChangeReturn.FAILURE:
-        logger.error("DeepStream pipeline failed to start")
-        pipeline.set_state(Gst.State.NULL)
-        return
-
-    _pipeline = pipeline
-    logger.info("DeepStream pipeline started (%d camera(s))", n)
-
-    # Poll the bus in a background thread — bus.add_watch() needs a GLib main
-    # loop which uvicorn/asyncio never starts, so callbacks would never fire.
-    # On EOS, restart the whole pipeline rather than seeking: nvurisrcbin does
-    # not reliably support seek for file sources in this DeepStream build.
-    def _bus_poll(pipeline_ref):
-        from gi.repository import Gst as _Gst
-        bus = pipeline_ref.get_bus()
-        while True:
-            msg = bus.timed_pop_filtered(
-                100 * _Gst.MSECOND,
-                _Gst.MessageType.EOS | _Gst.MessageType.ERROR,
-            )
-            if msg is None:
-                if pipeline_ref.get_state(0)[1] == _Gst.State.NULL:
-                    break
-                continue
-            if msg.type == _Gst.MessageType.EOS:
-                logger.info("Pipeline EOS — restarting pipeline for file loop")
-                # Snapshot the stream map at EOS time so the restart uses the
-                # same sources even if add_stream/remove_stream races in.
-                streams_snapshot = dict(_streams)
-                threading.Thread(
-                    target=_rebuild,
-                    args=(streams_snapshot,),
-                    daemon=True,
-                    name="ds-eos-restart",
-                ).start()
-                break  # new bus poll thread started by _rebuild/_build_and_start_pipeline
-            elif msg.type == _Gst.MessageType.ERROR:
-                err, dbg = msg.parse_error()
-                logger.warning("Pipeline error: %s (%s)", err, dbg)
-                break
-
-    threading.Thread(target=_bus_poll, args=(pipeline,), daemon=True,
-                     name="ds-bus-poll").start()
+    _frame_reader_thread = threading.Thread(
+        target=_frame_reader,
+        args=(proc, dict(stream_map)),
+        daemon=True,
+        name="ds-frame-reader",
+    )
+    _frame_reader_thread.start()
 
 
 def _stop_pipeline() -> None:
-    global _pipeline
-    if _pipeline is not None:
+    global _worker_proc, _frame_reader_thread
+
+    if _worker_proc is not None:
+        proc = _worker_proc
+        _worker_proc = None   # clear first so frame_reader doesn't restart
         try:
-            _pipeline.set_state(__import__("gi").repository.Gst.State.NULL)
+            if proc.stdin:
+                proc.stdin.write(b"STOP\n")
+                proc.stdin.flush()
         except Exception:
             pass
-        _pipeline = None
-        logger.info("DeepStream pipeline stopped")
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        logger.info("Pipeline worker stopped")
+
+    if _frame_reader_thread and _frame_reader_thread.is_alive():
+        _frame_reader_thread.join(timeout=3)
+    _frame_reader_thread = None
 
 
 def _stop_inference() -> None:
@@ -680,7 +652,7 @@ def _rebuild(new_streams: dict[str, str]) -> None:
         _streams = dict(new_streams)
 
         if _streams:
-            _build_and_start_pipeline(_streams)
+            _start_pipeline_worker(_streams)
             _start_inference()
             logger.info("DeepStream service running: %s", list(_streams.keys()))
         else:
@@ -897,7 +869,7 @@ async def _add_stream(payload: dict):
         return _JSONResponse({"error": "cam_id is required"}, status_code=400)
     if not url:
         return _JSONResponse({"error": "url is required"}, status_code=400)
-    add_stream(cam_id, url)
+    await asyncio.to_thread(add_stream, cam_id, url)
     return _JSONResponse({"ok": True, "streams": get_streams()})
 
 
@@ -905,7 +877,7 @@ async def _add_stream(payload: dict):
 async def _remove_stream(cam_id: str):
     if cam_id not in get_streams():
         return _JSONResponse({"error": f"stream '{cam_id}' not found"}, status_code=404)
-    remove_stream(cam_id)
+    await asyncio.to_thread(remove_stream, cam_id)
     return _JSONResponse({"ok": True, "streams": get_streams()})
 
 

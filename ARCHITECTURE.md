@@ -47,7 +47,7 @@ Browser/Twilio ──HTTPS──► app:8000 ──HTTP──► whisper:8080   
 | Messaging | Twilio WhatsApp API | Async research + reminder delivery |
 | Storage | Markdown file (`family.md`) | Human-readable, editable, no DB setup |
 | File locking | `filelock` | Prevents concurrent write corruption |
-| Video ingest | DeepStream 7.0 — nvurisrcbin → nvstreammux → nvmultistreamtiler → appsink | 100% NVDEC GPU decode; CPU never touches video data; leaky queue decouples decode (48fps) from inference (10fps) |
+| Video ingest | DeepStream 7.0 — `pipeline_worker.py` subprocess: rtspsrc → nvv4l2decoder → nvvideoconvert → nvjpegenc → appsink | 100% NVDEC GPU decode; frame stays in NVMM until final JPEG bytes; subprocess isolation avoids asyncio↔rtspsrc SIGABRT |
 | Scene detection | YOLO-World M TRT via Triton 25.03 | Open-vocabulary detection; 8ms median @ 1280×720; queries updated without TRT re-export |
 | Object tracking | `_SimpleTracker` (pure-numpy IoU) | Persistent track IDs, deduplication; CPU-only; no pybind11/supervision |
 | Inference serving | NVIDIA Triton Inference Server 25.03 (Python backend + TRT) | Model management API enables live query swaps; HTTP :8002 for inference + model control |
@@ -66,7 +66,7 @@ Browser/Twilio ──HTTPS──► app:8000 ──HTTP──► whisper:8080   
 | Qwen 2.5:14b Q4_K_M (Ollama) | ~9–10 GB | Always hot; loaded at startup |
 | Whisper large-v3 int8_float16 | ~1.5 GB | Always loaded; not active during Qwen inference |
 | YOLO-World M TRT engine (Triton) | ~0.3 GB | Loaded at triton startup; persistent |
-| DeepStream pipeline buffers | ~0.5 GB | nvstreammux frame batches; scales with camera count |
+| DeepStream pipeline buffers | ~0.3 GB | Per-camera nvv4l2decoder + NVMM buffers; scales with camera count |
 | **Steady-state total** | **~12.3 GB** | ~3.7 GB headroom |
 
 Note: Whisper and Qwen never run at the same time. TRT re-export (if needed) peaks at ~4GB extra — do not trigger while Qwen is running a long generation.
@@ -85,7 +85,7 @@ graph TD
             T1["Triton Inference Server 25.03\nYOLO-World M TRT backend\n~0.3 GB VRAM\nHTTP :8002  gRPC :8001  metrics :8003\nManagement sidecar FastAPI :8004\n(TRT re-export API)"]
         end
         subgraph deepstream["bianca-deepstream :8090"]
-            DS1["DeepStream 7.0 pipeline\nNVDEC hardware decode\nnvurisrcbin → nvstreammux\n→ appsink → Triton HTTP :8002\nFastAPI REST + WebSocket :8090"]
+            DS1["DeepStream 7.0 pipeline\nFastAPI REST + WebSocket :8090\nSpawns pipeline_worker.py subprocess\nrtspsrc → nvv4l2decoder → nvvideoconvert\n→ nvjpegenc → appsink → stdout pipe\n→ Triton HTTP :8002 inference"]
         end
         subgraph ollama["bianca-ollama :11434"]
             O1["Ollama\nQwen 2.5:14b\n~9-10 GB VRAM\nPOST /api/chat\nGET  /api/tags"]
@@ -335,19 +335,15 @@ flowchart TD
 
     B --> C["GET /games\ngames.html\ngames hub: Hangman, Multiply, Clock, Quiz"]
 
-    B --> CAM["GET /cameras\ncameras.html"]
-    CAM --> CAM1["POST /cameras/set-stream {url}\ncamera_service.set_stream_url(url)\n→ scene_service.start_analysis(url) or stop"]
-    CAM --> CAM2["GET /cameras/stream\nMJPEG StreamingResponse (local fallback)"]
-    CAM --> CAM3["WS /cameras/ws\nWebSocket stream (works via Cloudflare Tunnel)"]
+    B --> CAM["GET /cameras\ncameras.html\nproxied from app → deepstream:8090"]
+    CAM --> CAM1["POST /cameras/streams {cam_id, uri}\nRegisters stream in deepstream_service\nSpawns pipeline_worker.py subprocess"]
+    CAM --> CAM3["WS /cameras/ws/{cam_id}\nWebSocket stream (works via Cloudflare Tunnel)\nRaw JPEG binary frames\nBrowser renders on canvas via createImageBitmap"]
 
-    CAM --> CAM4["Singleton reader camera_service._reader_loop\nOne background thread per active stream URL\nBackend: PyAV software decode (4 CPU threads)\nReads frames → optional debug overlay → JPEG\nBroadcasts JPEG to all subscriber queues"]
-    CAM4 --> CAM5["Consumers via subscribe_frames() → Queue\nmjpeg_generator: multipart/x-mixed-replace\nws_frame_generator: raw JPEG → WebSocket binary\nBrowser renders frames on canvas via createImageBitmap"]
+    CAM --> CAM4["pipeline_worker.py subprocess\nPer-camera GStreamer chain:\nrtspsrc (latency=0) → rtph264/5depay\n→ h264/5parse → nvv4l2decoder (NVDEC)\n→ nvvideoconvert → capsfilter(NVMM I420)\n→ nvjpegenc → appsink\nJPEG bytes → stdout pipe → deepstream_service\n_frame_reader thread reads + broadcasts"]
 
-    CAM --> CAM6["GET /cameras/queries\nPOST /cameras/queries {text}\nDELETE /cameras/queries/{i}\nGET /cameras/events (polled every 5s)\nGET|POST /cameras/threshold\nGET|POST /cameras/pad\nPOST /cameras/debug-overlay"]
+    CAM --> CAM6["GET /cameras/queries\nPOST /cameras/queries {text}\nDELETE /cameras/queries/{i}\nGET /cameras/events (SSE)\nGET|POST /cameras/threshold\nPOST /cameras/debug-overlay"]
 
-    CAM4 --> CAM7["scene_service.push_frame(frame)\nBackground thread, samples at 5 fps\nJPEG-encode → httpx POST /infer to GDINO container\nReturns JSON: {boxes, scores, labels}\n_SimpleTracker (pure-numpy IoU): persistent track IDs\nCameraEvent on match (threshold + 30s dedup)\nRolling event log: deque(maxlen=500)"]
-
-    CAM7 --> CAM8["GDINO FastAPI Service\nbianca-triton container (port 8082)\ngdino_server.py — uvicorn\nGDINO Tiny fp16 CUDA\nPOST /infer: resize → run GDINO → pixel coords\nGET /health: healthcheck + scene_service wait loop"]
+    CAM4 --> CAM7["deepstream_service.py _infer_slots\nSamples frames at INFER_FPS\nPOST triton:8002/v2/models/yoloworld/infer\nYOLO-World M TRT — 8ms median\nReturns {boxes, scores, labels}\n_SimpleTracker IoU dedup\nCameraEvent → SSE broadcast"]
 
     B --> TALK["GET /talk\ntalk.html"]
     TALK --> T1["Page loads → Silero VAD initialises\nONNX model from CDN, cached, runs via WASM"]
@@ -397,8 +393,8 @@ family-assistant/
 │   └── response_handler.py    TwiML builders: voice_gather, voice_say_then_gather, etc.
 │
 ├── services/
-│   ├── camera_service.py      RTSP URL storage; PyAV software decode (GStreamer present but disabled — thread-safety bug); WebSocket/MJPEG broadcast; triggers scene analysis
-│   ├── scene_service.py       Grounding DINO Tiny via GDINO FastAPI (httpx POST) + _SimpleTracker (IoU, pure-numpy); query management; event log; no PyTorch in main process
+│   ├── deepstream_service.py  FastAPI :8090; spawns pipeline_worker.py subprocess per stream set; _frame_reader reads JPEG frames from stdout pipe; broadcasts via WebSocket; Triton YOLO-World inference; query + event management
+│   ├── pipeline_worker.py     Standalone GStreamer subprocess — isolates rtspsrc from asyncio; per-camera chain: rtspsrc→nvv4l2decoder→nvvideoconvert→nvjpegenc→appsink; JPEG frames sent over stdout length-prefixed wire protocol
 │   ├── whisper_service.py     faster-whisper large-v3 CUDA, suffix param for webm/wav
 │   ├── qwen.py                Ollama REST wrapper, all LLM calls, JSON extraction
 │   ├── markdown_service.py    Read/write/parse/delete family.md with FileLock
@@ -481,3 +477,112 @@ family-assistant/
 | DeepStream → Triton via HTTP not gRPC | gRPC TYPE_STRING/pybind11 crash in tritonserver ≤24.09; UINT8+FP32 inputs mean gRPC could work on 25.03, but HTTP is simpler to debug (curl, browser) and required anyway for the model management API (`/v2/repository/models/yoloworld/load`); at 10fps with ~8ms GPU inference the ~0.9ms HTTP overhead is negligible; gRPC worth revisiting only at 10+ cameras |
 | TRT inference always; query changes trigger full re-export via management sidecar | TRT bakes CLIP text embeddings at export time — changing queries without re-exporting fires the engine on old class slots but maps to new labels (silent wrong results). PyTorch fallback is not used after initial engine creation; instead the management sidecar (`triton:8004`) re-exports a new TRT engine (~90s) in the background. The old engine keeps running until the new one is ready. |
 | App-level cross-service orchestration for query changes | When the user changes detection queries, `main.py` owns the full lifecycle: (1) pause Qwen (`keep_alive=0` so VRAM is freed), (2) trigger TRT re-export via `POST triton:8004/reexport`, (3) poll status every 3s up to 180s, (4) reload Triton model via `triton:8002` management API, (5) commit updated queries to deepstream via `POST deepstream:8090/queries/commit`, (6) resume Qwen. During re-export all LLM routes return HTTP 503. `deepstream_service` has no knowledge of Ollama. |
+| GStreamer subprocess isolation for RTSP | asyncio's epoll races with rtspsrc's GLib socket watcher in the same process → SIGABRT. Spawning `pipeline_worker.py` as a subprocess removes the interference entirely. All GLib/GStreamer code lives only in the subprocess. |
+| `import cv2` must come after `Gst.init()` | cv2 (CUDA build) initialises NVIDIA codec libs on import, conflicting with DeepStream's CUDA init inside Gst.init(). Importing cv2 before Gst.init() → SIGABRT. Solution: remove cv2 from pipeline_worker.py entirely — use GStreamer's `nvjpegenc` for JPEG encoding instead. |
+| Per-camera chains instead of nvstreammux+tiler | nvstreammux batches streams for nvinfer — unnecessary for display-only pipelines. Per-camera chains (each with its own nvv4l2decoder→nvvideoconvert→nvjpegenc→appsink) are simpler, remove the nvmultistreamtiler, and scale independently. nvstreammux is only needed when running nvinfer on the pipeline output. |
+| nvjpegenc over jpegenc | nvjpegenc accepts `video/x-raw(memory:NVMM)` — the frame stays in GPU memory through encode. jpegenc (CPU) requires a GPU→CPU copy first. On an RTX 4070 Ti Super the difference is measurable in frame latency at 25fps. |
+
+---
+
+## pipeline_worker.py — IPC Protocol
+
+`deepstream_service.py` spawns `pipeline_worker.py` as a subprocess with `stdout=PIPE, stdin=PIPE`.
+
+**stdout (pipeline_worker → parent) — binary, big-endian:**
+```
+Normal frame:
+  [4 bytes]  cam_id UTF-8 byte length
+  [N bytes]  cam_id string
+  [4 bytes]  JPEG byte length
+  [M bytes]  JPEG data
+
+EOS / shutdown signal:
+  [4 bytes = 0x00000000]   (cam_id length of zero)
+```
+
+**stdin (parent → pipeline_worker) — text lines:**
+```
+"STOP\n"  →  graceful shutdown (pipeline.set_state(NULL), send EOS, exit)
+```
+
+**Pipeline topology per camera:**
+```
+RTSP:  rtspsrc (latency=0) → rtph264/5depay → h264/5parse → nvv4l2decoder
+             → nvvideoconvert → capsfilter(video/x-raw(memory:NVMM),format=I420)
+             → nvjpegenc → appsink
+
+File:  uridecodebin → nvvideoconvert → capsfilter(video/x-raw(memory:NVMM),format=I420)
+             → nvjpegenc → appsink
+```
+
+Key properties: `appsink` has `emit-signals=True`, `max-buffers=2`, `drop=True`, `sync=False`. The `new-sample` callback throttles to `DISPLAY_FPS` (default 25) using a monotonic timestamp check; excess frames are drained (pull-sample without sending) to keep the 2-slot buffer free.
+
+---
+
+## Testing RTSP Streams Locally (mediamtx + ffmpeg)
+
+Use this to test the camera pipeline without a real IP camera.
+
+### 1. Run the mediamtx RTSP server
+
+mediamtx is already in `docker-compose.yml` (if added) or run it standalone:
+
+```bash
+docker run --rm -d \
+  --name mediamtx \
+  --network family-assistant_bianca-net \
+  -p 8554:8554 \
+  -p 1935:1935 \
+  bluenviron/mediamtx:latest
+```
+
+mediamtx auto-accepts any published stream — no config needed.
+
+### 2. Publish a local video file as an RTSP stream
+
+```bash
+ffmpeg -re \
+  -stream_loop -1 \
+  -i /path/to/your/video.mp4 \
+  -c:v libx264 \
+  -preset veryfast \
+  -tune zerolatency \
+  -rtsp_transport tcp \
+  -f rtsp \
+  rtsp://localhost:8554/cam1
+```
+
+Flags explained:
+- `-re` — read at native speed (real-time, not as fast as possible)
+- `-stream_loop -1` — loop the file indefinitely
+- `-c:v libx264 -preset veryfast -tune zerolatency` — fast H.264 encode, minimal buffering
+- `-rtsp_transport tcp` — use TCP (required if mediamtx UDP ports 8000/8001 are not exposed)
+- `rtsp://localhost:8554/cam1` — publish to mediamtx on host; use `rtsp://mediamtx:8554/cam1` from inside containers
+
+### 3. Register the stream with deepstream
+
+```bash
+curl -s -X POST http://localhost:8090/streams \
+  -H "Content-Type: application/json" \
+  -d '{"cam_id": "cam0", "uri": "rtsp://mediamtx:8554/cam1"}'
+```
+
+`uri` uses the container hostname `mediamtx` because deepstream_service runs inside Docker.
+
+### 4. Watch logs
+
+```bash
+docker logs -f bianca-deepstream 2>&1 | grep -v "^0:"
+```
+
+Expected on success:
+```
+[pipeline_worker] INFO Pipeline started: 1 camera(s) ['cam0']
+[pipeline_worker] INFO cam0 downstream chain ready (nvvideoconvert→nvjpegenc→appsink)
+```
+
+### 5. Remove the stream
+
+```bash
+curl -s -X DELETE http://localhost:8090/streams/cam0
+```

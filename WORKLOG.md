@@ -683,6 +683,35 @@ Six improvements applied to `services/scene_service.py` to reduce false positive
 
 ---
 
+### 2026-04-14 — RTSP pipeline debugging + fix
+
+**Goal:** Get `rtsp://mediamtx:8554/cam1` streaming into the camera UI with GPU decode (nvv4l2decoder).
+
+**Root cause found:** `import cv2` before `Gst.init()` causes SIGABRT. OpenCV (CUDA build) initialises NVIDIA codec libraries in an order that conflicts with DeepStream's own CUDA init triggered by Gst.init(). Produced `std::runtime_error("Unable to read configuration")` immediately after `pipeline.set_state(PLAYING)`.
+
+Diagnosed via progressive isolation tests — everything passed individually (rtspsrc, decode chain, appsink callback) until cv2 was isolated as the trigger.
+
+**Fix + refactor:** Removed cv2 and numpy from pipeline_worker.py entirely. Switched from a shared nvstreammux+nvmultistreamtiler topology to per-camera independent chains with GStreamer-native JPEG encoding:
+
+```
+rtspsrc (latency=0) → rtph264/5depay → h264/5parse → nvv4l2decoder
+        → nvvideoconvert → capsfilter(NVMM I420) → nvjpegenc → appsink
+```
+
+`nvjpegenc` (hardware) keeps the frame in NVMM GPU memory through encode — no GPU→CPU copy until final JPEG bytes land in appsink. The `new-sample` callback does `bytes(minfo.data)` and writes to stdout — no numpy, no cv2.
+
+**Performance improvements applied:**
+- `rtspsrc latency=0` (was 100ms) — removes jitter buffer, cuts E2E latency on LAN
+- `nvjpegenc` instead of `jpegenc` (CPU) — JPEG encode stays in NVMM, faster
+- Removed `nvstreammux` + `nvmultistreamtiler` — not needed for display; simpler pipeline
+
+**Other findings:**
+- nvurisrcbin (rank 256) must be bypassed for RTSP in DS7.0 — use rtspsrc directly
+- asyncio + rtspsrc in the same process → SIGABRT — fixed by subprocess isolation
+- nvstreammux/nvmultistreamtiler only needed when feeding nvinfer (batching requirement)
+
+---
+
 ## Open Questions / Future Ideas
 - Add a "complete todo" voice command ("mark buy groceries as done")
 - Scheduled reminders: outbound WhatsApp at event time
