@@ -22,6 +22,9 @@ __pycache__/
 .ultralytics/
 *.pt
 
+# ONNX model files — exported at runtime, large binaries
+*.onnx
+
 # TRT engine files — large binary, exported at runtime
 models/*.engine
 models/*.meta.json

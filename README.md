@@ -193,7 +193,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.app.txt
 # Start Ollama separately: ollama serve
 # Start Whisper separately: cd whisper_server && uvicorn main:app --port 8080
-# Start GDINO separately:  uvicorn gdino_server:app --app-dir triton_models --port 8082
+# Start DeepStream separately: docker compose up deepstream  (runs pipeline_worker subprocess internally)
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -281,7 +281,8 @@ family-assistant/
 │   ├── session_store.py      # In-memory sessions for async phone call flow
 │   ├── reminder_service.py   # APScheduler — proactive WhatsApp event reminders
 │   ├── hangman_service.py    # Hangman game logic and in-memory game state
-│   ├── deepstream_service.py # DeepStream NVDEC pipeline + YOLO-World TRT inference; replaces camera_service + scene_service
+│   ├── deepstream_service.py # FastAPI :8090; spawns pipeline_worker.py; WebSocket broadcast; Triton YOLO-World inference
+│   ├── pipeline_worker.py    # Standalone GStreamer subprocess; rtspsrc→nvv4l2decoder→nvjpegenc→appsink; stdout JPEG frames
 │   ├── bulls_cows_service.py # Bulls and Cows game state and spoken-digit parser
 │   ├── word_ladder_service.py # Word Ladder — BFS validation, system dictionary word set, hint generation
 │   └── twenty_questions_service.py # 20 Questions — multi-turn Qwen session, phase management
