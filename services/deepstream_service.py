@@ -33,6 +33,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import cv2
@@ -48,6 +49,17 @@ _triton_host = _triton_raw.split(":")[0]
 TRITON_HTTP_URL  = f"{_triton_host}:8002"
 
 META_JSON_PATH    = os.environ.get("META_JSON_PATH", "/app/models/yoloworld.meta.json")
+CAMERAS_JSON_PATH  = os.environ.get("CAMERAS_JSON_PATH", "./cameras.json")
+CLIPS_DIR          = Path(os.environ.get("CLIPS_DIR", "./clips"))
+PRE_BUFFER_S       = int(os.environ.get("PRE_BUFFER_S", "5"))
+POST_BUFFER_S      = int(os.environ.get("POST_BUFFER_S", "5"))
+MAX_CLIPS_PER_CAM  = int(os.environ.get("MAX_CLIPS_PER_CAM", "100"))
+CLIP_FPS           = int(os.environ.get("CLIP_FPS", "25"))      # clip recording FPS (matches display pipeline)
+MAX_CLIP_DURATION_S = int(os.environ.get("MAX_CLIP_DURATION_S", "60"))  # hard cap per clip chunk
+
+MOTION_GATE       = os.environ.get("MOTION_GATE", "true").lower() == "true"
+MOTION_THRESHOLD  = float(os.environ.get("MOTION_THRESHOLD", "2.0"))  # mean pixel diff (0-255) to trigger inference
+MOTION_SCALE      = (320, 180)   # downscale to this for cheap frame differencing
 
 DISPLAY_FPS       = 25
 INFER_FPS         = 10       # max inference calls per camera per second
@@ -156,6 +168,17 @@ class CameraEvent:
     cam_id:     str = "cam0"
 
 
+@dataclass
+class _ClipSession:
+    cam_id:          str
+    query:           str
+    pre_frames:      list   # [(ts: float, jpeg: bytes)] — snapshot of pre-buffer at session start
+    live_frames:     list   # [(ts: float, jpeg: bytes)] — appended by frame reader
+    first_detection: float  # monotonic time of first detection — used for duration checks
+    last_detection:  float  # monotonic time of most recent detection — used for gap checks
+    wall_start:      float  # time.time() at session start — used for filename/timestamp
+
+
 # ── Module-level state ────────────────────────────────────────────────────────
 
 _pipeline_lock = threading.Lock()
@@ -187,8 +210,23 @@ _trackers:    dict[str, _SimpleTracker] = {}
 _detections:  dict[str, list]           = {}
 _det_lock     = threading.Lock()
 
+# Motion gate: last downscaled grayscale frame per camera for frame differencing
+_motion_prev: dict[str, np.ndarray] = {}
+
 _events:     deque = deque(maxlen=500)
 _events_lock = threading.Lock()
+
+# Per-camera rolling pre-event frame buffers (last PRE_BUFFER_S seconds of full frames)
+_pre_buffers: dict[str, deque] = {}   # cam_id → deque of (ts: float, jpeg: bytes)
+_last_clip_frame: dict[str, float] = {}  # rate-limit pre-buffer + session writes to CLIP_FPS
+
+# Active clip recording sessions and finalized clip index
+_clip_sessions:       dict[str, _ClipSession] = {}
+_clip_sessions_lock   = threading.Lock()
+_clip_index:          list[dict] = []
+_clip_index_lock      = threading.Lock()
+_clip_manager_stop    = threading.Event()
+_clip_manager_thread: Optional[threading.Thread] = None
 
 _queries:      list[str] = []
 _queries_lock  = threading.Lock()
@@ -233,6 +271,211 @@ def _commit_queries(new_queries: list[str]) -> None:
     logger.info("Queries committed: %s", new_queries)
 
 
+# ── Camera persistence (cameras.json) ────────────────────────────────────────
+
+def _load_cameras() -> dict[str, str]:
+    """Load persisted camera list from cameras.json. Returns {} on missing/corrupt file."""
+    try:
+        with open(CAMERAS_JSON_PATH) as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:
+        logger.warning("Failed to load cameras.json: %s", exc)
+        return {}
+
+
+def _save_cameras(streams: dict[str, str]) -> None:
+    """Write camera list to cameras.json.
+
+    Note: atomic tmp+rename fails with EBUSY on Docker bind-mounted single files
+    (rename(2) can't replace a bind-mount inode). Write directly instead.
+    """
+    try:
+        with open(CAMERAS_JSON_PATH, "w") as f:
+            json.dump(streams, f, indent=2)
+    except Exception as exc:
+        logger.warning("Failed to save cameras.json: %s", exc)
+
+
+# ── Clip recording helpers ────────────────────────────────────────────────────
+
+def _update_clip_session(cam_id: str, query: str, now: float) -> None:
+    """Start a new clip session or extend the existing one for this camera."""
+    with _clip_sessions_lock:
+        if cam_id in _clip_sessions:
+            _clip_sessions[cam_id].last_detection = now
+        else:
+            # Snapshot the current pre-buffer as the pre-event footage
+            pre_frames = list(_pre_buffers.get(cam_id, []))
+            _clip_sessions[cam_id] = _ClipSession(
+                cam_id=cam_id,
+                query=query,
+                pre_frames=pre_frames,
+                live_frames=[],
+                first_detection=now,
+                last_detection=now,
+                wall_start=time.time(),
+            )
+            logger.info("Clip session started: cam=%s query=%r pre_frames=%d",
+                        cam_id, query, len(pre_frames))
+
+
+def _encode_clip(session: _ClipSession) -> Optional[Path]:
+    """Encode all frames into an H.264 MP4 using imageio-ffmpeg's bundled static binary.
+    Produces browser-playable H.264 with faststart (moov atom at front)."""
+    import imageio_ffmpeg
+    all_frames = session.pre_frames + session.live_frames
+    if not all_frames:
+        return None
+    out_dir = CLIPS_DIR / session.cam_id
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.error("Cannot create clips dir %s: %s", out_dir, exc)
+        return None
+    ts_str   = datetime.fromtimestamp(session.wall_start).strftime("%Y%m%d_%H%M%S")
+    safe_q   = "".join(c if c.isalnum() or c in "-_" else "_" for c in session.query)
+    out_path = out_dir / f"{ts_str}_{safe_q}.mp4"
+
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    try:
+        proc = subprocess.Popen(
+            [
+                ffmpeg_exe, "-y",
+                "-f", "image2pipe", "-framerate", str(CLIP_FPS),
+                "-i", "pipe:",
+                "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                str(out_path),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        written = 0
+        for _, jpeg in all_frames:
+            proc.stdin.write(jpeg)
+            written += 1
+        proc.stdin.close()
+        proc.wait(timeout=120)
+        if proc.returncode != 0:
+            logger.error("ffmpeg failed for clip %s (rc=%d)", out_path, proc.returncode)
+            return None
+    except Exception as exc:
+        logger.error("Clip encoding error for %s: %s", out_path, exc)
+        return None
+
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        logger.error("Clip file empty after encoding: %s", out_path)
+        return None
+
+    logger.info("Clip saved: %s (%d frames, %.1fs)", out_path, written, written / CLIP_FPS)
+    return out_path
+
+
+def _prune_clips(cam_id: str) -> None:
+    """Delete oldest clips when per-camera limit is exceeded."""
+    cam_dir = CLIPS_DIR / cam_id
+    try:
+        clips = sorted(cam_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
+        for old in clips[:-MAX_CLIPS_PER_CAM]:
+            old.unlink(missing_ok=True)
+            with _clip_index_lock:
+                _clip_index[:] = [c for c in _clip_index if c["path"] != str(old)]
+    except Exception as exc:
+        logger.warning("Clip prune error for %s: %s", cam_id, exc)
+
+
+def _finalize_session(session: _ClipSession) -> None:
+    """Encode session frames, update clip index, prune old clips."""
+    out_path = _encode_clip(session)
+    if out_path is None:
+        return
+    entry = {
+        "cam_id":    session.cam_id,
+        "filename":  out_path.name,
+        "path":      str(out_path),
+        "timestamp": datetime.fromtimestamp(session.wall_start).isoformat(timespec="seconds"),
+        "query":     session.query,
+        "url":       f"/cameras/clips/file/{session.cam_id}/{out_path.name}",
+    }
+    with _clip_index_lock:
+        _clip_index.append(entry)
+    _prune_clips(session.cam_id)
+
+
+def _clip_manager() -> None:
+    """Background thread: finalize clip sessions whose POST_BUFFER_S window has elapsed."""
+    while not _clip_manager_stop.is_set():
+        _clip_manager_stop.wait(timeout=1.0)
+        if _clip_manager_stop.is_set():
+            break
+        now = time.monotonic()
+        expired = []
+        with _clip_sessions_lock:
+            for cam_id in list(_clip_sessions):
+                session = _clip_sessions[cam_id]
+                if now - session.last_detection > POST_BUFFER_S:
+                    expired.append(_clip_sessions.pop(cam_id))
+                elif now - session.first_detection > MAX_CLIP_DURATION_S:
+                    # Hard duration cap: finalize this chunk; inference will start a new session
+                    expired.append(_clip_sessions.pop(cam_id))
+                    logger.info("Clip duration cap reached for cam=%s — finalizing chunk", cam_id)
+        for session in expired:
+            logger.info("Clip session ended: cam=%s query=%r live_frames=%d",
+                        session.cam_id, session.query, len(session.live_frames))
+            threading.Thread(
+                target=_finalize_session,
+                args=(session,),
+                daemon=True,
+                name=f"ds-clip-encode-{session.cam_id}",
+            ).start()
+    logger.info("Clip manager stopped")
+
+
+def _start_clip_manager() -> None:
+    global _clip_manager_thread
+    _clip_manager_stop.clear()
+    _clip_manager_thread = threading.Thread(
+        target=_clip_manager, daemon=True, name="ds-clip-manager"
+    )
+    _clip_manager_thread.start()
+
+
+def _stop_clip_manager() -> None:
+    global _clip_manager_thread
+    _clip_manager_stop.set()
+    if _clip_manager_thread and _clip_manager_thread.is_alive():
+        _clip_manager_thread.join(timeout=5)
+    _clip_manager_thread = None
+
+
+def _init_clip_index() -> None:
+    """Scan clips directory on startup to populate the in-memory index."""
+    try:
+        CLIPS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        for cam_dir in sorted(CLIPS_DIR.iterdir()):
+            if not cam_dir.is_dir():
+                continue
+            for mp4 in sorted(cam_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime):
+                stem_parts = mp4.stem.split("_", 2)
+                query = stem_parts[2].replace("_", " ") if len(stem_parts) >= 3 else ""
+                _clip_index.append({
+                    "cam_id":    cam_dir.name,
+                    "filename":  mp4.name,
+                    "path":      str(mp4),
+                    "timestamp": datetime.fromtimestamp(mp4.stat().st_mtime).isoformat(timespec="seconds"),
+                    "query":     query,
+                    "url":       f"/cameras/clips/file/{cam_dir.name}/{mp4.name}",
+                })
+    except Exception as exc:
+        logger.warning("Failed to scan clips dir: %s", exc)
+    logger.info("Clip index loaded: %d clips", len(_clip_index))
 
 
 # ── Frame-reader helpers (subprocess stdout → broadcast + inference) ──────────
@@ -306,6 +549,21 @@ def _frame_reader(proc: subprocess.Popen, streams_snapshot: dict) -> None:
                 jpeg_bytes = _apply_debug_overlay(cam_id, jpeg_bytes)
 
             _broadcast(cam_id, jpeg_bytes)
+
+            # Pre-event buffer + clip session feed — rate-limited to CLIP_FPS to bound RAM/disk.
+            # At CLIP_FPS=10: pre-buffer holds 50 frames (5s), a 60s clip uses ≤600 frames (~30MB JPEG).
+            ts_frame = time.monotonic()
+            if ts_frame - _last_clip_frame.get(cam_id, 0.0) >= 1.0 / CLIP_FPS:
+                _last_clip_frame[cam_id] = ts_frame
+                if cam_id not in _pre_buffers:
+                    _pre_buffers[cam_id] = deque(maxlen=PRE_BUFFER_S * CLIP_FPS)
+                _pre_buffers[cam_id].append((ts_frame, jpeg_bytes))
+
+                # Feed active clip session
+                with _clip_sessions_lock:
+                    active_session = _clip_sessions.get(cam_id)
+                if active_session is not None:
+                    active_session.live_frames.append((ts_frame, jpeg_bytes))
 
             # Inference slot throttled to INFER_FPS
             now = time.monotonic()
@@ -436,6 +694,18 @@ def _inference_loop() -> None:
                     continue
                 jpeg_bytes = jpeg_buf.tobytes()
 
+            # Motion gate: skip Triton if the scene hasn't changed enough.
+            # Diff is computed on a small grayscale thumbnail — ~0.5ms CPU, no GPU needed.
+            if MOTION_GATE:
+                gray = cv2.resize(
+                    cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_GRAYSCALE),
+                    MOTION_SCALE,
+                )
+                prev = _motion_prev.get(cam_id)
+                _motion_prev[cam_id] = gray
+                if prev is not None and cv2.absdiff(gray, prev).mean() < MOTION_THRESHOLD:
+                    continue   # scene is static — skip Triton for this frame
+
             img_in = triton_http.InferInput("IMAGE", [len(jpeg_bytes)], "UINT8")
             img_in.set_data_from_numpy(
                 np.frombuffer(jpeg_bytes, dtype=np.uint8).copy()
@@ -493,6 +763,12 @@ def _inference_loop() -> None:
                 scores_dict = {label: conf} if label else {}
 
                 key = (cam_id, track_id, q_idx)
+
+                # Clip session: start/extend whenever detection is above threshold,
+                # independent of the event-firing cooldown (RECHECK_INTERVAL_S).
+                if label and conf >= _threshold:
+                    _update_clip_session(cam_id, label, now)
+
                 if label and now - fired.get(key, 0.0) > RECHECK_INTERVAL_S:
                     score_buf.setdefault(key, deque(maxlen=3)).append(conf)
                     if len(score_buf[key]) >= 1:
@@ -634,6 +910,7 @@ def _rebuild(new_streams: dict[str, str]) -> None:
         return
 
     try:
+        _stop_clip_manager()
         _stop_inference()
         _stop_pipeline()
 
@@ -648,12 +925,18 @@ def _rebuild(new_streams: dict[str, str]) -> None:
             _trackers.pop(cam_id, None)
             with _det_lock:
                 _detections.pop(cam_id, None)
+            _pre_buffers.pop(cam_id, None)
+            _last_clip_frame.pop(cam_id, None)
+            _motion_prev.pop(cam_id, None)
+            with _clip_sessions_lock:
+                _clip_sessions.pop(cam_id, None)
 
         _streams = dict(new_streams)
 
         if _streams:
             _start_pipeline_worker(_streams)
             _start_inference()
+            _start_clip_manager()
             logger.info("DeepStream service running: %s", list(_streams.keys()))
         else:
             logger.info("DeepStream service idle — no streams")
@@ -668,12 +951,14 @@ def add_stream(cam_id: str, uri: str) -> None:
         new = dict(_streams)
         new[cam_id] = uri
         _rebuild(new)
+        _save_cameras(_streams)
 
 
 def remove_stream(cam_id: str) -> None:
     with _pipeline_lock:
         new = {k: v for k, v in _streams.items() if k != cam_id}
         _rebuild(new)
+        _save_cameras(_streams)
 
 
 def get_streams() -> dict[str, str]:
@@ -831,7 +1116,7 @@ async def mjpeg_generator(rtsp_url: str, cam_id: str = "cam0"):
         unsubscribe_frames(q, cam_id)
 
 
-# ── Startup: load persisted queries ──────────────────────────────────────────
+# ── Startup: load persisted queries, cameras, and clip index ─────────────────
 
 def _init_queries() -> None:
     persisted = _load_queries_from_meta()
@@ -840,13 +1125,22 @@ def _init_queries() -> None:
             _queries.extend(persisted)
 
 
+def _init_cameras() -> None:
+    cameras = _load_cameras()
+    for cam_id, uri in cameras.items():
+        logger.info("Restoring camera from cameras.json: %s → %s", cam_id, uri)
+        add_stream(cam_id, uri)
+
+
 _init_queries()
+_init_clip_index()
+_init_cameras()
 
 
 # ── FastAPI app (served by the deepstream container on port 8090) ─────────────
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
-from fastapi.responses import JSONResponse as _JSONResponse   # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse as _JSONResponse  # noqa: E402
 
 app = FastAPI(title="DeepStream Service")
 
@@ -971,3 +1265,23 @@ async def _ws_default(websocket: WebSocket):
             await websocket.send_bytes(jpeg_bytes)
     except WebSocketDisconnect:
         pass
+
+
+@app.get("/clips")
+async def _list_clips(cam_id: Optional[str] = None):
+    with _clip_index_lock:
+        clips = list(_clip_index)
+    if cam_id:
+        clips = [c for c in clips if c["cam_id"] == cam_id]
+    return _JSONResponse({"clips": list(reversed(clips))})  # newest first
+
+
+@app.get("/clips/file/{cam_id}/{filename}")
+async def _serve_clip(cam_id: str, filename: str):
+    # Sanitise inputs — only allow safe path components
+    if "/" in cam_id or "/" in filename or ".." in cam_id or ".." in filename:
+        return _JSONResponse({"error": "invalid path"}, status_code=400)
+    path = CLIPS_DIR / cam_id / filename
+    if not path.exists():
+        return _JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(str(path), media_type="video/mp4")

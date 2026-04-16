@@ -6,7 +6,8 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI, Form, Response, Request, UploadFile, File, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from pathlib import Path
 from fastapi.templating import Jinja2Templates
 import httpx
 from handlers.call_handler import handle_incoming, handle_transcription
@@ -347,6 +348,24 @@ async def cameras_remove_stream(cam_id: str):
 @app.get("/cameras/streams")
 async def cameras_list_streams():
     return await _ds_proxy("GET", "/streams")
+
+
+@app.get("/cameras/clips")
+async def cameras_list_clips(cam_id: str | None = None):
+    qs = f"?cam_id={cam_id}" if cam_id else ""
+    return await _ds_proxy("GET", f"/clips{qs}")
+
+
+CLIPS_DIR = Path(os.environ.get("CLIPS_DIR", "/app/clips"))
+
+@app.get("/cameras/clips/file/{cam_id}/{filename}")
+async def cameras_serve_clip(cam_id: str, filename: str):
+    if "/" in cam_id or "/" in filename or ".." in cam_id or ".." in filename:
+        return JSONResponse({"error": "invalid path"}, status_code=400)
+    path = CLIPS_DIR / cam_id / filename
+    if not path.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(str(path), media_type="video/mp4")
 
 
 @app.websocket("/cameras/ws/{cam_id}")

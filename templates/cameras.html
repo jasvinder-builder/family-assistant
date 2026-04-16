@@ -26,13 +26,12 @@
     .query-badge button { padding: 0; border: none; background: none; color: #94a3b8; line-height: 1; font-size: 1rem; }
     .query-badge button:hover { color: #ef4444; }
     .query-updating { background: #fefce8; border: 1px solid #fde047; border-radius: 8px; padding: 0.5rem 0.75rem; font-size: 0.85rem; color: #854d0e; }
-    .event-row { border-left: 3px solid #6366f1; padding: 0.5rem 0.75rem; margin-bottom: 0.5rem; background: white; border-radius: 0 8px 8px 0; font-size: 0.88rem; display: flex; align-items: flex-start; gap: 0.6rem; }
-    .event-thumb { width: 56px; height: 80px; object-fit: cover; border-radius: 6px; flex-shrink: 0; background: #e2e8f0; }
-    .event-thumb-placeholder { width: 56px; height: 80px; border-radius: 6px; flex-shrink: 0; background: #e2e8f0; }
-    .event-ts { color: #64748b; font-size: 0.78rem; font-variant-numeric: tabular-nums; }
-    .event-conf { color: #94a3b8; font-size: 0.75rem; }
-    .event-cam { color: #6366f1; font-size: 0.75rem; font-weight: 600; }
     .empty-hint { color: #94a3b8; font-size: 0.88rem; }
+    .clip-card { background: white; border-radius: 10px; overflow: hidden; box-shadow: 0 1px 6px rgba(0,0,0,0.07); }
+    .clip-card video { width: 100%; display: block; max-height: 200px; background: #0f172a; }
+    .clip-meta { padding: 0.4rem 0.6rem; font-size: 0.8rem; }
+    .clip-query { font-weight: 600; color: #4f46e5; }
+    .clip-ts { color: #64748b; font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
@@ -122,20 +121,22 @@
     </div>
   </div>
 
-  <!-- ── Event log ──────────────────────────────────────────────────────── -->
+  <!-- ── Recorded clips ─────────────────────────────────────────────────── -->
   <div class="card">
     <div class="card-body">
       <div class="d-flex justify-content-between align-items-center mb-3">
-        <h6 class="fw-semibold mb-0">Detected Events <span class="text-muted fw-normal small">(last hour)</span></h6>
+        <h6 class="fw-semibold mb-0">Recorded Clips
+          <span class="text-muted fw-normal small">(5s pre + detection + 5s post)</span>
+        </h6>
         <div class="d-flex align-items-center gap-3">
-          <select id="camFilter" class="form-select form-select-sm" style="width:auto;" onchange="filterEvents()">
+          <select id="clipCamFilter" class="form-select form-select-sm" style="width:auto;" onchange="filterClips()">
             <option value="">All cameras</option>
           </select>
-          <span id="eventCount" class="badge text-white" style="background:#6366f1;"></span>
+          <span id="clipCount" class="badge text-white" style="background:#0891b2;"></span>
         </div>
       </div>
-      <div id="eventLog">
-        <p class="empty-hint">No events yet. Connect a stream and add scene queries to start detection.</p>
+      <div id="clipGrid" class="row g-3">
+        <p class="empty-hint col-12">No clips yet. Clips are recorded automatically when a detection is confirmed.</p>
       </div>
     </div>
   </div>
@@ -271,7 +272,6 @@
   // ── Query management ──────────────────────────────────────────────────────
 
   let queries = [];
-  let allEvents = [];
 
   function renderQueries() {
     const el = document.getElementById('queryList');
@@ -338,63 +338,8 @@
     }
   }
 
-  // ── Event log ─────────────────────────────────────────────────────────────
-
-  function renderEvents(events) {
-    const badge = document.getElementById('eventCount');
-    badge.textContent = events.length ? `${events.length} event${events.length > 1 ? 's' : ''}` : '';
-
-    const el = document.getElementById('eventLog');
-    if (events.length === 0) {
-      el.innerHTML = '<p class="empty-hint mb-0">No events yet. Connect a stream and add scene queries to start detection.</p>';
-      return;
-    }
-
-    const rows = [...events].reverse().map(e => {
-      const ts    = e.timestamp.replace('T', ' ');
-      const conf  = `${Math.round(e.confidence * 100)}% match`;
-      const camId = e.cam_id || '';
-      const thumb = e.image_b64
-        ? `<img class="event-thumb" src="data:image/jpeg;base64,${e.image_b64}" alt="crop">`
-        : `<div class="event-thumb-placeholder"></div>`;
-      return `<div class="event-row">
-        ${thumb}
-        <div class="flex-grow-1">
-          <div class="d-flex justify-content-between align-items-start gap-2">
-            <span>🔍 ${escHtml(e.query)}</span>
-            <span class="event-conf">${conf}</span>
-          </div>
-          <div class="d-flex gap-2 mt-1">
-            ${camId ? `<span class="event-cam">${escHtml(camId)}</span>` : ''}
-            <span class="event-ts">${ts}</span>
-          </div>
-        </div>
-      </div>`;
-    }).join('');
-    el.innerHTML = rows;
-  }
-
-  function filterEvents() {
-    const camId = document.getElementById('camFilter').value;
-    const filtered = camId ? allEvents.filter(e => e.cam_id === camId) : allEvents;
-    renderEvents(filtered);
-  }
-
   function updateCamFilter() {
-    const sel  = document.getElementById('camFilter');
-    const cur  = sel.value;
-    const cams = Object.keys(activeCams);
-    sel.innerHTML = '<option value="">All cameras</option>' +
-      cams.map(id => `<option value="${escAttr(id)}"${cur === id ? ' selected' : ''}>${escHtml(id)}</option>`).join('');
-  }
-
-  async function pollEvents() {
-    const res = await fetch('/cameras/events').catch(() => null);
-    if (res && res.ok) {
-      allEvents = (await res.json()).events;
-      filterEvents();
-    }
-    setTimeout(pollEvents, 5000);
+    // kept so addCamera/removeCamera calls don't break; clipCamFilter is updated by updateClipCamFilter
   }
 
   // ── Utilities ─────────────────────────────────────────────────────────────
@@ -434,13 +379,70 @@
     document.getElementById('thresholdVal').textContent = threshold.toFixed(2);
   }
 
+  // ── Clips ─────────────────────────────────────────────────────────────
+
+  let allClips = [];
+
+  function renderClips(clips) {
+    const badge = document.getElementById('clipCount');
+    badge.textContent = clips.length ? `${clips.length} clip${clips.length > 1 ? 's' : ''}` : '';
+
+    const grid = document.getElementById('clipGrid');
+    if (clips.length === 0) {
+      grid.innerHTML = '<p class="empty-hint col-12">No clips yet. Clips are recorded automatically when a detection is confirmed.</p>';
+      return;
+    }
+
+    const cols = clips.map(c => {
+      const ts = new Date(c.timestamp).toLocaleString();
+      return `<div class="col-sm-6 col-md-4 col-xl-3">
+        <div class="clip-card">
+          <video controls preload="metadata" src="${escAttr(c.url)}"></video>
+          <div class="clip-meta">
+            <div class="clip-query">🔍 ${escHtml(c.query)}</div>
+            <div class="d-flex justify-content-between mt-1">
+              <span class="event-cam">${escHtml(c.cam_id)}</span>
+              <span class="clip-ts">${ts}</span>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+    grid.innerHTML = cols;
+  }
+
+  function filterClips() {
+    const camId = document.getElementById('clipCamFilter').value;
+    const filtered = camId ? allClips.filter(c => c.cam_id === camId) : allClips;
+    renderClips(filtered);
+  }
+
+  function updateClipCamFilter() {
+    const sel  = document.getElementById('clipCamFilter');
+    const cur  = sel.value;
+    const cams = [...new Set(allClips.map(c => c.cam_id))].sort();
+    sel.innerHTML = '<option value="">All cameras</option>' +
+      cams.map(id => `<option value="${escAttr(id)}"${cur === id ? ' selected' : ''}>${escHtml(id)}</option>`).join('');
+  }
+
+  async function pollClips() {
+    const res = await fetch('/cameras/clips').catch(() => null);
+    if (res && res.ok) {
+      allClips = (await res.json()).clips || [];
+      updateClipCamFilter();
+      filterClips();
+    }
+    setTimeout(pollClips, 30000);
+  }
+
   // ── Init ─────────────────────────────────────────────────────────────────
 
   loadStreams();
+  setInterval(loadStreams, 10000);   // propagate camera add/remove to other windows
   loadQueries();
   loadThreshold();
-  pollEvents();
   pollQueryStatus();
+  pollClips();
 </script>
 
 </body>

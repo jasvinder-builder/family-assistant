@@ -54,7 +54,7 @@ graph TD
 - **Bulls and Cows** — crack Bianca's secret 4-digit code; say each digit aloud; bulls = right digit right place, cows = right digit wrong place
 - **Word Ladder** — change one letter at a time to climb from the start word to the target; BFS-powered hints; Qwen generates kid-friendly puzzles
 - **20 Questions** — think of an animal, food, object, or place; Bianca asks up to 20 yes/no questions and tries to guess it using Qwen
-- **Cameras** — live view of RTSP streams or local video files via DeepStream NVDEC hardware decode; YOLO-World M TRT engine on Triton Inference Server detects objects matching user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa") at ~8ms per frame; _SimpleTracker assigns persistent track IDs; matched events logged in real time; changing queries triggers a ~90s TRT re-export (Qwen temporarily paused to free VRAM) after which the new classes are active
+- **Cameras** — live view of RTSP streams or local video files via DeepStream NVDEC hardware decode; software motion gate (frame differencing) skips inference when the scene is static; YOLO-World M TRT engine on Triton Inference Server detects objects matching user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa") at ~8ms per frame; _SimpleTracker assigns persistent track IDs; matched detections trigger H.264 video clip recording (5s pre-event buffer + detection duration + 5s post-event) playable in the browser; camera registrations persist across restarts via `cameras.json`; changing queries triggers a ~90s TRT re-export (Qwen temporarily paused to free VRAM) after which the new classes are active
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events
@@ -230,6 +230,8 @@ family-assistant/
 ├── main.py                   # FastAPI app, all routes, startup warmup, logging
 ├── config.py                 # Settings, .env loading, phone→name mapping
 ├── family.md                 # Shared storage (not in git — copy from family.md.example)
+├── cameras.json              # Persisted camera registry — auto-created on first camera add
+├── clips/                    # Per-camera MP4 detection clips (gitignored)
 ├── .env                      # Credentials (not in git)
 ├── .env.example              # Template
 ├── family.md.example         # Template for family.md

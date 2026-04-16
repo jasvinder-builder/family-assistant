@@ -535,6 +535,60 @@ Removed dead code accumulated since the GDINO → YOLO-World / camera_service �
 
 ---
 
+### 2026-04-16 — Camera persistence, video clip recording, motion gate
+
+**What was built:**
+
+**Camera persistence (`cameras.json`)**
+- Cameras added via the UI now survive service restarts. `_save_cameras()` writes the `{cam_id: uri}` map to `cameras.json`; `_init_cameras()` loads it at startup and re-registers each stream.
+- Fix: initial implementation used atomic `tmp + os.replace()` which fails with `EBUSY` when the target is a Docker bind-mounted single file (Linux `rename(2)` can't replace a bind-mount inode). Switched to direct `open(..., "w")` truncate-and-write.
+- Cross-window sync: `cameras.html` polls `GET /cameras/streams` every 10s so additions and removals made in one browser tab appear in other open tabs within 10 seconds.
+
+**Pre/post-buffered video clips**
+- Replaced single-frame detection crops with H.264 MP4 clips: 5s before first detection + detection duration + 5s after last detection.
+- Pre-event circular buffer (`_pre_buffers[cam_id]`, `deque(maxlen=PRE_BUFFER_S * CLIP_FPS)`) accumulates JPEG frames continuously in `_frame_reader()`. On the first detection hit a `_ClipSession` is opened and the pre-buffer is snapshotted into `pre_frames`. Subsequent frames during the session go into `live_frames`.
+- Gap tolerance: the session stays open while `now - last_detection < POST_BUFFER_S`, so brief detection gaps (lighting flicker, partial occlusion 1–4s) produce one clip per object visit, not one clip per detected frame.
+- `_clip_manager()` daemon thread wakes every 0.5s, detects sessions past the post-buffer window, and calls `_encode_clip()`.
+- Encoding uses `imageio_ffmpeg.get_ffmpeg_exe()` (bundled static ffmpeg binary) — system ffmpeg in the DeepStream image has missing `.so` files despite dpkg claiming the packages are installed. `-c:v libx264 -pix_fmt yuv420p -movflags +faststart` produces browser-playable MP4.
+- `wall_start: float` field on `_ClipSession` (set to `time.time()` at session open) is used for filenames and the clip index — avoids the `time.monotonic()` → `datetime.fromtimestamp()` epoch-1970 bug.
+- Clips stored under `./clips/{cam_id}/`, pruned to `MAX_CLIPS_PER_CAM=100` per camera.
+- New routes: `GET /clips` (JSON index, filterable by `?cam_id=`), `GET /clips/file/{cam_id}/{filename}` (`FileResponse` — handles browser `Range` requests for video seeking).
+- App container proxies clips: `GET /cameras/clips` and `GET /cameras/clips/file/{cam_id}/{filename}` (direct `FileResponse` using `./clips` bind-mount, not httpx proxy, so range requests work end-to-end).
+
+**Software motion gate**
+- `_inference_loop()` now checks frame-to-frame pixel difference before calling Triton. Each frame is resized to 320×180 grayscale; if `cv2.absdiff(gray, prev).mean() < MOTION_THRESHOLD` (default 2.0), the frame is skipped. Reduces Triton calls by ~80–90% in static scenes. Overhead ~0.5ms CPU per frame.
+- Controlled by `MOTION_GATE` env var (default `True`). Cameras without motion will still trigger on the first frame (no prev) and whenever the scene changes.
+
+**UI changes**
+- Removed the detection events section entirely — clips are a better artefact.
+- Added a Clips section below the camera grid: video grid with `<video controls preload="metadata">`, camera filter dropdown, timestamp and query label. Fetches `/cameras/clips` on load and every 30s.
+
+**Bugs encountered and fixed:**
+| Bug | Cause | Fix |
+|---|---|---|
+| `ffmpeg: error while loading shared libraries: libavcodec.so.58` | DeepStream image removed libav .so files post-install | Use `imageio_ffmpeg.get_ffmpeg_exe()` for bundled static binary |
+| `cv2.VideoWriter` mp4v clips not playing in Chrome | OpenCV bundled FFmpeg has no libx264; mp4v = MPEG-4 Part 2, unsupported in Chrome Linux | Switch entirely to imageio-ffmpeg + libx264 |
+| Clips named `19700118_*` | `first_detection = time.monotonic()` passed to `datetime.fromtimestamp()` | Added `wall_start = time.time()` on session create; use that for filenames |
+| Video not playing in browser | Proxy returned `200` (no `Accept-Ranges`); browsers need `206` for video seeking | Mount clips in app container, serve via `FileResponse` (handles range requests natively) |
+| `cameras.json` never saved — EBUSY | `os.replace(tmp, bind_mounted_file)` fails; bind-mount is a separate fs entry | Write directly with `open(..., "w")` |
+| Cameras lost on restart | `_save_cameras` was silently failing due to EBUSY | Fixed by above; `_init_cameras()` now successfully restores state on startup |
+
+**Key decisions:**
+- `imageio-ffmpeg` pip package bundled binary preferred over any system ffmpeg — guaranteed available, no `.so` surprises in the DeepStream image
+- `FileResponse` (not httpx proxy) for video serving — FastAPI's FileResponse handles `Accept-Ranges` / `206 Partial Content` natively; proxying via httpx would require manually forwarding Range headers
+- `_SimpleTracker` kept as-is (CPU IoU) — nvtracker requires an `nvinfer` element in-pipeline which would need a major GStreamer topology refactor; not worth it for family-assistant use case
+- Motion gate Option A (software frame diff) implemented; Option B (Thingino firmware webhook) documented in `improvement_ideas.md` for future exploration
+
+**New/changed files:**
+- `services/deepstream_service.py` — camera persistence, pre-buffer, clip sessions, motion gate, encoding, clips routes
+- `main.py` — proxy routes for `/cameras/clips`, direct FileResponse for clip files
+- `templates/cameras.html` — removed event log, added clips section, stream list polling
+- `docker-compose.yml` — `cameras.json` bind-mount, `clips/` bind-mount, env vars
+- `Dockerfile.deepstream` — added `imageio-ffmpeg>=0.5`
+- `improvement_ideas.md` — Thingino webhook motion detection (Option B)
+
+---
+
 ## Open Questions / Future Ideas
 - Add a "complete todo" voice command ("mark buy groceries as done")
 - Scheduled reminders: outbound WhatsApp at event time

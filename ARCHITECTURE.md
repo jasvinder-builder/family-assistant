@@ -341,9 +341,9 @@ flowchart TD
 
     CAM --> CAM4["pipeline_worker.py subprocess\nPer-camera GStreamer chain:\nrtspsrc (latency=0) → rtph264/5depay\n→ h264/5parse → nvv4l2decoder (NVDEC)\n→ nvvideoconvert → capsfilter(NVMM I420)\n→ nvjpegenc → appsink\nJPEG bytes → stdout pipe → deepstream_service\n_frame_reader thread reads + broadcasts"]
 
-    CAM --> CAM6["GET /cameras/queries\nPOST /cameras/queries {text}\nDELETE /cameras/queries/{i}\nGET /cameras/events (SSE)\nGET|POST /cameras/threshold\nPOST /cameras/debug-overlay"]
+    CAM --> CAM6["GET /cameras/queries\nPOST /cameras/queries {text}\nDELETE /cameras/queries/{i}\nGET|POST /cameras/threshold\nGET /cameras/clips\nGET /cameras/clips/file/{cam_id}/{filename}"]
 
-    CAM4 --> CAM7["deepstream_service.py _infer_slots\nSamples frames at INFER_FPS\nPOST triton:8002/v2/models/yoloworld/infer\nYOLO-World M TRT — 8ms median\nReturns {boxes, scores, labels}\n_SimpleTracker IoU dedup\nCameraEvent → SSE broadcast"]
+    CAM4 --> CAM7["deepstream_service.py _inference_loop\nSoftware motion gate: cv2.absdiff 320×180 grey\n(skips Triton if no motion — ~80-90% reduction)\nPOST triton:8002/v2/models/yoloworld/infer\nYOLO-World M TRT — 8ms median\nReturns {boxes, scores, labels}\n_SimpleTracker IoU dedup\n_ClipSession: 5s pre-buffer + event + 5s post\n_clip_manager encodes H.264 MP4 via imageio-ffmpeg"]
 
     B --> TALK["GET /talk\ntalk.html"]
     TALK --> T1["Page loads → Silero VAD initialises\nONNX model from CDN, cached, runs via WASM"]
@@ -393,7 +393,7 @@ family-assistant/
 │   └── response_handler.py    TwiML builders: voice_gather, voice_say_then_gather, etc.
 │
 ├── services/
-│   ├── deepstream_service.py  FastAPI :8090; spawns pipeline_worker.py subprocess per stream set; _frame_reader reads JPEG frames from stdout pipe; broadcasts via WebSocket; Triton YOLO-World inference; query + event management
+│   ├── deepstream_service.py  FastAPI :8090; spawns pipeline_worker.py subprocess per stream set; _frame_reader reads JPEG frames; WebSocket broadcast; software motion gate; Triton YOLO-World inference; pre-buffer clip recording; camera persistence via cameras.json
 │   ├── pipeline_worker.py     Standalone GStreamer subprocess — isolates rtspsrc from asyncio; per-camera chain: rtspsrc→nvv4l2decoder→nvvideoconvert→nvjpegenc→appsink; JPEG frames sent over stdout length-prefixed wire protocol
 │   ├── whisper_service.py     faster-whisper large-v3 CUDA, suffix param for webm/wav
 │   ├── qwen.py                Ollama REST wrapper, all LLM calls, JSON extraction
@@ -406,6 +406,9 @@ family-assistant/
 │   ├── bulls_cows_service.py  Bulls and Cows game state, secret generation, spoken-digit parser
 │   ├── word_ladder_service.py BFS-validated word ladder puzzles; /usr/share/dict/words word set
 │   └── twenty_questions_service.py  20Q multi-turn Qwen session, phase management, answer normalisation
+│
+├── cameras.json               Persisted camera registry {cam_id: uri} — loaded by deepstream_service at startup
+├── clips/                     Per-camera H.264 MP4 clips (gitignored); served via GET /cameras/clips/file/{cam_id}/{fn}
 │
 ├── models/
 │   └── schemas.py             Pydantic models: IntentResult, TodoItem, EventItem
@@ -481,6 +484,10 @@ family-assistant/
 | `import cv2` must come after `Gst.init()` | cv2 (CUDA build) initialises NVIDIA codec libs on import, conflicting with DeepStream's CUDA init inside Gst.init(). Importing cv2 before Gst.init() → SIGABRT. Solution: remove cv2 from pipeline_worker.py entirely — use GStreamer's `nvjpegenc` for JPEG encoding instead. |
 | Per-camera chains instead of nvstreammux+tiler | nvstreammux batches streams for nvinfer — unnecessary for display-only pipelines. Per-camera chains (each with its own nvv4l2decoder→nvvideoconvert→nvjpegenc→appsink) are simpler, remove the nvmultistreamtiler, and scale independently. nvstreammux is only needed when running nvinfer on the pipeline output. |
 | nvjpegenc over jpegenc | nvjpegenc accepts `video/x-raw(memory:NVMM)` — the frame stays in GPU memory through encode. jpegenc (CPU) requires a GPU→CPU copy first. On an RTX 4070 Ti Super the difference is measurable in frame latency at 25fps. |
+| Software motion gate before Triton | Frame differencing on a 320×180 grayscale thumbnail (~0.5ms CPU) skips Triton entirely when the scene is static. Reduces inference calls by ~80–90% in idle scenes. `MOTION_GATE` env var disables it if needed. Camera-side hardware detection (Thingino webhook) documented in `improvement_ideas.md` as a future zero-CPU alternative. |
+| `imageio-ffmpeg` for clip encoding | System ffmpeg in the DeepStream 7.0 image is broken (libav `.so` files removed post-install despite dpkg listing them). `imageio-ffmpeg` pip package ships a bundled static ffmpeg binary with libx264; accessed via `imageio_ffmpeg.get_ffmpeg_exe()`. |
+| Direct `open(..., "w")` for cameras.json | `os.replace(tmp, dest)` (atomic rename) fails with `EBUSY` when `dest` is a Docker bind-mounted single file — Linux `rename(2)` can't replace a bind-mount inode. Direct write truncates in place, which is safe for a small JSON config file. |
+| `FileResponse` for clip serving (not httpx proxy) | FastAPI's `FileResponse` handles `Accept-Ranges` / `206 Partial Content` natively, which browsers require for video seeking. Forwarding through httpx would need manual Range header plumbing. The `clips/` directory is bind-mounted into both the deepstream and app containers so app can serve files directly. |
 
 ---
 

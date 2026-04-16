@@ -90,8 +90,12 @@ services:
       - ./models:/app/models          # TRT engine + metadata JSON
       - ${HOME}/.cache/ultralytics:/root/.cache/ultralytics
       - .:/workspace:ro               # host project dir → /workspace (test videos)
+      - ./cameras.json:/app/cameras.json   # persisted camera list
+      - ./clips:/app/clips                 # recorded detection clips
     environment:
       TRITON_URL: "triton:8001"
+      CAMERAS_JSON_PATH: /app/cameras.json
+      CLIPS_DIR: /app/clips
       PYTHONUNBUFFERED: "1"
       GST_DEBUG: "2"
     deploy:
@@ -160,6 +164,7 @@ services:
       - family-data:/data
       - app-logs:/app/logs
       - /home/jasvinder:/home/jasvinder:ro
+      - ./clips:/app/clips:ro           # serve detection clips directly (read-only)
     env_file:
       - .env
     environment:
