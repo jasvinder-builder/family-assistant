@@ -406,7 +406,7 @@
     }
 
     const cols = clips.map(c => {
-      const ts = new Date(c.timestamp * 1000).toLocaleString();
+      const ts = new Date(c.timestamp).toLocaleString();
       return `<div class="col-sm-6 col-md-4 col-xl-3">
         <div class="clip-card">
           <video controls preload="metadata" src="${escAttr(c.url)}"></video>

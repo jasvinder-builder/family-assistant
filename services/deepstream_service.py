@@ -32,7 +32,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -397,7 +397,7 @@ def _finalize_session(session: _ClipSession) -> None:
         "cam_id":    session.cam_id,
         "filename":  out_path.name,
         "path":      str(out_path),
-        "timestamp": session.wall_start,  # Unix epoch float — browser converts to local time
+        "timestamp": datetime.fromtimestamp(session.wall_start, tz=timezone.utc).isoformat(timespec="seconds"),
         "query":     session.query,
         "url":       f"/cameras/clips/file/{session.cam_id}/{out_path.name}",
     }
@@ -469,7 +469,7 @@ def _init_clip_index() -> None:
                     "cam_id":    cam_dir.name,
                     "filename":  mp4.name,
                     "path":      str(mp4),
-                    "timestamp": mp4.stat().st_mtime,  # Unix epoch float — browser converts to local time
+                    "timestamp": datetime.fromtimestamp(mp4.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds"),
                     "query":     query,
                     "url":       f"/cameras/clips/file/{cam_dir.name}/{mp4.name}",
                 })
