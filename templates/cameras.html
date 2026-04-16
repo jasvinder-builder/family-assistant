@@ -186,16 +186,28 @@
 
   let activeCams = {};   // {cam_id: url}
 
+  let _renderedCamIds = '';   // track last-rendered set to avoid unnecessary DOM rebuilds
+
   function renderGrid() {
     const grid   = document.getElementById('cameraGrid');
     const camIds = Object.keys(activeCams);
+    const camKey = camIds.slice().sort().join(',');
+
     if (camIds.length === 0) {
-      grid.innerHTML = `<div class="col-12">
-        <div class="card"><div class="card-body cam-placeholder">
-          No cameras connected. Add a stream above to get started.
-        </div></div></div>`;
+      if (_renderedCamIds !== '') {
+        grid.innerHTML = `<div class="col-12">
+          <div class="card"><div class="card-body cam-placeholder">
+            No cameras connected. Add a stream above to get started.
+          </div></div></div>`;
+        _renderedCamIds = '';
+      }
       return;
     }
+
+    // Only rebuild the DOM when the camera set has actually changed.
+    // Rebuilding tears down and recreates <img> + WebSocket, causing a visible flash.
+    if (camKey === _renderedCamIds) return;
+    _renderedCamIds = camKey;
 
     // Choose column width based on count
     const colClass = camIds.length === 1 ? 'col-12' : camIds.length <= 2 ? 'col-md-6' : 'col-md-6 col-xl-4';
