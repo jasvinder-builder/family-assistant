@@ -397,7 +397,7 @@ def _finalize_session(session: _ClipSession) -> None:
         "cam_id":    session.cam_id,
         "filename":  out_path.name,
         "path":      str(out_path),
-        "timestamp": datetime.fromtimestamp(session.wall_start).isoformat(timespec="seconds"),
+        "timestamp": session.wall_start,  # Unix epoch float — browser converts to local time
         "query":     session.query,
         "url":       f"/cameras/clips/file/{session.cam_id}/{out_path.name}",
     }
@@ -469,7 +469,7 @@ def _init_clip_index() -> None:
                     "cam_id":    cam_dir.name,
                     "filename":  mp4.name,
                     "path":      str(mp4),
-                    "timestamp": datetime.fromtimestamp(mp4.stat().st_mtime).isoformat(timespec="seconds"),
+                    "timestamp": mp4.stat().st_mtime,  # Unix epoch float — browser converts to local time
                     "query":     query,
                     "url":       f"/cameras/clips/file/{cam_dir.name}/{mp4.name}",
                 })
