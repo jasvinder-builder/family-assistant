@@ -587,6 +587,24 @@ Removed dead code accumulated since the GDINO → YOLO-World / camera_service �
 - `Dockerfile.deepstream` — added `imageio-ffmpeg>=0.5`
 - `improvement_ideas.md` — Thingino webhook motion detection (Option B)
 
+### 2026-04-16 — Pipeline JPEG fix + clip detection gate
+
+**What was fixed:**
+
+**`nvjpegenc` → `jpegenc`: no video on WebSocket (pipeline_worker.py)**
+- Symptom: GStreamer pipeline active (decoder warnings visible in logs), RTSP data flowing, but WebSocket delivered zero frames. `buf.map(Gst.MapFlags.READ)` silently returns `ok=False` for NVMM (GPU memory) buffers — `nvjpegenc` outputs NVMM, so `_send_frame` was never called, and `_frame_reader` blocked indefinitely on the pipe read.
+- Root cause: the April 14 session switched from `jpegenc` (software, system memory) to `nvjpegenc` (hardware, NVMM) as a GPU→CPU copy optimisation. The optimisation assumed the final JPEG bytes would be in system memory for appsink — they weren't.
+- Fix: reverted to software `jpegenc` with capsfilter `video/x-raw,format=I420` (no `memory:NVMM`). `nvvideoconvert` downloads the decoded frame from NVMM to system memory; `jpegenc` encodes on CPU; appsink receives a system-memory buffer that `buf.map(READ)` can access. Latency impact: ~1–3 ms extra per frame (CPU JPEG encode) vs <0.2 ms difference in PCIe transfer — imperceptible for live display.
+- The bug was dormant immediately post-commit because the container started fresh with no rapid RTSP restart loops. The manual `sudo rm *` on the clips directory triggered a service restart; the resulting RTSP failure retry loop may also have exposed the race in `_rebuild` (non-blocking lock skip), compounding the issue.
+
+**Minimum detections gate for clip recording (deepstream_service.py)**
+- Added `MIN_CLIP_DETECTIONS` (default 5, env-var tunable) to suppress stray single-frame detections from producing clips.
+- `_ClipSession` gained a `detection_count: int = 0` field. `_update_clip_session` increments it on every call (new session starts at 1, each extension adds 1). `_finalize_session` discards the clip and logs `"Clip discarded: ... detections=N < min=5"` if the count is below the threshold.
+
+**Changed files:**
+- `services/pipeline_worker.py` — `nvjpegenc` → `jpegenc`, capsfilter caps `video/x-raw,format=I420`
+- `services/deepstream_service.py` — `MIN_CLIP_DETECTIONS` config, `detection_count` on `_ClipSession`, gate in `_finalize_session`
+
 ---
 
 ## Open Questions / Future Ideas

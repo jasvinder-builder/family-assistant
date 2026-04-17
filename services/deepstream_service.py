@@ -56,6 +56,7 @@ POST_BUFFER_S      = int(os.environ.get("POST_BUFFER_S", "5"))
 MAX_CLIPS_PER_CAM  = int(os.environ.get("MAX_CLIPS_PER_CAM", "100"))
 CLIP_FPS           = int(os.environ.get("CLIP_FPS", "25"))      # clip recording FPS (matches display pipeline)
 MAX_CLIP_DURATION_S = int(os.environ.get("MAX_CLIP_DURATION_S", "60"))  # hard cap per clip chunk
+MIN_CLIP_DETECTIONS = int(os.environ.get("MIN_CLIP_DETECTIONS", "5"))   # discard clips with fewer detections
 
 MOTION_GATE       = os.environ.get("MOTION_GATE", "true").lower() == "true"
 MOTION_THRESHOLD  = float(os.environ.get("MOTION_THRESHOLD", "2.0"))  # mean pixel diff (0-255) to trigger inference
@@ -177,6 +178,7 @@ class _ClipSession:
     first_detection: float  # monotonic time of first detection — used for duration checks
     last_detection:  float  # monotonic time of most recent detection — used for gap checks
     wall_start:      float  # time.time() at session start — used for filename/timestamp
+    detection_count: int = 0  # total detections in this session — used for MIN_CLIP_DETECTIONS gate
 
 
 # ── Module-level state ────────────────────────────────────────────────────────
@@ -306,6 +308,7 @@ def _update_clip_session(cam_id: str, query: str, now: float) -> None:
     with _clip_sessions_lock:
         if cam_id in _clip_sessions:
             _clip_sessions[cam_id].last_detection = now
+            _clip_sessions[cam_id].detection_count += 1
         else:
             # Snapshot the current pre-buffer as the pre-event footage
             pre_frames = list(_pre_buffers.get(cam_id, []))
@@ -317,6 +320,7 @@ def _update_clip_session(cam_id: str, query: str, now: float) -> None:
                 first_detection=now,
                 last_detection=now,
                 wall_start=time.time(),
+                detection_count=1,
             )
             logger.info("Clip session started: cam=%s query=%r pre_frames=%d",
                         cam_id, query, len(pre_frames))
@@ -390,6 +394,10 @@ def _prune_clips(cam_id: str) -> None:
 
 def _finalize_session(session: _ClipSession) -> None:
     """Encode session frames, update clip index, prune old clips."""
+    if session.detection_count < MIN_CLIP_DETECTIONS:
+        logger.info("Clip discarded: cam=%s query=%r detections=%d < min=%d",
+                    session.cam_id, session.query, session.detection_count, MIN_CLIP_DETECTIONS)
+        return
     out_path = _encode_clip(session)
     if out_path is None:
         return

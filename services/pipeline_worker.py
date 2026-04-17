@@ -125,24 +125,24 @@ def _make_sample_cb(cam_id: str):
 def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
                        cam_id: str) -> bool:
     """
-    Attach nvvideoconvert → capsfilter → nvjpegenc → appsink to decoded_src_pad.
-    nvjpegenc accepts NVMM buffers so the frame stays in GPU memory until the
-    final JPEG bytes are handed to appsink — no GPU→CPU copy during encode.
+    Attach nvvideoconvert → capsfilter → jpegenc → appsink to decoded_src_pad.
+    nvvideoconvert downloads NVMM frames to system memory; jpegenc (software)
+    encodes to JPEG in system memory so appsink can map the buffer with READ access.
     All elements are added to pipeline and synced with parent state.
     Returns True on success.
     """
     convert    = Gst.ElementFactory.make("nvvideoconvert", f"convert-{cam_id}")
     capsfilter = Gst.ElementFactory.make("capsfilter",     f"caps-{cam_id}")
-    jpegenc    = Gst.ElementFactory.make("nvjpegenc",      f"jpeg-{cam_id}")
+    jpegenc    = Gst.ElementFactory.make("jpegenc",        f"jpeg-{cam_id}")
     sink       = Gst.ElementFactory.make("appsink",        f"sink-{cam_id}")
 
     if not all([convert, capsfilter, jpegenc, sink]):
         logger.error("Failed to create downstream chain elements for %s", cam_id)
         return False
 
-    # nvjpegenc requires NVMM I420 — keep frame in GPU memory through encode
+    # Force system-memory I420 output from nvvideoconvert so jpegenc can read it
     capsfilter.set_property("caps", Gst.Caps.from_string(
-        "video/x-raw(memory:NVMM),format=I420"
+        "video/x-raw,format=I420"
     ))
 
     sink.set_property("emit-signals", True)
@@ -166,7 +166,7 @@ def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
         logger.error("%s → nvvideoconvert link failed: %s", cam_id, ret)
         return False
 
-    logger.info("%s downstream chain ready (nvvideoconvert→nvjpegenc→appsink)", cam_id)
+    logger.info("%s downstream chain ready (nvvideoconvert→jpegenc→appsink)", cam_id)
     return True
 
 
