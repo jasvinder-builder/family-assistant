@@ -62,6 +62,7 @@ INFER_FPS   = int(os.environ.get("INFER_FPS",   "10"))
 _stop_flag = threading.Event()
 _last_ts: dict[str, float] = {}
 _stdout = sys.stdout.buffer
+_stdout_lock = threading.Lock()   # serialise writes from concurrent appsink threads
 
 
 # ── Wire protocol helpers ─────────────────────────────────────────────────────
@@ -78,8 +79,9 @@ def _send_frame(cam_id: str, jpeg_bytes: bytes, frame_type: int = 0) -> None:
         + jpeg_bytes
     )
     try:
-        _stdout.write(msg)
-        _stdout.flush()
+        with _stdout_lock:
+            _stdout.write(msg)
+            _stdout.flush()
     except BrokenPipeError:
         _stop_flag.set()
 
