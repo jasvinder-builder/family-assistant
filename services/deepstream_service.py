@@ -1265,6 +1265,9 @@ async def _set_roi(cam_id: str, payload: dict):
         roi = payload["roi"]
     elif all(k in payload for k in ("x", "y", "w", "h")):
         roi = {k: int(payload[k]) for k in ("x", "y", "w", "h")}
+        if "frame_w" in payload and "frame_h" in payload:
+            roi["frame_w"] = int(payload["frame_w"])
+            roi["frame_h"] = int(payload["frame_h"])
     try:
         await asyncio.to_thread(set_roi, cam_id, roi)
     except KeyError:
