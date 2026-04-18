@@ -623,16 +623,17 @@ def _frame_reader(proc: subprocess.Popen, streams_snapshot: dict) -> None:
         except Exception:
             pass
 
-    # Restart if this is still the active worker (not a superseded one)
+    # Restart if this is still the active worker (not a superseded one).
+    # Sleep before restart to prevent a tight loop when the camera is unreachable
+    # (e.g. IP change, network outage) — without backoff the loop hammers
+    # subprocess.Popen thousands of times and eventually crashes with RecursionError.
     global _worker_proc
     if _worker_proc is proc and streams_snapshot:
-        logger.info("Pipeline worker exited — restarting for file-loop / RTSP reconnect")
-        threading.Thread(
-            target=_rebuild,
-            args=(streams_snapshot,),
-            daemon=True,
-            name="ds-eos-restart",
-        ).start()
+        logger.info("Pipeline worker exited — restarting in 5s (RTSP reconnect backoff)")
+        def _delayed_rebuild():
+            time.sleep(5)
+            _rebuild(streams_snapshot)
+        threading.Thread(target=_delayed_rebuild, daemon=True, name="ds-eos-restart").start()
 
 
 # ── Subscriber management ─────────────────────────────────────────────────────
