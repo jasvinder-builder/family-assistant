@@ -555,12 +555,16 @@
   function drawRoiOverlay(camId) {
     const canvas = document.getElementById(`roi-canvas-${camId}`);
     if (!canvas) return;
-    const {w, h} = getFrameDims(camId);
+    const roi = activeCams[camId]?.roi;
+    // Use frame dims stored in the ROI (always correct, even before first frame arrives).
+    // Fall back to live img dims or constants only when no ROI is saved yet.
+    const {w, h} = roi?.frame_w
+      ? {w: roi.frame_w, h: roi.frame_h}
+      : getFrameDims(camId);
     canvas.width  = canvas.offsetWidth  || w;
     canvas.height = canvas.offsetHeight || h;
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const roi = activeCams[camId]?.roi;
     if (!roi || roiDrawing[camId]) return;
     const b = roiBounds(canvas, w, h);
     const dx = b.offX + roi.x * b.scale;
