@@ -573,7 +573,18 @@ def _frame_reader(proc: subprocess.Popen, streams_snapshot: dict) -> None:
             if jpeg_bytes is None or len(jpeg_bytes) != jpeg_len:
                 break
 
-            # frame_type byte is always 0 (single display branch, no tee).
+            if frame_type == 1:
+                # Inference frame: ROI-cropped JPEG from GStreamer videocrop branch.
+                # Route directly to inference slot — never broadcast or clip-record.
+                # Throttling is already applied in pipeline_worker appsink callback (INFER_FPS).
+                now = time.monotonic()
+                _last_infer[cam_id] = now
+                with _infer_slots_lock:
+                    _infer_slots[cam_id] = (jpeg_bytes, now)
+                _infer_event.set()
+                continue
+
+            # frame_type == 0: display frame.
             # Live WebSocket: apply debug overlay only for display — never bake boxes into
             # stored frames so clips and inference slots always use clean raw frames.
             display_jpeg = _apply_debug_overlay(cam_id, jpeg_bytes) if _debug_overlay else jpeg_bytes
@@ -594,28 +605,15 @@ def _frame_reader(proc: subprocess.Popen, streams_snapshot: dict) -> None:
                 if active_session is not None:
                     active_session.live_frames.append((ts_frame, jpeg_bytes))
 
-            # Inference slot throttled to INFER_FPS.
-            # If an ROI is configured, crop the frame in Python (cv2 slice, ~5ms at 10fps)
-            # before queuing for Triton — avoids GStreamer tee + NVMM buffer sharing issues.
-            now = time.monotonic()
-            if now - _last_infer.get(cam_id, 0.0) >= 1.0 / INFER_FPS:
-                _last_infer[cam_id] = now
-                roi = _rois.get(cam_id)
-                if roi:
-                    arr = cv2.imdecode(np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR)
-                    if arr is not None:
-                        cropped = arr[roi["y"]:roi["y"] + roi["h"],
-                                      roi["x"]:roi["x"] + roi["w"]]
-                        ok, buf = cv2.imencode(".jpg", cropped,
-                                              [cv2.IMWRITE_JPEG_QUALITY, 85])
-                        infer_jpeg = buf.tobytes() if ok else jpeg_bytes
-                    else:
-                        infer_jpeg = jpeg_bytes
-                else:
-                    infer_jpeg = jpeg_bytes
-                with _infer_slots_lock:
-                    _infer_slots[cam_id] = (infer_jpeg, now)
-                _infer_event.set()
+            # Inference slot: only when this camera has no ROI branch.
+            # When ROI is configured, the dedicated frame_type=1 branch above feeds inference.
+            if _rois.get(cam_id) is None:
+                now = time.monotonic()
+                if now - _last_infer.get(cam_id, 0.0) >= 1.0 / INFER_FPS:
+                    _last_infer[cam_id] = now
+                    with _infer_slots_lock:
+                        _infer_slots[cam_id] = (jpeg_bytes, now)
+                    _infer_event.set()
 
     except Exception as exc:
         logger.error("Frame reader error: %s", exc)
@@ -1026,12 +1024,14 @@ def remove_stream(cam_id: str) -> None:
 
 def set_roi(cam_id: str, roi: Optional[dict]) -> None:
     """Set or clear the inference ROI for a camera.
-    ROI is applied dynamically in _frame_reader (Python cv2 crop) — no pipeline restart needed."""
+    Triggers pipeline rebuild: the tee + videocrop branch is added/removed in GStreamer
+    based on whether roi is set, so the pipeline topology must change."""
     with _pipeline_lock:
         if cam_id not in _streams:
             raise KeyError(cam_id)
         _rois[cam_id] = roi
         _save_cameras(_streams, _rois)
+        _rebuild(dict(_streams))
 
 
 def get_streams() -> dict[str, dict]:

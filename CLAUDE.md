@@ -43,6 +43,16 @@ Update when a change affects:
 - **GPU:** RTX 4070 Ti Super (16GB VRAM) — Whisper ~1.5GB + Qwen ~10GB, ~4.5GB free
 - **Filler UX:** `/voice/transcription` returns filler phrase immediately, computation runs async, Twilio redirects to `/voice/answer/{sid}` for the real answer
 
+## Engineering Principles
+
+**Production quality over simplicity.** This project targets low latency and efficient resource use. Before trading GPU/hardware acceleration for a simpler CPU/Python fallback, ask the user first. Examples of changes that require explicit approval:
+- Replacing GPU-side processing (GStreamer elements, NVMM, nvvideoconvert, nvh264enc) with CPU equivalents (cv2, ffmpeg-python, numpy)
+- Moving work out of a pipeline/worker into a Python service loop
+- Adding extra encode/decode roundtrips (e.g. JPEG → numpy → JPEG) on a hot path
+- Introducing polling or sleep loops where event-driven would work
+
+When a hardware approach hits a real obstacle (driver bug, element unavailable, etc.), present the trade-off and wait for a decision rather than silently downgrading.
+
 ## Dev Workflow
 
 ```bash
