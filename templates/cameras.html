@@ -479,11 +479,24 @@
 
   // ── ROI drawing ───────────────────────────────────────────────────────────
 
+  // Fallback frame dimensions — only used before the first JPEG arrives.
+  // Actual dimensions are read from img.naturalWidth/naturalHeight so the
+  // coordinate mapping is correct regardless of camera resolution.
   const CAM_WIDTH  = 1280;
   const CAM_HEIGHT = 720;
 
   const roiDrawing = {};   // cam_id → bool (currently in draw mode)
   const roiDragStart = {}; // cam_id → {x, y} in canvas coords
+
+  // Return the actual frame pixel dimensions for a camera.
+  // Reads from the live <img> element so it always matches the real stream.
+  function getFrameDims(camId) {
+    const img = document.getElementById(`feed-${camId}`);
+    return {
+      w: (img?.naturalWidth  > 0 ? img.naturalWidth  : CAM_WIDTH),
+      h: (img?.naturalHeight > 0 ? img.naturalHeight : CAM_HEIGHT),
+    };
+  }
 
   // Update button state + overlay for a camera
   function refreshRoiBtn(camId) {
@@ -517,36 +530,39 @@
     refreshRoiBtn(camId);
   }
 
-  // Compute image display bounds within object-fit:contain canvas
-  function roiBounds(canvas) {
-    const cw = canvas.offsetWidth  || CAM_WIDTH;
-    const ch = canvas.offsetHeight || CAM_HEIGHT;
-    const scale = Math.min(cw / CAM_WIDTH, ch / CAM_HEIGHT);
-    const rendW = CAM_WIDTH  * scale;
-    const rendH = CAM_HEIGHT * scale;
-    return {offX: (cw - rendW) / 2, offY: (ch - rendH) / 2, scale, rendW, rendH};
+  // Compute image display bounds within object-fit:contain canvas.
+  // frameW/frameH must be the actual pixel dimensions of the source frame.
+  function roiBounds(canvas, frameW, frameH) {
+    const cw = canvas.offsetWidth  || frameW;
+    const ch = canvas.offsetHeight || frameH;
+    const scale = Math.min(cw / frameW, ch / frameH);
+    const rendW = frameW * scale;
+    const rendH = frameH * scale;
+    return {offX: (cw - rendW) / 2, offY: (ch - rendH) / 2, scale, rendW, rendH, frameW, frameH};
   }
 
-  function canvasToFrame(canvas, cx, cy) {
-    const b  = roiBounds(canvas);
+  function canvasToFrame(canvas, cx, cy, camId) {
+    const {w, h} = getFrameDims(camId);
+    const b = roiBounds(canvas, w, h);
     const fx = Math.round((cx - b.offX) / b.scale);
     const fy = Math.round((cy - b.offY) / b.scale);
     return {
-      x: Math.max(0, Math.min(CAM_WIDTH,  fx)),
-      y: Math.max(0, Math.min(CAM_HEIGHT, fy)),
+      x: Math.max(0, Math.min(w, fx)),
+      y: Math.max(0, Math.min(h, fy)),
     };
   }
 
   function drawRoiOverlay(camId) {
     const canvas = document.getElementById(`roi-canvas-${camId}`);
     if (!canvas) return;
-    canvas.width  = canvas.offsetWidth  || CAM_WIDTH;
-    canvas.height = canvas.offsetHeight || CAM_HEIGHT;
+    const {w, h} = getFrameDims(camId);
+    canvas.width  = canvas.offsetWidth  || w;
+    canvas.height = canvas.offsetHeight || h;
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const roi = activeCams[camId]?.roi;
     if (!roi || roiDrawing[camId]) return;
-    const b = roiBounds(canvas);
+    const b = roiBounds(canvas, w, h);
     const dx = b.offX + roi.x * b.scale;
     const dy = b.offY + roi.y * b.scale;
     const dw = roi.w * b.scale;
@@ -557,7 +573,6 @@
     ctx.strokeRect(dx, dy, dw, dh);
     ctx.fillStyle = 'rgba(99,102,241,0.12)';
     ctx.fillRect(dx, dy, dw, dh);
-    // Label
     ctx.fillStyle = 'rgba(99,102,241,0.9)';
     ctx.font = '11px sans-serif';
     ctx.fillText('Inference ROI', dx + 4, dy + 14);
@@ -605,8 +620,8 @@
       const rect = canvas.getBoundingClientRect();
       const ex   = e.clientX - rect.left;
       const ey   = e.clientY - rect.top;
-      const p1   = canvasToFrame(canvas, roiDragStart[camId].x, roiDragStart[camId].y);
-      const p2   = canvasToFrame(canvas, ex, ey);
+      const p1   = canvasToFrame(canvas, roiDragStart[camId].x, roiDragStart[camId].y, camId);
+      const p2   = canvasToFrame(canvas, ex, ey, camId);
       roiDragStart[camId] = null;
       const roi = {
         x: Math.min(p1.x, p2.x), y: Math.min(p1.y, p2.y),
@@ -621,9 +636,10 @@
   });
 
   async function saveRoi(camId, roi) {
-    // Include frame dimensions so the backend can compute videocrop right/bottom
+    // Include actual frame dimensions so the backend can compute videocrop right/bottom
     // immediately at pipeline build time — avoids wrong aspect ratio during caps negotiation.
-    const payload = { ...roi, frame_w: CAM_WIDTH, frame_h: CAM_HEIGHT };
+    const {w: frame_w, h: frame_h} = getFrameDims(camId);
+    const payload = { ...roi, frame_w, frame_h };
     const res = await fetch(`/cameras/streams/${encodeURIComponent(camId)}/roi`, {
       method: 'PATCH', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(payload),
