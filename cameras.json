@@ -1,3 +1,6 @@
 {
-  "front-door": "rtsp://thingino:thingino@192.168.86.23/ch0"
+  "balcony": {
+    "url": "rtsp://thingino:thingino@192.168.86.29/ch0",
+    "roi": null
+  }
 }

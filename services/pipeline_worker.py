@@ -125,29 +125,25 @@ def _make_sample_cb(cam_id: str, frame_type: int = 0):
     return cb
 
 
-# ── Per-camera downstream chains ──────────────────────────────────────────────
+# ── Per-camera downstream chain ───────────────────────────────────────────────
 
-def _make_jpeg_chain(pipeline: Gst.Pipeline, cam_id: str, suffix: str,
-                     roi: dict | None, frame_type: int) -> tuple:
+def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
+                       cam_id: str) -> bool:
     """
-    Build nvvideoconvert → capsfilter(I420) → jpegenc → appsink.
-    If roi is set, configures nvvideoconvert src-crop for GPU-side crop.
-    Returns (convert_element, appsink_element) or (None, None) on failure.
+    Attach nvvideoconvert → capsfilter(I420) → jpegenc → appsink to decoded_src_pad.
+    Single branch, always full-frame (frame_type=0).  ROI crop for inference is
+    applied in Python inside deepstream_service.py — avoids NVMM buffer sharing
+    issues that arise with a GStreamer tee + nvvideoconvert src-crop approach.
+    Returns True on success.
     """
-    convert    = Gst.ElementFactory.make("nvvideoconvert", f"convert-{suffix}")
-    capsfilter = Gst.ElementFactory.make("capsfilter",     f"caps-{suffix}")
-    jpegenc    = Gst.ElementFactory.make("jpegenc",        f"jpeg-{suffix}")
-    sink       = Gst.ElementFactory.make("appsink",        f"sink-{suffix}")
+    convert    = Gst.ElementFactory.make("nvvideoconvert", f"convert-{cam_id}")
+    capsfilter = Gst.ElementFactory.make("capsfilter",     f"caps-{cam_id}")
+    jpegenc    = Gst.ElementFactory.make("jpegenc",        f"jpeg-{cam_id}")
+    sink       = Gst.ElementFactory.make("appsink",        f"sink-{cam_id}")
 
     if not all([convert, capsfilter, jpegenc, sink]):
-        logger.error("Failed to create chain elements for %s", suffix)
-        return None, None
-
-    if roi:
-        convert.set_property(
-            "src-crop",
-            f"{roi['x']}:{roi['y']}:{roi['w']}:{roi['h']}",
-        )
+        logger.error("Failed to create downstream chain elements for %s", cam_id)
+        return False
 
     capsfilter.set_property("caps", Gst.Caps.from_string("video/x-raw,format=I420"))
 
@@ -155,7 +151,7 @@ def _make_jpeg_chain(pipeline: Gst.Pipeline, cam_id: str, suffix: str,
     sink.set_property("max-buffers",  2)
     sink.set_property("drop",         True)
     sink.set_property("sync",         False)
-    sink.connect("new-sample", _make_sample_cb(cam_id, frame_type), None)
+    sink.connect("new-sample", _make_sample_cb(cam_id, 0), None)
 
     for el in [convert, capsfilter, jpegenc, sink]:
         pipeline.add(el)
@@ -164,106 +160,26 @@ def _make_jpeg_chain(pipeline: Gst.Pipeline, cam_id: str, suffix: str,
     if not (convert.link(capsfilter)
             and capsfilter.link(jpegenc)
             and jpegenc.link(sink)):
-        logger.error("Chain link failed for %s", suffix)
-        return None, None
-
-    return convert, sink
-
-
-def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
-                       cam_id: str, roi: dict | None = None) -> bool:
-    """
-    Attach downstream chain(s) to decoded_src_pad.
-
-    No ROI: single display chain (frame_type=0) — existing behaviour.
-    ROI set: tee → display branch (frame_type=0) + inference branch with
-             GPU src-crop (frame_type=1).
-
-    nvvideoconvert downloads NVMM frames to system memory; jpegenc (software)
-    encodes to JPEG so appsink can map the buffer with READ access.
-    Returns True on success.
-    """
-    if roi is None:
-        # Single branch: display + inference on same frame (no tee)
-        convert, _ = _make_jpeg_chain(pipeline, cam_id, cam_id, None, frame_type=0)
-        if convert is None:
-            return False
-        ret = decoded_src_pad.link(convert.get_static_pad("sink"))
-        if ret != Gst.PadLinkReturn.OK:
-            logger.error("%s → nvvideoconvert link failed: %s", cam_id, ret)
-            return False
-        logger.info("%s display chain ready (no ROI)", cam_id)
-        return True
-
-    # Two branches: display (full frame) + inference (ROI crop) via tee
-    tee = Gst.ElementFactory.make("tee", f"tee-{cam_id}")
-    if tee is None:
-        logger.error("Failed to create tee for %s", cam_id)
+        logger.error("Downstream chain link failed for %s", cam_id)
         return False
-    pipeline.add(tee)
-    tee.sync_state_with_parent()
 
-    ret = decoded_src_pad.link(tee.get_static_pad("sink"))
+    ret = decoded_src_pad.link(convert.get_static_pad("sink"))
     if ret != Gst.PadLinkReturn.OK:
-        logger.error("%s → tee link failed: %s", cam_id, ret)
+        logger.error("%s → nvvideoconvert link failed: %s", cam_id, ret)
         return False
 
-    # Branch A — display (full frame, frame_type=0)
-    q_disp = Gst.ElementFactory.make("queue", f"q-disp-{cam_id}")
-    if q_disp is None:
-        logger.error("Failed to create display queue for %s", cam_id)
-        return False
-    pipeline.add(q_disp)
-    q_disp.sync_state_with_parent()
-    tee_src0 = tee.get_request_pad("src_%u")
-    if tee_src0 is None or tee_src0.link(q_disp.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
-        logger.error("tee → display queue link failed for %s", cam_id)
-        return False
-    conv_disp, _ = _make_jpeg_chain(
-        pipeline, cam_id, f"{cam_id}-disp", None, frame_type=0
-    )
-    if conv_disp is None:
-        return False
-    if not q_disp.get_static_pad("src").link(conv_disp.get_static_pad("sink")) == Gst.PadLinkReturn.OK:
-        logger.error("display queue → nvvideoconvert link failed for %s", cam_id)
-        return False
-
-    # Branch B — inference (ROI crop, frame_type=1)
-    q_infer = Gst.ElementFactory.make("queue", f"q-infer-{cam_id}")
-    if q_infer is None:
-        logger.error("Failed to create infer queue for %s", cam_id)
-        return False
-    pipeline.add(q_infer)
-    q_infer.sync_state_with_parent()
-    tee_src1 = tee.get_request_pad("src_%u")
-    if tee_src1 is None or tee_src1.link(q_infer.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
-        logger.error("tee → infer queue link failed for %s", cam_id)
-        return False
-    conv_infer, _ = _make_jpeg_chain(
-        pipeline, cam_id, f"{cam_id}-infer", roi, frame_type=1
-    )
-    if conv_infer is None:
-        return False
-    if not q_infer.get_static_pad("src").link(conv_infer.get_static_pad("sink")) == Gst.PadLinkReturn.OK:
-        logger.error("infer queue → nvvideoconvert link failed for %s", cam_id)
-        return False
-
-    logger.info(
-        "%s tee ready: display (full) + inference (ROI %s:%s:%s:%s)",
-        cam_id, roi["x"], roi["y"], roi["w"], roi["h"],
-    )
+    logger.info("%s downstream chain ready (nvvideoconvert→jpegenc→appsink)", cam_id)
     return True
 
 
 # ── Source helpers ────────────────────────────────────────────────────────────
 
-def _add_rtsp_source(pipeline: Gst.Pipeline, cam_id: str, uri: str,
-                     roi: dict | None = None) -> None:
+def _add_rtsp_source(pipeline: Gst.Pipeline, cam_id: str, uri: str) -> None:
     """
     Add an RTSP source using rtspsrc directly (bypasses nvurisrcbin which
     requires a config file in DS7.0).  Decode chain per camera:
       rtspsrc → rtph264/5depay → h264/5parse → nvv4l2decoder → queue
-            → [tee →] nvvideoconvert → capsfilter → jpegenc → appsink
+            → nvvideoconvert → capsfilter → jpegenc → appsink
     Audio pads from rtspsrc are silently ignored.
     """
     src = Gst.ElementFactory.make("rtspsrc", f"src-{cam_id}")
@@ -274,7 +190,7 @@ def _add_rtsp_source(pipeline: Gst.Pipeline, cam_id: str, uri: str,
     src.set_property("latency",  0)
     pipeline.add(src)
 
-    def on_rtp_pad(rtspsrc_el, new_pad, _cid=cam_id, _pl=pipeline, _roi=roi):
+    def on_rtp_pad(rtspsrc_el, new_pad, _cid=cam_id, _pl=pipeline):
         caps = new_pad.get_current_caps() or new_pad.query_caps()
         if not caps or caps.get_size() == 0:
             return
@@ -311,13 +227,12 @@ def _add_rtsp_source(pipeline: Gst.Pipeline, cam_id: str, uri: str,
             logger.error("Decode chain link failed for %s", _cid)
             return
 
-        _attach_downstream(_pl, q.get_static_pad("src"), _cid, _roi)
+        _attach_downstream(_pl, q.get_static_pad("src"), _cid)
 
     src.connect("pad-added", on_rtp_pad)
 
 
-def _add_file_source(pipeline: Gst.Pipeline, cam_id: str, uri: str,
-                     roi: dict | None = None) -> None:
+def _add_file_source(pipeline: Gst.Pipeline, cam_id: str, uri: str) -> None:
     """Add a file source using uridecodebin."""
     src = Gst.ElementFactory.make("uridecodebin", f"src-{cam_id}")
     if src is None:
@@ -325,13 +240,13 @@ def _add_file_source(pipeline: Gst.Pipeline, cam_id: str, uri: str,
         sys.exit(1)
     src.set_property("uri", uri)
 
-    def on_pad_added(src_bin, new_pad, _cid=cam_id, _pl=pipeline, _roi=roi):
+    def on_pad_added(src_bin, new_pad, _cid=cam_id, _pl=pipeline):
         caps = new_pad.get_current_caps() or new_pad.query_caps()
         if not caps or caps.get_size() == 0:
             return
         if "video" not in caps.get_structure(0).get_name():
             return
-        _attach_downstream(_pl, new_pad, _cid, _roi)
+        _attach_downstream(_pl, new_pad, _cid)
 
     src.connect("pad-added", on_pad_added)
     pipeline.add(src)
@@ -347,16 +262,12 @@ def _build_and_run(stream_map: dict) -> None:
 
     for cam_id, cam_info in stream_map.items():
         # Support both old format {"cam": "rtsp://..."} and new {"cam": {"url":..., "roi":...}}
-        if isinstance(cam_info, str):
-            uri, roi = cam_info, None
-        else:
-            uri = cam_info.get("url", "")
-            roi = cam_info.get("roi")   # {x, y, w, h} or None
+        uri = cam_info if isinstance(cam_info, str) else cam_info.get("url", "")
 
         if uri.lower().startswith("rtsp://"):
-            _add_rtsp_source(pipeline, cam_id, uri, roi)
+            _add_rtsp_source(pipeline, cam_id, uri)
         else:
-            _add_file_source(pipeline, cam_id, uri, roi)
+            _add_file_source(pipeline, cam_id, uri)
 
     ret = pipeline.set_state(Gst.State.PLAYING)
     if ret == Gst.StateChangeReturn.FAILURE:
