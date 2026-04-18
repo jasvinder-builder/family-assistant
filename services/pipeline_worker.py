@@ -169,12 +169,12 @@ def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
         # ── Tee → display branch + inference branch ──────────────────────────
         tee = Gst.ElementFactory.make("tee", f"tee-{cam_id}")
 
-        # Display branch
+        # Display branch — leaky queue so a slow consumer never blocks the tee
         q_d    = Gst.ElementFactory.make("queue",   f"q-disp-{cam_id}")
         jpeg_d = Gst.ElementFactory.make("jpegenc", f"jpeg-disp-{cam_id}")
         sink_d = Gst.ElementFactory.make("appsink", f"sink-disp-{cam_id}")
 
-        # Inference branch (ROI-cropped)
+        # Inference branch — leaky queue so inference backlog never starves display
         q_i    = Gst.ElementFactory.make("queue",     f"q-inf-{cam_id}")
         vcrop  = Gst.ElementFactory.make("videocrop", f"vcrop-{cam_id}")
         jpeg_i = Gst.ElementFactory.make("jpegenc",   f"jpeg-inf-{cam_id}")
@@ -218,6 +218,13 @@ def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
                     logger.info("%s videocrop: left=%d top=%d right=%d bottom=%d (from caps)",
                                 cam_id, _roi["x"], _roi["y"], right, bottom)
             vcrop.get_static_pad("sink").connect("notify::caps", _on_vcrop_caps)
+
+        # leaky=downstream: drop the newest buffer when queue is full rather than
+        # blocking the tee pad.  Prevents a slow inference consumer from starving
+        # the display branch — both branches run independently.
+        for q in [q_d, q_i]:
+            q.set_property("leaky", 2)        # GST_QUEUE_LEAK_DOWNSTREAM = 2
+            q.set_property("max-size-buffers", 2)
 
         # Configure appsinks
         for sink, ft in [(sink_d, 0), (sink_i, 1)]:
