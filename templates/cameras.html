@@ -621,9 +621,12 @@
   });
 
   async function saveRoi(camId, roi) {
+    // Include frame dimensions so the backend can compute videocrop right/bottom
+    // immediately at pipeline build time — avoids wrong aspect ratio during caps negotiation.
+    const payload = { ...roi, frame_w: CAM_WIDTH, frame_h: CAM_HEIGHT };
     const res = await fetch(`/cameras/streams/${encodeURIComponent(camId)}/roi`, {
       method: 'PATCH', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(roi),
+      body: JSON.stringify(payload),
     }).catch(() => null);
     if (!res || !res.ok) return;
     const data = await res.json();

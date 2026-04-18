@@ -184,27 +184,40 @@ def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
             logger.error("Failed to create tee branch elements for %s", cam_id)
             return False
 
-        # videocrop: left/top are pixel counts to remove from each edge.
-        # right/bottom = frame_w/h - (roi_x/y + roi_w/h) — set once caps are known.
+        # videocrop: left/top are pixels to remove from each edge.
+        # right/bottom = frame_w/h - (roi_x/y + roi_w/h).
+        # Use stored frame dimensions if available (set by browser at ROI save time)
+        # to compute right/bottom immediately — avoids wrong aspect ratio during the
+        # caps-negotiation window.  Fall back to notify::caps for legacy roi dicts.
         vcrop.set_property("left", roi["x"])
         vcrop.set_property("top",  roi["y"])
 
-        def _on_vcrop_caps(pad, _pspec, _vcrop=vcrop, _roi=roi):
-            caps = pad.get_current_caps()
-            if not caps or caps.get_size() == 0:
-                return
-            s = caps.get_structure(0)
-            ok_w, frame_w = s.get_int("width")
-            ok_h, frame_h = s.get_int("height")
-            if ok_w and ok_h and frame_w and frame_h:
-                right  = max(0, frame_w - (_roi["x"] + _roi["w"]))
-                bottom = max(0, frame_h - (_roi["y"] + _roi["h"]))
-                _vcrop.set_property("right",  right)
-                _vcrop.set_property("bottom", bottom)
-                logger.info("%s videocrop: left=%d top=%d right=%d bottom=%d",
-                            cam_id, _roi["x"], _roi["y"], right, bottom)
-
-        vcrop.get_static_pad("sink").connect("notify::caps", _on_vcrop_caps)
+        frame_w_known = roi.get("frame_w")
+        frame_h_known = roi.get("frame_h")
+        if frame_w_known and frame_h_known:
+            vcrop.set_property("right",  max(0, frame_w_known - (roi["x"] + roi["w"])))
+            vcrop.set_property("bottom", max(0, frame_h_known - (roi["y"] + roi["h"])))
+            logger.info("%s videocrop: left=%d top=%d right=%d bottom=%d (from roi dims)",
+                        cam_id, roi["x"], roi["y"],
+                        max(0, frame_w_known - (roi["x"] + roi["w"])),
+                        max(0, frame_h_known - (roi["y"] + roi["h"])))
+        else:
+            # Fallback: set right/bottom once caps are negotiated
+            def _on_vcrop_caps(pad, _pspec, _vcrop=vcrop, _roi=roi):
+                caps = pad.get_current_caps()
+                if not caps or caps.get_size() == 0:
+                    return
+                s = caps.get_structure(0)
+                ok_w, fw = s.get_int("width")
+                ok_h, fh = s.get_int("height")
+                if ok_w and ok_h and fw and fh:
+                    right  = max(0, fw - (_roi["x"] + _roi["w"]))
+                    bottom = max(0, fh - (_roi["y"] + _roi["h"]))
+                    _vcrop.set_property("right",  right)
+                    _vcrop.set_property("bottom", bottom)
+                    logger.info("%s videocrop: left=%d top=%d right=%d bottom=%d (from caps)",
+                                cam_id, _roi["x"], _roi["y"], right, bottom)
+            vcrop.get_static_pad("sink").connect("notify::caps", _on_vcrop_caps)
 
         # Configure appsinks
         for sink, ft in [(sink_d, 0), (sink_i, 1)]:
