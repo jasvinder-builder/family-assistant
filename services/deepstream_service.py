@@ -186,6 +186,7 @@ class _ClipSession:
 _pipeline_lock = threading.Lock()
 _rebuild_lock  = threading.Lock()      # serialises concurrent _rebuild calls
 _streams: dict[str, str] = {}          # cam_id → uri (ordered by insertion)
+_rois:    dict[str, Optional[dict]] = {}  # cam_id → {x,y,w,h} | None
 
 # Subprocess that owns the GStreamer pipeline (isolated from asyncio)
 _worker_proc:         Optional[subprocess.Popen] = None
@@ -275,28 +276,42 @@ def _commit_queries(new_queries: list[str]) -> None:
 
 # ── Camera persistence (cameras.json) ────────────────────────────────────────
 
-def _load_cameras() -> dict[str, str]:
-    """Load persisted camera list from cameras.json. Returns {} on missing/corrupt file."""
+def _load_cameras() -> tuple[dict[str, str], dict[str, Optional[dict]]]:
+    """Load persisted camera list from cameras.json.
+    Supports both old format {"cam": "rtsp://..."} and new {"cam": {"url":..., "roi":...}}.
+    Returns (streams, rois) — both default to {} on missing/corrupt file."""
     try:
         with open(CAMERAS_JSON_PATH) as f:
             data = json.load(f)
-        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+        streams: dict[str, str] = {}
+        rois:    dict[str, Optional[dict]] = {}
+        for k, v in data.items():
+            if not isinstance(k, str):
+                continue
+            if isinstance(v, str):
+                streams[k] = v
+                rois[k]    = None
+            elif isinstance(v, dict) and "url" in v:
+                streams[k] = v["url"]
+                rois[k]    = v.get("roi")  # {x,y,w,h} or None
+        return streams, rois
     except FileNotFoundError:
-        return {}
+        return {}, {}
     except Exception as exc:
         logger.warning("Failed to load cameras.json: %s", exc)
-        return {}
+        return {}, {}
 
 
-def _save_cameras(streams: dict[str, str]) -> None:
-    """Write camera list to cameras.json.
+def _save_cameras(streams: dict[str, str], rois: dict[str, Optional[dict]]) -> None:
+    """Write camera list to cameras.json in new {url, roi} format.
 
     Note: atomic tmp+rename fails with EBUSY on Docker bind-mounted single files
     (rename(2) can't replace a bind-mount inode). Write directly instead.
     """
+    data = {cam_id: {"url": uri, "roi": rois.get(cam_id)} for cam_id, uri in streams.items()}
     try:
         with open(CAMERAS_JSON_PATH, "w") as f:
-            json.dump(streams, f, indent=2)
+            json.dump(data, f, indent=2)
     except Exception as exc:
         logger.warning("Failed to save cameras.json: %s", exc)
 
@@ -543,6 +558,12 @@ def _frame_reader(proc: subprocess.Popen, streams_snapshot: dict) -> None:
                 break
             cam_id = cam_id_bytes.decode("utf-8")
 
+            # frame_type byte: 0 = display, 1 = inference (ROI-cropped)
+            ft_hdr = _read_exactly(src, 1)
+            if ft_hdr is None:
+                break
+            frame_type = struct.unpack(">B", ft_hdr)[0]
+
             jpeg_len_hdr = _read_exactly(src, 4)
             if jpeg_len_hdr is None:
                 break
@@ -552,11 +573,22 @@ def _frame_reader(proc: subprocess.Popen, streams_snapshot: dict) -> None:
             if jpeg_bytes is None or len(jpeg_bytes) != jpeg_len:
                 break
 
-            # Optional debug overlay (decode → draw → re-encode)
-            if _debug_overlay:
-                jpeg_bytes = _apply_debug_overlay(cam_id, jpeg_bytes)
+            if frame_type == 1:
+                # Inference-only frame (ROI crop) — route straight to inference slot.
+                # Never broadcast or clip-record; those paths use the full display frame.
+                now = time.monotonic()
+                if now - _last_infer.get(cam_id, 0.0) >= 1.0 / INFER_FPS:
+                    _last_infer[cam_id] = now
+                    with _infer_slots_lock:
+                        _infer_slots[cam_id] = (jpeg_bytes, now)
+                    _infer_event.set()
+                continue
 
-            _broadcast(cam_id, jpeg_bytes)
+            # frame_type == 0: display frame — broadcast + pre-buffer + clip + inference (if no ROI)
+            # Live WebSocket: apply debug overlay only for display — never bake boxes into
+            # stored frames so clips and inference slots always use clean raw frames.
+            display_jpeg = _apply_debug_overlay(cam_id, jpeg_bytes) if _debug_overlay else jpeg_bytes
+            _broadcast(cam_id, display_jpeg)
 
             # Pre-event buffer + clip session feed — rate-limited to CLIP_FPS to bound RAM/disk.
             # At CLIP_FPS=10: pre-buffer holds 50 frames (5s), a 60s clip uses ≤600 frames (~30MB JPEG).
@@ -573,13 +605,15 @@ def _frame_reader(proc: subprocess.Popen, streams_snapshot: dict) -> None:
                 if active_session is not None:
                     active_session.live_frames.append((ts_frame, jpeg_bytes))
 
-            # Inference slot throttled to INFER_FPS
-            now = time.monotonic()
-            if now - _last_infer.get(cam_id, 0.0) >= 1.0 / INFER_FPS:
-                _last_infer[cam_id] = now
-                with _infer_slots_lock:
-                    _infer_slots[cam_id] = (jpeg_bytes, now)
-                _infer_event.set()
+            # Inference slot — only if this camera has no dedicated ROI inference branch.
+            # When ROI is active the frame_type=1 branch above feeds inference instead.
+            if _rois.get(cam_id) is None:
+                now = time.monotonic()
+                if now - _last_infer.get(cam_id, 0.0) >= 1.0 / INFER_FPS:
+                    _last_infer[cam_id] = now
+                    with _infer_slots_lock:
+                        _infer_slots[cam_id] = (jpeg_bytes, now)
+                    _infer_event.set()
 
     except Exception as exc:
         logger.error("Frame reader error: %s", exc)
@@ -757,9 +791,16 @@ def _inference_loop() -> None:
             now  = time.monotonic()
             dets: list[Detection] = []
 
+            # ROI offset: boxes from Triton are in ROI-crop coordinate space.
+            # Translate to full-frame coordinates for overlay and clip recording.
+            roi = _rois.get(cam_id)
+            roi_ox = roi["x"] if roi else 0
+            roi_oy = roi["y"] if roi else 0
+
             for i in range(len(t_boxes)):
                 track_id = int(t_tids[i])
                 x1, y1, x2, y2 = map(int, t_boxes[i])
+                # Clamp to inference-frame bounds first (crop or full frame)
                 x1 = max(0, x1); y1 = max(0, y1)
                 x2 = min(w, x2); y2 = min(h, y2)
                 if x2 <= x1 or y2 <= y1:
@@ -777,6 +818,10 @@ def _inference_loop() -> None:
                 if label and conf >= _threshold:
                     _update_clip_session(cam_id, label, now)
 
+                # Translate box from inference-frame coords to full-frame coords
+                fx1 = x1 + roi_ox; fy1 = y1 + roi_oy
+                fx2 = x2 + roi_ox; fy2 = y2 + roi_oy
+
                 if label and now - fired.get(key, 0.0) > RECHECK_INTERVAL_S:
                     score_buf.setdefault(key, deque(maxlen=3)).append(conf)
                     if len(score_buf[key]) >= 1:
@@ -784,6 +829,7 @@ def _inference_loop() -> None:
                         if mean_conf >= _threshold:
                             fired[key] = now
                             score_buf.pop(key, None)
+                            # Crop from inference frame (ROI-relative coords are still valid here)
                             crop        = frame[y1:y2, x1:x2]
                             ok_j, j_buf = cv2.imencode(
                                 ".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 80]
@@ -806,9 +852,10 @@ def _inference_loop() -> None:
                                 cam_id, track_id, label, mean_conf,
                             )
 
+                # Store full-frame coordinates for overlay + clip crop
                 dets.append(Detection(
                     track_id=track_id,
-                    box=(x1, y1, x2, y2),
+                    box=(fx1, fy1, fx2, fy2),
                     scores=scores_dict,
                     label=label,
                     cam_id=cam_id,
@@ -842,7 +889,12 @@ def _start_pipeline_worker(stream_map: dict[str, str]) -> None:
     if not stream_map:
         return
 
-    cmd = [sys.executable, _WORKER_SCRIPT, json.dumps(stream_map)]
+    # Pass ROI info per camera: {"cam": {"url": uri, "roi": {x,y,w,h}|null}}
+    worker_map = {
+        cam_id: {"url": uri, "roi": _rois.get(cam_id)}
+        for cam_id, uri in stream_map.items()
+    }
+    cmd = [sys.executable, _WORKER_SCRIPT, json.dumps(worker_map)]
     logger.info("Spawning pipeline worker: %s", cmd)
 
     proc = subprocess.Popen(
@@ -936,6 +988,7 @@ def _rebuild(new_streams: dict[str, str]) -> None:
             _pre_buffers.pop(cam_id, None)
             _last_clip_frame.pop(cam_id, None)
             _motion_prev.pop(cam_id, None)
+            _rois.pop(cam_id, None)
             with _clip_sessions_lock:
                 _clip_sessions.pop(cam_id, None)
 
@@ -959,18 +1012,32 @@ def add_stream(cam_id: str, uri: str) -> None:
         new = dict(_streams)
         new[cam_id] = uri
         _rebuild(new)
-        _save_cameras(_streams)
+        _save_cameras(_streams, _rois)
 
 
 def remove_stream(cam_id: str) -> None:
     with _pipeline_lock:
         new = {k: v for k, v in _streams.items() if k != cam_id}
         _rebuild(new)
-        _save_cameras(_streams)
+        _save_cameras(_streams, _rois)
 
 
-def get_streams() -> dict[str, str]:
-    return dict(_streams)
+def set_roi(cam_id: str, roi: Optional[dict]) -> None:
+    """Set or clear the inference ROI for a camera. Triggers pipeline rebuild."""
+    with _pipeline_lock:
+        if cam_id not in _streams:
+            raise KeyError(cam_id)
+        _rois[cam_id] = roi
+        _save_cameras(_streams, _rois)
+        _rebuild(dict(_streams))
+
+
+def get_streams() -> dict[str, dict]:
+    """Return {cam_id: {url, roi}} for all active streams."""
+    return {
+        cam_id: {"url": uri, "roi": _rois.get(cam_id)}
+        for cam_id, uri in _streams.items()
+    }
 
 
 # ── Backward-compatible single-camera API ────────────────────────────────────
@@ -1134,9 +1201,11 @@ def _init_queries() -> None:
 
 
 def _init_cameras() -> None:
-    cameras = _load_cameras()
+    cameras, rois = _load_cameras()
     for cam_id, uri in cameras.items():
-        logger.info("Restoring camera from cameras.json: %s → %s", cam_id, uri)
+        logger.info("Restoring camera from cameras.json: %s → %s (roi=%s)",
+                    cam_id, uri, rois.get(cam_id))
+        _rois[cam_id] = rois.get(cam_id)
         add_stream(cam_id, uri)
 
 
@@ -1177,10 +1246,29 @@ async def _add_stream(payload: dict):
 
 @app.delete("/streams/{cam_id}")
 async def _remove_stream(cam_id: str):
-    if cam_id not in get_streams():
+    if cam_id not in _streams:
         return _JSONResponse({"error": f"stream '{cam_id}' not found"}, status_code=404)
     await asyncio.to_thread(remove_stream, cam_id)
     return _JSONResponse({"ok": True, "streams": get_streams()})
+
+
+@app.patch("/streams/{cam_id}/roi")
+async def _set_roi(cam_id: str, payload: dict):
+    """Set or clear the inference ROI for a camera.
+    Body: {"x": int, "y": int, "w": int, "h": int} to set, {} or {"roi": null} to clear."""
+    if cam_id not in _streams:
+        return _JSONResponse({"error": f"stream '{cam_id}' not found"}, status_code=404)
+    roi = None
+    if payload.get("roi") is not None:
+        roi = payload["roi"]
+    elif all(k in payload for k in ("x", "y", "w", "h")):
+        roi = {k: int(payload[k]) for k in ("x", "y", "w", "h")}
+    try:
+        await asyncio.to_thread(set_roi, cam_id, roi)
+    except KeyError:
+        return _JSONResponse({"error": f"stream '{cam_id}' not found"}, status_code=404)
+    logger.info("ROI updated: cam=%s roi=%s", cam_id, roi)
+    return _JSONResponse({"ok": True, "cam_id": cam_id, "roi": roi, "streams": get_streams()})
 
 
 @app.get("/queries")

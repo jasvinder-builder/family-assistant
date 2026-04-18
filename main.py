@@ -350,6 +350,11 @@ async def cameras_list_streams():
     return await _ds_proxy("GET", "/streams")
 
 
+@app.patch("/cameras/streams/{cam_id}/roi")
+async def cameras_set_roi(cam_id: str, payload: dict):
+    return await _ds_proxy("PATCH", f"/streams/{cam_id}/roi", payload)
+
+
 @app.get("/cameras/clips")
 async def cameras_list_clips(cam_id: str | None = None):
     qs = f"?cam_id={cam_id}" if cam_id else ""

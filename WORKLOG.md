@@ -607,6 +607,51 @@ Removed dead code accumulated since the GDINO → YOLO-World / camera_service �
 
 ---
 
+### 2026-04-17 — Per-camera inference ROI (GPU crop via GStreamer tee)
+
+**What was built:**
+
+**Per-camera ROI drawn in browser, applied in GStreamer pipeline (zero CPU cost)**
+- User draws a crop rectangle on the live camera feed in the browser (canvas overlay). Coordinates are stored per camera in `cameras.json` and passed to the pipeline worker.
+- When an ROI is configured, `pipeline_worker.py` inserts a `tee` element after the decoder and creates two downstream branches:
+  - **Branch A (display)**: unchanged full-frame path → `jpegenc` → `appsink` → WebSocket → browser
+  - **Branch B (inference)**: `nvvideoconvert[src-crop=ROI]` → `jpegenc` → `appsink` → Triton
+- The GPU-side crop (`nvvideoconvert src-crop` property, format `"x:y:w:h"`) reduces the inference frame to just the region of interest (e.g. the road strip at 40-50m), improving small-object detection without any CPU decode/re-encode overhead.
+- Without ROI, the single-branch architecture is preserved (no tee, backward compatible).
+
+**Wire protocol extended with `frame_type` byte**
+- Protocol was: `[4B cam_id_len][cam_id][4B jpeg_len][jpeg]`
+- Now: `[4B cam_id_len][cam_id][1B frame_type][4B jpeg_len][jpeg]`
+- `frame_type=0`: display frame → broadcast to WebSocket + pre-buffer + clip session; also feeds inference slot if no ROI configured
+- `frame_type=1`: ROI-cropped inference frame → only feeds `_infer_slots`; never broadcast or clip-recorded
+
+**ROI offset applied in inference loop**
+- Triton boxes are in ROI-crop coordinate space. After getting results, `roi_ox = roi["x"]` and `roi_oy = roi["y"]` offsets are added to translate back to full-frame coordinates for the debug overlay and `Detection` objects. Event image thumbnails are cropped from the inference frame (ROI-relative coords are still valid there).
+
+**`cameras.json` schema updated**
+- Old: `{"cam-id": "rtsp://..."}` (string value)
+- New: `{"cam-id": {"url": "rtsp://...", "roi": {"x": 0, "y": 300, "w": 1280, "h": 250}}}` (`roi` is `null` when unset)
+- `_load_cameras()` parses both formats (backward compatible). `_save_cameras()` always writes new format.
+
+**New API endpoint: `PATCH /cameras/streams/{cam_id}/roi`**
+- Accepts `{"x": int, "y": int, "w": int, "h": int}` to set ROI, or `{}` to clear.
+- Persists to `cameras.json` and triggers pipeline rebuild.
+
+**Browser UI: canvas ROI drawing on camera cards**
+- Each camera tile gets a transparent canvas overlay and a "ROI" button (bottom-left).
+- Clicking "ROI" enters draw mode (canvas captures mouse, cursor crosshair, button turns yellow).
+- Drag to draw rectangle → on mouseup, saves to backend and shows the saved ROI as a semi-transparent indigo rectangle with "Inference ROI" label.
+- A "✕" clear button appears next to the ROI button when ROI is set.
+- Coordinate conversion accounts for `object-fit: contain` letterboxing using the known 1280×720 camera aspect ratio.
+
+**Changed files:**
+- `services/pipeline_worker.py` — wire protocol `frame_type` byte, `_make_jpeg_chain` helper, `_attach_downstream` tee logic, `_add_rtsp_source`/`_add_file_source` roi param, `_build_and_run` new stream_map format
+- `services/deepstream_service.py` — `_rois` state dict, `_load_cameras`/`_save_cameras` new schema, `_start_pipeline_worker` passes ROI in worker_map, `_frame_reader` routes by `frame_type`, inference loop ROI offset, `set_roi()` function, `get_streams()` returns `{url, roi}`, `PATCH /streams/{cam_id}/roi` endpoint
+- `main.py` — `PATCH /cameras/streams/{cam_id}/roi` proxy route
+- `templates/cameras.html` — canvas overlay, ROI draw/clear UI, `drawRoiOverlay`, `refreshRoiBtn`, mouse event handlers
+
+---
+
 ## Open Questions / Future Ideas
 - Add a "complete todo" voice command ("mark buy groceries as done")
 - Scheduled reminders: outbound WhatsApp at event time
