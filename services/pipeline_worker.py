@@ -16,6 +16,7 @@ Protocol — stdout (binary, big-endian):
   Normal frame:
     [4B: cam_id UTF-8 byte length]
     [N bytes: cam_id]
+    [1B: frame_type  0=display  1=inference]
     [4B: JPEG byte length]
     [M bytes: JPEG]
   EOS / shutdown signal:
@@ -25,11 +26,23 @@ Control — stdin (text lines):
   "STOP\\n"  →  clean shutdown
 
 Pipeline topology — one chain per camera, no tiler:
-  RTSP:  rtspsrc → rtph264/5depay → h264/5parse → nvv4l2decoder
-              → nvvideoconvert → capsfilter → jpegenc → appsink
-  File:  uridecodebin → nvvideoconvert → capsfilter → jpegenc → appsink
 
-JPEG encoding is handled by GStreamer's jpegenc element (no cv2/numpy needed).
+  Live display is handled by go2rtc (reads RTSP directly from go2rtc's re-stream).
+  No display branch here — only inference + recording.
+
+  With ROI:
+    rtspsrc → nvv4l2decoder → nvvideoconvert → capsfilter(I420,sys) → tee
+      ├─ queue(leaky) → videocrop(ROI) → jpegenc → appsink[inference, ft=1, INFER_FPS]
+      └─ queue        → nvvideoconvert(NVMM) → nvh264enc → h264parse → splitmuxsink[segs]
+
+  Without ROI:
+    rtspsrc → nvv4l2decoder → nvvideoconvert → capsfilter(I420,sys) → tee
+      ├─ queue(leaky) → jpegenc → appsink[inference, ft=1, INFER_FPS]
+      └─ queue        → nvvideoconvert(NVMM) → nvh264enc → h264parse → splitmuxsink[segs]
+
+JPEG encoding: GStreamer jpegenc for inference crops only.
+Segment recording: nvh264enc → splitmuxsink writes rolling .ts segments via mpegtsmux.
+  format-location fires on new segment; frame_type=2 JSON event sent to deepstream_service.
 """
 
 import json
@@ -56,13 +69,23 @@ Gst.init(None)
 _glib_loop = GLib.MainLoop()
 threading.Thread(target=_glib_loop.run, daemon=True, name="glib-main-loop").start()
 
-DISPLAY_FPS = int(os.environ.get("DISPLAY_FPS", "25"))
-INFER_FPS   = int(os.environ.get("INFER_FPS",   "10"))
+DISPLAY_FPS    = int(os.environ.get("DISPLAY_FPS",    "25"))
+INFER_FPS      = int(os.environ.get("INFER_FPS",      "10"))
+SEG_DURATION_S = int(os.environ.get("SEG_DURATION_S", "30"))   # rolling segment length
+MAX_SEG_FILES  = int(os.environ.get("MAX_SEG_FILES",  "25"))   # ~12.5 min pre-buffer
+CLIPS_DIR      = os.environ.get("CLIPS_DIR", "/app/clips")
 
 _stop_flag = threading.Event()
 _last_ts: dict[str, float] = {}
 _stdout = sys.stdout.buffer
 _stdout_lock = threading.Lock()   # serialise writes from concurrent appsink threads
+
+# splitmuxsink elements indexed by cam_id — used by the SPLIT stdin command
+_splitmuxers: dict[str, object] = {}
+_splitmuxers_lock = threading.Lock()
+
+# Per-camera current in-flight segment: {path, start_wall}
+_seg_info: dict[str, dict] = {}
 
 
 # ── Wire protocol helpers ─────────────────────────────────────────────────────
@@ -128,6 +151,123 @@ def _make_sample_cb(cam_id: str, frame_type: int = 0):
     return cb
 
 
+# ── Recording branch helpers ──────────────────────────────────────────────────
+
+def _build_recording_branch(pipeline: Gst.Pipeline, cam_id: str) -> tuple:
+    """
+    Build and return (q_r, mux_r) — the recording tee branch elements.
+
+    Chain: queue → nvvideoconvert(NVMM) → nvh264enc → h264parse → splitmuxsink
+
+    nvvideoconvert re-uploads the I420 system-memory buffer (output from the
+    upstream capsfilter) back to NVMM so nvh264enc can GPU-encode it.  The
+    double copy (NVMM→sys for jpegenc, sys→NVMM for nvh264enc) is acceptable
+    because the recording branch runs at the same rate as the source (~25fps)
+    but the encode is fast on hardware.
+
+    splitmuxsink writes rolling SEG_DURATION_S-second MP4 segments to
+    CLIPS_DIR/{cam_id}/segs/seg_%05d.mp4.  It emits:
+      - format-location: when creating a new file (we record start_wall)
+      - finished-file:   when a segment is done (we send frame_type=2 to parent)
+    """
+    segs_dir = os.path.join(CLIPS_DIR, cam_id, "segs")
+    try:
+        os.makedirs(segs_dir, exist_ok=True)
+    except Exception as exc:
+        logger.error("Cannot create segs dir %s: %s", segs_dir, exc)
+        return None, None
+
+    q_r      = Gst.ElementFactory.make("queue",           f"q-rec-{cam_id}")
+    conv_r   = Gst.ElementFactory.make("nvvideoconvert",  f"conv-rec-{cam_id}")
+    caps_r   = Gst.ElementFactory.make("capsfilter",      f"caps-rec-{cam_id}")
+    enc_r    = Gst.ElementFactory.make("nvv4l2h264enc",   f"enc-{cam_id}")
+    parse_r  = Gst.ElementFactory.make("h264parse",       f"h264parse-{cam_id}")
+    mux_r    = Gst.ElementFactory.make("splitmuxsink",    f"splitmux-{cam_id}")
+
+    if not all([q_r, conv_r, caps_r, enc_r, parse_r, mux_r]):
+        logger.error("Failed to create recording branch elements for %s", cam_id)
+        return None, None
+
+    # Recording queue: leaky=2 (drop oldest) to prevent the non-draining encoder
+    # from deadlocking the tee.  GStreamer tee pushes synchronously — a blocked
+    # branch blocks ALL branches, including the leaky inference branch.  Making
+    # this queue leaky means the tee never waits; occasional frame drops during
+    # the initial go2rtc burst are acceptable.
+    q_r.set_property("leaky",            2)     # GST_QUEUE_LEAK_DOWNSTREAM
+    q_r.set_property("max-size-buffers", 600)   # ~40 s at 15 fps before leaking
+    q_r.set_property("max-size-time",    int(10 * Gst.SECOND))
+
+    # nvvideoconvert must output NVMM — nvv4l2h264enc only accepts memory:NVMM
+    caps_r.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:NVMM),format=I420"))
+
+    # nvv4l2h264enc: bitrate is in bits/s (not kbps)
+    enc_r.set_property("bitrate",        3000000)   # 3 Mbps — good quality for 1080p/720p
+    enc_r.set_property("iframeinterval", 30)        # keyframe every 30 frames (~1s)
+
+    # h264parse: resend SPS/PPS with every IDR so each segment is self-contained.
+    parse_r.set_property("config-interval", -1)
+
+    # splitmuxsink: use mpegtsmux instead of the default mp4mux.
+    # nvv4l2h264enc output buffers have no PTS — mp4mux rejects them with
+    # "Buffer has no PTS"; mpegtsmux is designed for streaming and tolerates
+    # missing / inconsistent timestamps without error.
+    tsmux = Gst.ElementFactory.make("mpegtsmux", f"tsmux-{cam_id}")
+    if tsmux is None:
+        logger.error("mpegtsmux not available — recording branch disabled for %s", cam_id)
+        return None, None
+    mux_r.set_property("muxer",         tsmux)
+    mux_r.set_property("location",      os.path.join(segs_dir, "seg_%05d.ts"))
+    mux_r.set_property("max-size-time", SEG_DURATION_S * Gst.SECOND)
+    mux_r.set_property("max-files",     MAX_SEG_FILES)
+
+    # ── Signal handlers ────────────────────────────────────────────────────────
+    # splitmuxsink in GStreamer < 1.18 has no finished-file signal.
+    # Instead, format-location fires when a NEW segment opens — at that point
+    # the PREVIOUS segment is complete.  We emit the frame_type=2 boundary event
+    # for the old segment when the next segment starts.
+
+    def _on_format_location(mux, frag_id, _cam=cam_id):
+        """Called when splitmuxsink opens a new segment file."""
+        now  = time.time()
+        path = os.path.join(CLIPS_DIR, _cam, "segs", f"seg_{frag_id:05d}.ts")
+
+        # Close out the PREVIOUS segment (frag_id > 0 means there was one)
+        prev = _seg_info.get(_cam)
+        if prev and prev.get("start_wall"):
+            payload = json.dumps({
+                "path":       prev["path"],
+                "start_wall": prev["start_wall"],
+                "end_wall":   now,
+            }).encode()
+            _send_frame(_cam, payload, frame_type=2)
+            logger.info("Segment finished: cam=%s path=%s dur=%.1fs",
+                        _cam, os.path.basename(prev["path"]), now - prev["start_wall"])
+
+        # Record the new segment
+        _seg_info[_cam] = {"path": path, "start_wall": now}
+        logger.info("Segment started: cam=%s frag=%d path=%s", _cam, frag_id, path)
+        return path   # splitmuxsink uses the returned path as the actual filename
+
+    mux_r.connect("format-location", _on_format_location)
+
+    with _splitmuxers_lock:
+        _splitmuxers[cam_id] = mux_r
+
+    # Add and link
+    for el in [q_r, conv_r, caps_r, enc_r, parse_r, mux_r]:
+        pipeline.add(el)
+        el.sync_state_with_parent()
+
+    if not (q_r.link(conv_r) and conv_r.link(caps_r) and caps_r.link(enc_r)
+            and enc_r.link(parse_r) and parse_r.link(mux_r)):
+        logger.error("Recording branch link failed for %s", cam_id)
+        return None, None
+
+    logger.info("%s recording branch: queue→nvh264enc→mpegtsmux→splitmuxsink (%s, %ds segs)",
+                cam_id, segs_dir, SEG_DURATION_S)
+    return q_r, mux_r
+
+
 # ── Per-camera downstream chain ───────────────────────────────────────────────
 
 def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
@@ -135,62 +275,62 @@ def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
     """
     Build the downstream chain from decoded_src_pad.
 
-    Without ROI (single branch):
-        nvv4l2decoder → nvvideoconvert → capsfilter(I420,system-mem)
-          → jpegenc → appsink[display, frame_type=0]
+    No display branch — go2rtc handles live display directly from RTSP.
 
-    With ROI (tee after NVMM exit — safe because system-memory buffers are
-    copied by tee, not shared by reference like NVMM buffers):
-        nvv4l2decoder → nvvideoconvert → capsfilter(I420,system-mem) → tee
-          ├─ queue → jpegenc → appsink[display,   frame_type=0, DISPLAY_FPS]
-          └─ queue → videocrop → jpegenc → appsink[inference, frame_type=1, INFER_FPS]
+    With ROI:
+        → capsfilter(I420,sys) → tee
+          ├─ queue(leaky) → videocrop(ROI) → jpegenc → appsink[inference, ft=1]
+          └─ queue        → nvvideoconvert(NVMM) → nvh264enc → h264parse → splitmuxsink
 
-    videocrop left/top are set immediately; right/bottom are computed once caps
-    are negotiated (pad notify::caps signal) so we don't need to know frame dims upfront.
+    Without ROI:
+        → capsfilter(I420,sys) → tee
+          ├─ queue(leaky) → jpegenc → appsink[inference, ft=1]
+          └─ queue        → nvvideoconvert(NVMM) → nvh264enc → h264parse → splitmuxsink
     """
     # ── Shared head: NVMM → I420 system memory ──────────────────────────────
     convert    = Gst.ElementFactory.make("nvvideoconvert", f"convert-{cam_id}")
     capsfilter = Gst.ElementFactory.make("capsfilter",     f"caps-{cam_id}")
+    tee        = Gst.ElementFactory.make("tee",            f"tee-{cam_id}")
 
-    if not all([convert, capsfilter]):
-        logger.error("Failed to create convert chain for %s", cam_id)
+    if not all([convert, capsfilter, tee]):
+        logger.error("Failed to create head elements for %s", cam_id)
         return False
 
-    # Request I420 WITHOUT memory:NVMM → nvvideoconvert outputs system memory.
     capsfilter.set_property("caps", Gst.Caps.from_string("video/x-raw,format=I420"))
 
-    for el in [convert, capsfilter]:
+    for el in [convert, capsfilter, tee]:
         pipeline.add(el)
         el.sync_state_with_parent()
 
-    if not convert.link(capsfilter):
-        logger.error("convert → capsfilter link failed for %s", cam_id)
+    if not (convert.link(capsfilter) and capsfilter.link(tee)):
+        logger.error("head chain link failed for %s", cam_id)
         return False
 
+    # ── Branch A: inference ──────────────────────────────────────────────────
+    # With ROI: videocrop → jpegenc → appsink (ft=1, cropped region)
+    # Without ROI: jpegenc → appsink (ft=1, full frame)
+    q_i    = Gst.ElementFactory.make("queue",   f"q-inf-{cam_id}")
+    jpeg_i = Gst.ElementFactory.make("jpegenc", f"jpeg-inf-{cam_id}")
+    sink_i = Gst.ElementFactory.make("appsink", f"sink-inf-{cam_id}")
+
+    if not all([q_i, jpeg_i, sink_i]):
+        logger.error("Failed to create inference branch elements for %s", cam_id)
+        return False
+
+    q_i.set_property("leaky",            2)   # GST_QUEUE_LEAK_DOWNSTREAM
+    q_i.set_property("max-size-buffers", 2)
+    sink_i.set_property("emit-signals", True)
+    sink_i.set_property("max-buffers",  2)
+    sink_i.set_property("drop",         True)
+    sink_i.set_property("sync",         False)
+    sink_i.connect("new-sample", _make_sample_cb(cam_id, 1), None)
+
     if roi:
-        # ── Tee → display branch + inference branch ──────────────────────────
-        tee = Gst.ElementFactory.make("tee", f"tee-{cam_id}")
-
-        # Display branch — leaky queue so a slow consumer never blocks the tee
-        q_d    = Gst.ElementFactory.make("queue",   f"q-disp-{cam_id}")
-        jpeg_d = Gst.ElementFactory.make("jpegenc", f"jpeg-disp-{cam_id}")
-        sink_d = Gst.ElementFactory.make("appsink", f"sink-disp-{cam_id}")
-
-        # Inference branch — leaky queue so inference backlog never starves display
-        q_i    = Gst.ElementFactory.make("queue",     f"q-inf-{cam_id}")
-        vcrop  = Gst.ElementFactory.make("videocrop", f"vcrop-{cam_id}")
-        jpeg_i = Gst.ElementFactory.make("jpegenc",   f"jpeg-inf-{cam_id}")
-        sink_i = Gst.ElementFactory.make("appsink",   f"sink-inf-{cam_id}")
-
-        if not all([tee, q_d, jpeg_d, sink_d, q_i, vcrop, jpeg_i, sink_i]):
-            logger.error("Failed to create tee branch elements for %s", cam_id)
+        vcrop = Gst.ElementFactory.make("videocrop", f"vcrop-{cam_id}")
+        if vcrop is None:
+            logger.error("Failed to create videocrop for %s", cam_id)
             return False
 
-        # videocrop: left/top are pixels to remove from each edge.
-        # right/bottom = frame_w/h - (roi_x/y + roi_w/h).
-        # Use stored frame dimensions if available (set by browser at ROI save time)
-        # to compute right/bottom immediately — avoids wrong aspect ratio during the
-        # caps-negotiation window.  Fall back to notify::caps for legacy roi dicts.
         vcrop.set_property("left", roi["x"])
         vcrop.set_property("top",  roi["y"])
 
@@ -199,12 +339,11 @@ def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
         if frame_w_known and frame_h_known:
             vcrop.set_property("right",  max(0, frame_w_known - (roi["x"] + roi["w"])))
             vcrop.set_property("bottom", max(0, frame_h_known - (roi["y"] + roi["h"])))
-            logger.info("%s videocrop: left=%d top=%d right=%d bottom=%d (from roi dims)",
+            logger.info("%s videocrop: left=%d top=%d right=%d bottom=%d",
                         cam_id, roi["x"], roi["y"],
                         max(0, frame_w_known - (roi["x"] + roi["w"])),
                         max(0, frame_h_known - (roi["y"] + roi["h"])))
         else:
-            # Fallback: set right/bottom once caps are negotiated
             def _on_vcrop_caps(pad, _pspec, _vcrop=vcrop, _roi=roi):
                 caps = pad.get_current_caps()
                 if not caps or caps.get_size() == 0:
@@ -217,80 +356,41 @@ def _attach_downstream(pipeline: Gst.Pipeline, decoded_src_pad: Gst.Pad,
                     bottom = max(0, fh - (_roi["y"] + _roi["h"]))
                     _vcrop.set_property("right",  right)
                     _vcrop.set_property("bottom", bottom)
-                    logger.info("%s videocrop: left=%d top=%d right=%d bottom=%d (from caps)",
+                    logger.info("%s videocrop: left=%d top=%d right=%d bottom=%d (caps)",
                                 cam_id, _roi["x"], _roi["y"], right, bottom)
             vcrop.get_static_pad("sink").connect("notify::caps", _on_vcrop_caps)
 
-        # leaky=downstream: drop the newest buffer when queue is full rather than
-        # blocking the tee pad.  Prevents a slow inference consumer from starving
-        # the display branch — both branches run independently.
-        for q in [q_d, q_i]:
-            q.set_property("leaky", 2)        # GST_QUEUE_LEAK_DOWNSTREAM = 2
-            q.set_property("max-size-buffers", 2)
-
-        # Configure appsinks
-        for sink, ft in [(sink_d, 0), (sink_i, 1)]:
-            sink.set_property("emit-signals", True)
-            sink.set_property("max-buffers",  2)
-            sink.set_property("drop",         True)
-            sink.set_property("sync",         False)
-            sink.connect("new-sample", _make_sample_cb(cam_id, ft), None)
-
-        for el in [tee, q_d, jpeg_d, sink_d, q_i, vcrop, jpeg_i, sink_i]:
+        for el in [q_i, vcrop, jpeg_i, sink_i]:
             pipeline.add(el)
             el.sync_state_with_parent()
-
-        if not capsfilter.link(tee):
-            logger.error("capsfilter → tee link failed for %s", cam_id)
-            return False
-
-        # Request two src pads from tee (tee.src_%u template)
-        tee_src_d = tee.get_request_pad("src_%u")
-        tee_src_i = tee.get_request_pad("src_%u")
-        if tee_src_d is None or tee_src_i is None:
-            logger.error("Could not get tee src pads for %s", cam_id)
-            return False
-
-        if tee_src_d.link(q_d.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
-            logger.error("tee → display queue link failed for %s", cam_id)
-            return False
-        if not (q_d.link(jpeg_d) and jpeg_d.link(sink_d)):
-            logger.error("Display branch link failed for %s", cam_id)
-            return False
-
-        if tee_src_i.link(q_i.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
-            logger.error("tee → inference queue link failed for %s", cam_id)
-            return False
-        if not (q_i.link(vcrop) and vcrop.link(jpeg_i) and jpeg_i.link(sink_i)):
-            logger.error("Inference branch link failed for %s", cam_id)
-            return False
-
-        logger.info("%s downstream: tee → [display] + [videocrop%s→infer]",
-                    cam_id, repr(roi))
+        infer_chain_ok = q_i.link(vcrop) and vcrop.link(jpeg_i) and jpeg_i.link(sink_i)
     else:
-        # ── Single branch (no ROI) ────────────────────────────────────────────
-        jpegenc = Gst.ElementFactory.make("jpegenc",  f"jpeg-{cam_id}")
-        sink    = Gst.ElementFactory.make("appsink",  f"sink-{cam_id}")
-
-        if not all([jpegenc, sink]):
-            logger.error("Failed to create single-branch elements for %s", cam_id)
-            return False
-
-        sink.set_property("emit-signals", True)
-        sink.set_property("max-buffers",  2)
-        sink.set_property("drop",         True)
-        sink.set_property("sync",         False)
-        sink.connect("new-sample", _make_sample_cb(cam_id, 0), None)
-
-        for el in [jpegenc, sink]:
+        for el in [q_i, jpeg_i, sink_i]:
             pipeline.add(el)
             el.sync_state_with_parent()
+        infer_chain_ok = q_i.link(jpeg_i) and jpeg_i.link(sink_i)
 
-        if not (capsfilter.link(jpegenc) and jpegenc.link(sink)):
-            logger.error("Single-branch link failed for %s", cam_id)
+    if not infer_chain_ok:
+        logger.error("Inference branch link failed for %s", cam_id)
+        return False
+
+    tee_src_i = tee.request_pad_simple("src_%u")
+    if tee_src_i is None or tee_src_i.link(q_i.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+        logger.error("tee → inference queue link failed for %s", cam_id)
+        return False
+
+    # ── Branch B: recording (splitmuxsink) ────────────────────────────────────
+    q_r, mux_r = _build_recording_branch(pipeline, cam_id)
+    if q_r is None:
+        logger.warning("%s recording branch unavailable — skipping", cam_id)
+    else:
+        tee_src_r = tee.request_pad_simple("src_%u")
+        if tee_src_r is None or tee_src_r.link(q_r.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+            logger.error("tee → recording queue link failed for %s", cam_id)
             return False
 
-        logger.info("%s downstream: single branch (nvvideoconvert→jpegenc→appsink)", cam_id)
+    logger.info("%s downstream: tee → [inference%s] + [recording]",
+                cam_id, "/crop" if roi else "")
 
     ret = decoded_src_pad.link(convert.get_static_pad("sink"))
     if ret != Gst.PadLinkReturn.OK:
@@ -316,8 +416,21 @@ def _add_rtsp_source(pipeline: Gst.Pipeline, cam_id: str, uri: str,
         logger.error("Could not create rtspsrc for %s", cam_id)
         sys.exit(1)
     src.set_property("location", uri)
-    src.set_property("latency",  0)
+    # 5 s jitter buffer: go2rtc sends buffered H.264 (up to ~40 s of content) in a burst
+    # when GStreamer first connects.  The rtpjitterbuffer resets when the measured skew
+    # exceeds latency/2.  With latency=2000, the tolerance is 1000 ms; go2rtc's burst
+    # causes up to 1.2 s of skew → reset → byte freeze.  With latency=5000 the tolerance
+    # is 2500 ms, safely above the observed burst skew.
+    src.set_property("latency",  5000)
+    src.set_property("do-rtcp", False)   # go2rtc doesn't forward RTCP SR; without this, the
+                                          # jitter buffer times out the video RTP source at ~30s
+                                          # and silently stops pulling video from go2rtc (zombie stall).
     pipeline.add(src)
+
+    # Guard: rtspsrc can fire pad-added multiple times for the same video track
+    # (e.g. after a jitter-buffer reset or RTSP renegotiation).  Only build the
+    # decode chain once — subsequent firings would fail with duplicate element names.
+    _video_connected = [False]
 
     def on_rtp_pad(rtspsrc_el, new_pad, _cid=cam_id, _pl=pipeline, _roi=roi):
         caps = new_pad.get_current_caps() or new_pad.query_caps()
@@ -328,8 +441,20 @@ def _add_rtsp_source(pipeline: Gst.Pipeline, cam_id: str, uri: str,
         enc     = (struct_.get_string("encoding-name") or "").upper()
 
         if media != "video":
-            logger.debug("rtspsrc pad skipped (media=%s)", media)
+            # Drain non-video (audio) pads into a fakesink so the rtspsrc
+            # jitter buffer doesn't time out and send an EOS.
+            sink = Gst.ElementFactory.make("fakesink", None)
+            if sink:
+                sink.set_property("sync", False)
+                _pl.add(sink)
+                sink.sync_state_with_parent()
+                new_pad.link(sink.get_static_pad("sink"))
             return
+
+        if _video_connected[0]:
+            logger.debug("%s: video pad-added fired again — skipping duplicate decode chain", _cid)
+            return
+        _video_connected[0] = True
 
         if enc in ("H265", "HEVC"):
             depay_name, parse_name = "rtph265depay", "h265parse"
@@ -436,10 +561,20 @@ def _build_and_run(stream_map: dict) -> None:
 def _stdin_watcher() -> None:
     try:
         for line in sys.stdin:
-            if line.strip() == "STOP":
+            cmd = line.strip()
+            if cmd == "STOP":
                 logger.info("Received STOP — shutting down")
                 _stop_flag.set()
                 break
+            elif cmd.startswith("SPLIT "):
+                cam_id = cmd[6:].strip()
+                with _splitmuxers_lock:
+                    mux = _splitmuxers.get(cam_id)
+                if mux:
+                    mux.emit("split-now")
+                    logger.info("Received SPLIT %s — forcing segment cut", cam_id)
+                else:
+                    logger.warning("Received SPLIT %s but no splitmuxer found", cam_id)
     except Exception:
         pass
     _stop_flag.set()

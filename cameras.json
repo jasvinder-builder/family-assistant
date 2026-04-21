@@ -1,6 +1,13 @@
 {
   "balcony": {
     "url": "rtsp://thingino:thingino@192.168.86.29/ch0",
-    "roi": null
+    "roi": {
+      "x": 78,
+      "y": 100,
+      "w": 559,
+      "h": 248,
+      "frame_w": 640,
+      "frame_h": 360
+    }
   }
 }

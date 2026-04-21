@@ -8,27 +8,36 @@ Bianca is a family assistant that runs entirely on local hardware. It handles da
 - All AI runs locally on GPU — no cloud AI services, no subscriptions
 - Video decoding and ML inference happen entirely on the GPU (CPU never touches video frames)
 - Surveillance alerts are defined in plain English — no retraining required
-- Five Docker containers on one machine, managed by Docker Compose
+- Nine containers on one machine (five static in Docker Compose + four dynamic per camera), managed by Docker Compose + Docker SDK
 
-The stack is built on five GPU-capable containers:
+The stack is built on several GPU-capable containers:
 
 | Container | Role | GPU | Key tech |
 |---|---|---|---|
 | `bianca-app` | FastAPI app, all routes, browser UI | No (CPU-only) | FastAPI, uvicorn, Jinja2 |
 | `bianca-whisper` | Speech-to-text | Yes | faster-whisper large-v3 |
-| `bianca-deepstream` | Video ingest + frame broadcast | Yes | DeepStream 7.0, GStreamer NVDEC |
+| `bianca-deepstream` | Inference service, REST API, clip management | Yes | DeepStream 7.0, Triton HTTP client, Docker SDK |
+| `bianca-savant-module` | RTSP frame ingestion, rate-limited JPEG forwarding | Yes | Savant DeepStream, pyfunc (NvDsPyFuncPlugin) |
+| `bianca-go2rtc` | RTSP normalizing proxy — single camera connection, re-streams DTS-clean RTSP | No | go2rtc 1.9.14, RTSP :8554, HTTP API :1984 |
+| `bianca-rtsp-{cam_id}` | Per-camera RTSP adapter (dynamic, Docker SDK) | No | Savant GStreamer RTSP adapter |
+| `bianca-sink-{cam_id}` | Per-camera live display (dynamic, Docker SDK) | Yes | Savant Always-On Sink, LL-HLS :888, RTSP :554 |
 | `bianca-triton` | Object detection inference | Yes | Triton 25.03, YOLO-World M TRT |
 | `bianca-ollama` | LLM for NLU and generation | Yes | Ollama, Qwen 2.5:14b |
 
 Inter-container communication:
 
 ```
-Browser/Twilio ──HTTPS──► app:8000 ──HTTP──► whisper:8080      (STT)
-                                    ──HTTP──► deepstream:8090   (video frames + events)
-                                    ──HTTP──► ollama:11434      (LLM)
-                                    ──HTTP──► triton:8002       (Triton model management)
-                                    ──HTTP──► triton:8004       (TRT re-export trigger)
-                    deepstream:8090 ──HTTP──► triton:8002       (YOLO inference)
+Browser/Twilio ──HTTPS──► app:8000 ──HTTP──► whisper:8080           (STT)
+                                    ──HTTP──► deepstream:8090        (video frames + events)
+                                    ──HTTP──► ollama:11434           (LLM)
+                                    ──HTTP──► triton:8002            (Triton model management)
+                                    ──HTTP──► triton:8004            (TRT re-export trigger)
+                    deepstream:8090 ──HTTP──► triton:8002            (YOLO inference)
+                    deepstream:8090 ──HTTP──► go2rtc:1984            (stream registration)
+                                             go2rtc:8554 ──RTSP──► rtsp-{cam_id}:*  (normalized stream)
+                     rtsp-{cam_id}  ──ZMQ──► savant-module:5555
+                    savant-module   ──ZMQ──► sink-{cam_id}:*        (encoded frames for display)
+                    savant-module ──HTTP──► deepstream:8090          (JPEG frames for inference)
 ```
 
 ---
@@ -47,7 +56,8 @@ Browser/Twilio ──HTTPS──► app:8000 ──HTTP──► whisper:8080   
 | Messaging | Twilio WhatsApp API | Async research + reminder delivery |
 | Storage | Markdown file (`family.md`) | Human-readable, editable, no DB setup |
 | File locking | `filelock` | Prevents concurrent write corruption |
-| Video ingest | DeepStream 7.0 — `pipeline_worker.py` subprocess: rtspsrc → nvv4l2decoder → nvvideoconvert → nvjpegenc → appsink | 100% NVDEC GPU decode; frame stays in NVMM until final JPEG bytes; subprocess isolation avoids asyncio↔rtspsrc SIGABRT |
+| Video ingest | Savant DeepStream framework — per-camera RTSP adapter container → ZeroMQ → Savant module (`pyfunc`) → HTTP POST to deepstream service | Savant handles RTCP SR sync and resilient reconnect; pyfunc extracts NVMM frames via `get_nvds_buf_surface`, applies ROI crop, encodes JPEG, POSTs to `/internal/frame` at configurable FPS |
+| Live display | Savant Always-On Sink (LL-HLS port 888) | LL-HLS served directly from pipeline output; browser uses hls.js; no go2rtc fMP4 issues |
 | Scene detection | YOLO-World M TRT via Triton 25.03 | Open-vocabulary detection; 8ms median @ 1280×720; queries updated without TRT re-export |
 | Object tracking | `_SimpleTracker` (pure-numpy IoU) | Persistent track IDs, deduplication; CPU-only; no pybind11/supervision |
 | Inference serving | NVIDIA Triton Inference Server 25.03 (Python backend + TRT) | Model management API enables live query swaps; HTTP :8002 for inference + model control |
@@ -84,8 +94,11 @@ graph TD
         subgraph triton["bianca-triton :8001/8002/8003/8004"]
             T1["Triton Inference Server 25.03\nYOLO-World M TRT backend\n~0.3 GB VRAM\nHTTP :8002  gRPC :8001  metrics :8003\nManagement sidecar FastAPI :8004\n(TRT re-export API)"]
         end
+        subgraph savant["bianca-savant-module + bianca-savant-sink"]
+            SV1["savant-module: pyfunc frame forwarder\nRTSP adapter → ZMQ :5555\npyfunc extracts JPEG from NVMM\nPOST deepstream:8090/internal/frame\nAlways-On Sink subscribed via ZMQ :5556\nLL-HLS :888  WebRTC :8889  RTSP :554"]
+        end
         subgraph deepstream["bianca-deepstream :8090"]
-            DS1["DeepStream 7.0 pipeline\nFastAPI REST + WebSocket :8090\nSpawns pipeline_worker.py subprocess\nrtspsrc → nvv4l2decoder → nvvideoconvert\n→ nvjpegenc → appsink → stdout pipe\n→ Triton HTTP :8002 inference"]
+            DS1["DeepStream inference service\nFastAPI REST :8090\nPOST /internal/frame → inference slot\nTriton HTTP :8002 inference\nDocker SDK → per-camera RTSP adapter containers\nffmpeg → rolling .ts segments\nClip extraction + index"]
         end
         subgraph ollama["bianca-ollama :11434"]
             O1["Ollama\nQwen 2.5:14b\n~9-10 GB VRAM\nPOST /api/chat\nGET  /api/tags"]
@@ -108,7 +121,11 @@ graph TD
 |---|---|---|---|
 | `bianca-whisper` | `bianca-whisper` (Dockerfile.whisper) | Yes | faster-whisper STT; exposes REST `/transcribe` |
 | `bianca-triton` | `bianca-triton` (Dockerfile.triton) | Yes | Triton 25.03 + YOLO-World M TRT; HTTP :8002, gRPC :8001; management sidecar FastAPI :8004 (TRT re-export) |
-| `bianca-deepstream` | `bianca-deepstream` (Dockerfile.deepstream) | Yes | DeepStream 7.0 NVDEC pipeline; FastAPI REST + WS :8090 |
+| `bianca-deepstream` | `bianca-deepstream` (Dockerfile.deepstream) | Yes | Inference service; FastAPI REST :8090; receives JPEG frames via `/internal/frame`; manages RTSP adapter + sink containers via Docker SDK; ffmpeg clip recorders |
+| `bianca-savant-module` | `bianca-savant-module` (Dockerfile.savant) | Yes | Savant pyfunc pipeline; receives frames from per-camera RTSP adapters via ZMQ; extracts JPEG; POSTs to deepstream service |
+| `bianca-go2rtc` | `alexxit/go2rtc:latest` | No | RTSP normalizing proxy; holds one connection per camera; re-streams DTS-clean H.264 on :8554; registered dynamically via HTTP API :1984 |
+| `bianca-rtsp-{cam_id}` | `savant-adapters-gstreamer:latest` | No | Per-camera Savant RTSP adapter; started dynamically; connects to go2rtc :8554; forwards encoded H.264 over ZMQ to savant-module |
+| `bianca-sink-{cam_id}` | `savant-adapters-deepstream:latest` | Yes | Per-camera Always-On Sink; started dynamically; subscribes to savant-module ZMQ PUB; serves LL-HLS :888 + RTSP :554 |
 | `bianca-ollama` | `ollama/ollama:latest` | Yes | Qwen 2.5:14b LLM; entrypoint auto-pulls model |
 | `bianca-app` | `bianca-app` (Dockerfile.app) | **No** | Main FastAPI app; explicitly CUDA-free; proxies camera routes |
 
@@ -336,14 +353,14 @@ flowchart TD
     B --> C["GET /games\ngames.html\ngames hub: Hangman, Multiply, Clock, Quiz"]
 
     B --> CAM["GET /cameras\ncameras.html\nproxied from app → deepstream:8090"]
-    CAM --> CAM1["POST /cameras/streams {cam_id, uri}\nRegisters stream in deepstream_service\nSpawns pipeline_worker.py subprocess"]
-    CAM --> CAM3["WS /cameras/ws/{cam_id}\nWebSocket stream (works via Cloudflare Tunnel)\nRaw JPEG binary frames\nBrowser renders on canvas via createImageBitmap"]
+    CAM --> CAM1["POST /cameras/streams {cam_id, uri}\nRegisters stream in deepstream_service\nStarts bianca-rtsp-{cam_id} container via Docker SDK\nStarts ffmpeg clip recorder from Savant RTSP :554"]
+    CAM --> CAM3["Browser video via LL-HLS (hls.js)\nSavant Always-On Sink :888\n/stream/{cam_id}/index.m3u8\nWorks via cloudflared tunnel through FastAPI"]
 
-    CAM --> CAM4["pipeline_worker.py subprocess\nPer-camera GStreamer chain:\nrtspsrc (latency=0) → rtph264/5depay\n→ h264/5parse → nvv4l2decoder (NVDEC)\n→ nvvideoconvert → capsfilter(NVMM I420)\n→ nvjpegenc → appsink\nJPEG bytes → stdout pipe → deepstream_service\n_frame_reader thread reads + broadcasts"]
+    CAM --> CAM4["Savant pipeline (bianca-savant-module)\nRTSP adapter → ZMQ dealer → pyfunc\nget_nvds_buf_surface → RGBA numpy\nROI crop (polled from deepstream /streams)\ncv2.imencode JPEG → POST /internal/frame\nRate-limited to INFER_FPS (10fps default)"]
 
     CAM --> CAM6["GET /cameras/queries\nPOST /cameras/queries {text}\nDELETE /cameras/queries/{i}\nGET|POST /cameras/threshold\nGET /cameras/clips\nGET /cameras/clips/file/{cam_id}/{filename}"]
 
-    CAM4 --> CAM7["deepstream_service.py _inference_loop\nSoftware motion gate: cv2.absdiff 320×180 grey\n(skips Triton if no motion — ~80-90% reduction)\nPOST triton:8002/v2/models/yoloworld/infer\nYOLO-World M TRT — 8ms median\nReturns {boxes, scores, labels}\n_SimpleTracker IoU dedup\n_ClipSession: 5s pre-buffer + event + 5s post\n_clip_manager encodes H.264 MP4 via imageio-ffmpeg"]
+    CAM4 --> CAM7["deepstream_service.py _inference_loop\nReads JPEG from _infer_slots (leaky)\nSoftware motion gate: cv2.absdiff 320×180 grey\n(skips Triton if no motion — ~80-90% reduction)\nPOST triton:8002/v2/models/yoloworld/infer\nYOLO-World M TRT — 8ms median\nReturns {boxes, scores, labels}\n_SimpleTracker IoU dedup\nClip trigger → ffmpeg concat from rolling .ts segments"]
 
     B --> TALK["GET /talk\ntalk.html"]
     TALK --> T1["Page loads → Silero VAD initialises\nONNX model from CDN, cached, runs via WASM"]
@@ -392,9 +409,12 @@ family-assistant/
 │   ├── research_handler.py    quick_answer → Tavily → parallel voice+WhatsApp summaries
 │   └── response_handler.py    TwiML builders: voice_gather, voice_say_then_gather, etc.
 │
+├── pipeline/
+│   ├── module.yml             Savant pipeline YAML — pyfunc-only; declares BiancaFrameForwarder
+│   └── pyfunc.py              NvDsPyFuncPlugin — NVMM frame extraction, ROI crop, JPEG encode, HTTP POST to /internal/frame
+│
 ├── services/
-│   ├── deepstream_service.py  FastAPI :8090; spawns pipeline_worker.py subprocess per stream set; _frame_reader reads JPEG frames; WebSocket broadcast; software motion gate; Triton YOLO-World inference; pre-buffer clip recording; camera persistence via cameras.json
-│   ├── pipeline_worker.py     Standalone GStreamer subprocess — isolates rtspsrc from asyncio; per-camera chain: rtspsrc→nvv4l2decoder→nvvideoconvert→nvjpegenc→appsink; JPEG frames sent over stdout length-prefixed wire protocol
+│   ├── deepstream_service.py  FastAPI :8090; receives JPEG frames via POST /internal/frame; software motion gate; Triton YOLO-World inference; Docker SDK RTSP adapter management; ffmpeg rolling clip segments; clip extraction; camera persistence via cameras.json
 │   ├── whisper_service.py     faster-whisper large-v3 CUDA, suffix param for webm/wav
 │   ├── qwen.py                Ollama REST wrapper, all LLM calls, JSON extraction
 │   ├── markdown_service.py    Read/write/parse/delete family.md with FileLock
@@ -488,108 +508,88 @@ family-assistant/
 | `imageio-ffmpeg` for clip encoding | System ffmpeg in the DeepStream 7.0 image is broken (libav `.so` files removed post-install despite dpkg listing them). `imageio-ffmpeg` pip package ships a bundled static ffmpeg binary with libx264; accessed via `imageio_ffmpeg.get_ffmpeg_exe()`. |
 | Direct `open(..., "w")` for cameras.json | `os.replace(tmp, dest)` (atomic rename) fails with `EBUSY` when `dest` is a Docker bind-mounted single file — Linux `rename(2)` can't replace a bind-mount inode. Direct write truncates in place, which is safe for a small JSON config file. |
 | `FileResponse` for clip serving (not httpx proxy) | FastAPI's `FileResponse` handles `Accept-Ranges` / `206 Partial Content` natively, which browsers require for video seeking. Forwarding through httpx would need manual Range header plumbing. The `clips/` directory is bind-mounted into both the deepstream and app containers so app can serve files directly. |
+| go2rtc as RTSP normalizing proxy | The Thingino camera generates DTS discontinuities in its audio tracks. The Savant RTSP adapter's ffmpeg_src plugin stalls when audio DTS jumps, causing a pipeline restart every ~30s. go2rtc absorbs the raw camera RTSP connection and re-streams a clean copy. The adapter connects to `rtsp://bianca-go2rtc:8554/{cam_id}?video=h264` — the `?video=h264` consumer filter tells go2rtc to forward only the H.264 video track, dropping all audio tracks and their DTS issues entirely. |
+| go2rtc stream registration via `?name=X&src=Y` query params | go2rtc 1.9.14's HTTP API has two registration formats. The JSON body format (`PUT /api/streams?name=X` with `{"url": "..."}`) returns 200 but creates no in-memory stream entry. The query-param format (`PUT /api/streams?name=X&src=Y`) registers correctly. The yaml write-back requires `streams:` (bare key, no `{}`) in go2rtc.yaml to avoid a parse error on write. |
+| LL-HLS query params forwarded end-to-end | hls.js in `lowLatencyMode` sends blocking playlist requests with `_HLS_msn` and `_HLS_part` query params; MediaMTX holds the HTTP connection open until the requested segment/part is ready. Both the `app` proxy (`/cameras/hls/`) and the `deepstream` proxy (`/hls/`) must forward `request.query_params` to the upstream. Without forwarding, hls.js gets immediate responses without the expected content and stalls. |
 
 ---
 
-## pipeline_worker.py — IPC Protocol
+## Savant Frame Flow
 
-`deepstream_service.py` spawns `pipeline_worker.py` as a subprocess with `stdout=PIPE, stdin=PIPE`.
-
-**stdout (pipeline_worker → parent) — binary, big-endian:**
 ```
-Normal frame:
-  [4 bytes]  cam_id UTF-8 byte length
-  [N bytes]  cam_id string
-  [4 bytes]  JPEG byte length
-  [M bytes]  JPEG data
+Camera ──RTSP──► bianca-go2rtc          (RTSP normalizing proxy)
+                  │ single connection; re-streams DTS-clean H.264
+                  │ registered via PUT /api/streams?name={cam_id}&src={url}
+                  │ RTSP re-stream at rtsp://bianca-go2rtc:8554/{cam_id}?video=h264
+                  ▼
+         bianca-rtsp-{cam_id}           (Savant RTSP adapter, dynamic)
+                  │ ZeroMQ dealer+connect:tcp://savant-module:5555
+                  ▼
+         bianca-savant-module            (Savant pyfunc pipeline)
+           NvDsPyFuncPlugin.process_frame():
+             get_nvds_buf_surface() → RGBA numpy (NVMM)
+             ROI crop (polled from deepstream /streams every 10s)
+             cv2.imencode JPEG (85% quality)
+             leaky queue → forwarder thread
+             HTTP POST bianca-deepstream:8090/internal/frame
+                  │ ZeroMQ pub+bind:tcp://*:5556
+                  ▼
+         bianca-sink-{cam_id}           (Always-On Sink, dynamic)
+           LL-HLS  :888  /stream/{cam_id}/index.m3u8
+           WebRTC  :8889
+           RTSP    :554  /stream/{cam_id}  (consumed by ffmpeg recorders)
+                  │ HTTP GET (LL-HLS, proxied through app:8000 → deepstream:8090)
+                  ▼
+         Browser (hls.js)
+           /cameras/hls/{cam_id}/index.m3u8
+           LL-HLS blocking playlist requests (_HLS_msn/_HLS_part forwarded end-to-end)
 
-EOS / shutdown signal:
-  [4 bytes = 0x00000000]   (cam_id length of zero)
+         bianca-deepstream:8090          (Inference + clip service)
+           POST /internal/frame → _infer_slots[cam_id]
+           _inference_loop: motion gate → Triton → tracker → events
+           ffmpeg -i rtsp://bianca-sink-{cam_id}:554/stream/{cam_id}
+             -f segment -segment_time 30 clips/{cam_id}/segs/seg_%05d.ts
+           _segment_watcher_loop polls segs/ every 5s → _seg_ring
+           _clip_manager: on trigger expiry → ffmpeg concat stream-copy → .mp4
 ```
-
-**stdin (parent → pipeline_worker) — text lines:**
-```
-"STOP\n"  →  graceful shutdown (pipeline.set_state(NULL), send EOS, exit)
-```
-
-**Pipeline topology per camera:**
-```
-RTSP:  rtspsrc (latency=0) → rtph264/5depay → h264/5parse → nvv4l2decoder
-             → nvvideoconvert → capsfilter(video/x-raw(memory:NVMM),format=I420)
-             → nvjpegenc → appsink
-
-File:  uridecodebin → nvvideoconvert → capsfilter(video/x-raw(memory:NVMM),format=I420)
-             → nvjpegenc → appsink
-```
-
-Key properties: `appsink` has `emit-signals=True`, `max-buffers=2`, `drop=True`, `sync=False`. The `new-sample` callback throttles to `DISPLAY_FPS` (default 25) using a monotonic timestamp check; excess frames are drained (pull-sample without sending) to keep the 2-slot buffer free.
 
 ---
 
-## Testing RTSP Streams Locally (mediamtx + ffmpeg)
+## Testing the Camera Pipeline
 
-Use this to test the camera pipeline without a real IP camera.
-
-### 1. Run the mediamtx RTSP server
-
-mediamtx is already in `docker-compose.yml` (if added) or run it standalone:
+### Verify go2rtc stream registration
 
 ```bash
-docker run --rm -d \
-  --name mediamtx \
-  --network family-assistant_bianca-net \
-  -p 8554:8554 \
-  -p 1935:1935 \
-  bluenviron/mediamtx:latest
+# Check registered streams and their status
+curl -s http://localhost:1984/api/streams | python3 -m json.tool
+
+# Expected: entry for each camera with "producers" (camera connection) and "consumers" (RTSP adapter)
 ```
 
-mediamtx auto-accepts any published stream — no config needed.
-
-### 2. Publish a local video file as an RTSP stream
+### Check pipeline health after adding a camera
 
 ```bash
-ffmpeg -re \
-  -stream_loop -1 \
-  -i /path/to/your/video.mp4 \
-  -c:v libx264 \
-  -preset veryfast \
-  -tune zerolatency \
-  -rtsp_transport tcp \
-  -f rtsp \
-  rtsp://localhost:8554/cam1
+# 1. Verify go2rtc registered the stream
+curl -s http://localhost:1984/api/streams | python3 -c "import sys,json; d=json.load(sys.stdin); print(list(d.keys()))"
+
+# 2. Verify RTSP adapter and sink containers are running
+docker ps --filter "name=bianca-rtsp" --filter "name=bianca-sink" --format "{{.Names}}: {{.Status}}"
+
+# 3. Verify HLS is serving live segments
+curl -s http://localhost:8000/cameras/hls/{cam_id}/index.m3u8
+
+# 4. Verify frames are reaching deepstream (check for POST /internal/frame)
+docker logs bianca-deepstream --tail=20 | grep internal/frame
 ```
 
-Flags explained:
-- `-re` — read at native speed (real-time, not as fast as possible)
-- `-stream_loop -1` — loop the file indefinitely
-- `-c:v libx264 -preset veryfast -tune zerolatency` — fast H.264 encode, minimal buffering
-- `-rtsp_transport tcp` — use TCP (required if mediamtx UDP ports 8000/8001 are not exposed)
-- `rtsp://localhost:8554/cam1` — publish to mediamtx on host; use `rtsp://mediamtx:8554/cam1` from inside containers
-
-### 3. Register the stream with deepstream
+### Add/remove a stream
 
 ```bash
+# Add
 curl -s -X POST http://localhost:8090/streams \
   -H "Content-Type: application/json" \
-  -d '{"cam_id": "cam0", "uri": "rtsp://mediamtx:8554/cam1"}'
-```
+  -d '{"cam_id": "cam0", "uri": "rtsp://camera-host/stream"}'
 
-`uri` uses the container hostname `mediamtx` because deepstream_service runs inside Docker.
-
-### 4. Watch logs
-
-```bash
-docker logs -f bianca-deepstream 2>&1 | grep -v "^0:"
-```
-
-Expected on success:
-```
-[pipeline_worker] INFO Pipeline started: 1 camera(s) ['cam0']
-[pipeline_worker] INFO cam0 downstream chain ready (nvvideoconvert→nvjpegenc→appsink)
-```
-
-### 5. Remove the stream
-
-```bash
+# Remove
 curl -s -X DELETE http://localhost:8090/streams/cam0
 ```

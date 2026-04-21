@@ -254,13 +254,6 @@ async def cameras_debug_overlay(payload: dict):
     return await _ds_proxy("POST", "/debug-overlay", payload)
 
 
-@app.websocket("/cameras/ws")
-async def cameras_ws(websocket: WebSocket):
-    logger.info("WebSocket camera client connected (cam0)")
-    await _ds_ws_proxy(websocket, "/ws")
-    logger.info("WebSocket camera client disconnected (cam0)")
-
-
 @app.get("/cameras/queries")
 async def cameras_get_queries():
     return await _ds_proxy("GET", "/queries")
@@ -362,6 +355,41 @@ async def cameras_list_clips(cam_id: str | None = None):
 
 
 CLIPS_DIR = Path(os.environ.get("CLIPS_DIR", "/app/clips"))
+DEEPSTREAM_URL = os.environ.get("DEEPSTREAM_URL", "http://deepstream:8090")
+
+
+@app.get("/cameras/hls/{cam_id}/{path:path}")
+async def cameras_hls_proxy(request: Request, cam_id: str, path: str):
+    """Stream-proxy HLS segments/playlists from the per-camera always_on_rtsp sink."""
+    if ".." in cam_id or "/" in cam_id:
+        return JSONResponse({"error": "invalid cam_id"}, status_code=400)
+    target = f"{DEEPSTREAM_URL}/hls/{cam_id}/{path}"
+    # LL-HLS blocking playlist requests carry _HLS_msn/_HLS_part query params — must forward.
+    params = dict(request.query_params)
+    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=30.0))
+    try:
+        r = await client.send(client.build_request("GET", target, params=params), stream=True)
+    except Exception:
+        await client.aclose()
+        return JSONResponse({"error": "stream unavailable"}, status_code=503)
+
+    async def _stream():
+        try:
+            async for chunk in r.aiter_bytes(65536):
+                yield chunk
+        finally:
+            await r.aclose()
+            await client.aclose()
+
+    from fastapi.responses import StreamingResponse
+    passthrough = {k: v for k, v in r.headers.items()
+                   if k.lower() not in ("content-encoding", "transfer-encoding", "content-length")}
+    return StreamingResponse(
+        _stream(), status_code=r.status_code,
+        media_type=r.headers.get("content-type", "application/octet-stream"),
+        headers=passthrough,
+    )
+
 
 @app.get("/cameras/clips/file/{cam_id}/{filename}")
 async def cameras_serve_clip(cam_id: str, filename: str):
@@ -372,12 +400,6 @@ async def cameras_serve_clip(cam_id: str, filename: str):
         return JSONResponse({"error": "not found"}, status_code=404)
     return FileResponse(str(path), media_type="video/mp4")
 
-
-@app.websocket("/cameras/ws/{cam_id}")
-async def cameras_ws_cam(websocket: WebSocket, cam_id: str):
-    logger.info("WebSocket camera client connected: %s", cam_id)
-    await _ds_ws_proxy(websocket, f"/ws/{cam_id}")
-    logger.info("WebSocket camera client disconnected: %s", cam_id)
 
 
 # ── LLM availability guard ────────────────────────────────────────────────────

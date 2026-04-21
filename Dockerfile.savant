@@ -1,0 +1,14 @@
+# Savant module container for Bianca family assistant.
+# Extends savant-deepstream with OpenCV and tritonclient (unused by pyfunc but
+# available for future direct inference without the deepstream_service proxy).
+#
+# Build:
+#   docker compose build savant-module
+
+FROM ghcr.io/insight-platform/savant-deepstream:latest
+
+RUN pip install --no-cache-dir \
+    "numpy<2.0"
+
+# Pipeline code is bind-mounted from ./pipeline at /opt/savant/pipeline
+WORKDIR /opt/savant

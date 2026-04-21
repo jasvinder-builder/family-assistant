@@ -1,22 +1,19 @@
 """
-DeepStream service — replaces camera_service.py + scene_service.py.
+Deepstream inference service — Triton inference + clip recording + REST API.
 
 Handles:
-  - RTSP/file ingestion via NVDEC hardware decode (DeepStream 7.0)
-  - Multi-camera batching via nvstreammux + nvmultistreamtiler
-  - Frame broadcast to WebSocket/MJPEG consumers (25fps cap)
-  - YOLO-World TRT inference via Triton HTTP at ~10fps per camera
+  - JPEG frame ingestion from Savant pyfunc via POST /internal/frame
+  - YOLO-World TRT inference via Triton at ~10fps per camera
   - Per-camera IoU tracking + event firing
-  - Query management (update meta.json + Triton unload/load)
+  - Segment-based clip recording (ffmpeg rolling segments from Savant Always-On Sink RTSP)
+  - Clip extraction on detection events (ffmpeg stream-copy)
+  - Savant RTSP adapter container lifecycle (Docker SDK)
 
-Public API is backward-compatible with camera_service + scene_service:
-  set_stream_url / get_stream_url / ws_frame_generator / mjpeg_generator
-  get_queries / add_query / remove_query
-  get_threshold / set_threshold / get_debug_overlay / set_debug_overlay
-  get_latest_detections / get_events / start_analysis / stop_analysis
+Live display is handled entirely by Savant Always-On Sink (LL-HLS on port 888).
 
-New multi-camera additions:
+Public stream management:
   add_stream(cam_id, uri) / remove_stream(cam_id) / get_streams()
+  get_queries / add_query / remove_query
 """
 
 import asyncio
@@ -26,12 +23,10 @@ import logging
 import os
 import queue
 import subprocess
-import struct
-import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -39,6 +34,11 @@ from typing import Optional
 import cv2
 import numpy as np
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -50,19 +50,36 @@ TRITON_HTTP_URL  = f"{_triton_host}:8002"
 
 META_JSON_PATH    = os.environ.get("META_JSON_PATH", "/app/models/yoloworld.meta.json")
 CAMERAS_JSON_PATH  = os.environ.get("CAMERAS_JSON_PATH", "./cameras.json")
+
+# Savant adapter / sink configuration
+SAVANT_MODULE_HOST = os.environ.get("SAVANT_MODULE_HOST", "bianca-savant-module")
+SAVANT_SINK_HOST   = os.environ.get("SAVANT_SINK_HOST", "bianca-savant-sink")
+DOCKER_NETWORK     = os.environ.get("DOCKER_NETWORK", "family-assistant_bianca-net")
+RTSP_ADAPTER_IMAGE = os.environ.get(
+    "RTSP_ADAPTER_IMAGE",
+    "ghcr.io/insight-platform/savant-adapters-gstreamer:latest"
+)
+SINK_IMAGE = os.environ.get(
+    "SINK_IMAGE",
+    "ghcr.io/insight-platform/savant-adapters-deepstream:latest"
+)
+STUB_FILE_HOST_PATH = os.environ.get("STUB_FILE_HOST_PATH", "/app/stub.jpg")
+GO2RTC_URL = os.environ.get("GO2RTC_URL", "http://bianca-go2rtc:1984")
+GO2RTC_RTSP_HOST = os.environ.get("GO2RTC_RTSP_HOST", "bianca-go2rtc")
+SEG_DURATION_S = int(os.environ.get("SEG_DURATION_S", "30"))
+MAX_SEG_FILES  = int(os.environ.get("MAX_SEG_FILES", "25"))
 CLIPS_DIR          = Path(os.environ.get("CLIPS_DIR", "./clips"))
 PRE_BUFFER_S       = int(os.environ.get("PRE_BUFFER_S", "5"))
 POST_BUFFER_S      = int(os.environ.get("POST_BUFFER_S", "5"))
 MAX_CLIPS_PER_CAM  = int(os.environ.get("MAX_CLIPS_PER_CAM", "100"))
-CLIP_FPS           = int(os.environ.get("CLIP_FPS", "25"))      # clip recording FPS (matches display pipeline)
 MAX_CLIP_DURATION_S = int(os.environ.get("MAX_CLIP_DURATION_S", "60"))  # hard cap per clip chunk
 MIN_CLIP_DETECTIONS = int(os.environ.get("MIN_CLIP_DETECTIONS", "5"))   # discard clips with fewer detections
+SEG_DURATION_S     = int(os.environ.get("SEG_DURATION_S", "30"))        # rolling segment length (must match worker)
 
 MOTION_GATE       = os.environ.get("MOTION_GATE", "true").lower() == "true"
 MOTION_THRESHOLD  = float(os.environ.get("MOTION_THRESHOLD", "2.0"))  # mean pixel diff (0-255) to trigger inference
 MOTION_SCALE      = (320, 180)   # downscale to this for cheap frame differencing
 
-DISPLAY_FPS       = 25
 INFER_FPS         = 10       # max inference calls per camera per second
 RECHECK_INTERVAL_S = 30      # minimum seconds between events for same (track, query)
 TRACK_PRUNE_AGE_S  = 300
@@ -170,15 +187,11 @@ class CameraEvent:
 
 
 @dataclass
-class _ClipSession:
-    cam_id:          str
-    query:           str
-    pre_frames:      list   # [(ts: float, jpeg: bytes)] — snapshot of pre-buffer at session start
-    live_frames:     list   # [(ts: float, jpeg: bytes)] — appended by frame reader
-    first_detection: float  # monotonic time of first detection — used for duration checks
-    last_detection:  float  # monotonic time of most recent detection — used for gap checks
-    wall_start:      float  # time.time() at session start — used for filename/timestamp
-    detection_count: int = 0  # total detections in this session — used for MIN_CLIP_DETECTIONS gate
+class _SegBoundary:
+    """Metadata for one completed rolling segment file."""
+    path:       str    # absolute path to the .ts segment file
+    start_wall: float  # time.time() when this segment started recording
+    end_wall:   float  # time.time() when this segment ended (next segment started)
 
 
 # ── Module-level state ────────────────────────────────────────────────────────
@@ -188,9 +201,13 @@ _rebuild_lock  = threading.Lock()      # serialises concurrent _rebuild calls
 _streams: dict[str, str] = {}          # cam_id → uri (ordered by insertion)
 _rois:    dict[str, Optional[dict]] = {}  # cam_id → {x,y,w,h} | None
 
-# Subprocess that owns the GStreamer pipeline (isolated from asyncio)
-_worker_proc:         Optional[subprocess.Popen] = None
-_frame_reader_thread: Optional[threading.Thread] = None
+# ffmpeg clip recorders: one subprocess per camera recording rolling segments
+# from the Savant Always-On Sink RTSP output
+_ffmpeg_procs: dict[str, subprocess.Popen] = {}
+
+# Segment watcher thread: polls clips/ directory to update _seg_ring
+_seg_watcher_stop   = threading.Event()
+_seg_watcher_thread: Optional[threading.Thread] = None
 
 _inference_thread: Optional[threading.Thread] = None
 _infer_stop        = threading.Event()
@@ -200,12 +217,7 @@ _infer_slots:      dict[str, Optional[tuple]] = {}
 _infer_slots_lock  = threading.Lock()
 _infer_event       = threading.Event()
 
-# Display subscribers: cam_id → set[queue.Queue]
-_subscribers:      dict[str, set] = {}
-_subscribers_lock  = threading.Lock()
-
 # Rate limiting per camera
-_last_display: dict[str, float] = {}
 _last_infer:   dict[str, float] = {}
 
 # Per-camera trackers and detections
@@ -219,15 +231,25 @@ _motion_prev: dict[str, np.ndarray] = {}
 _events:     deque = deque(maxlen=500)
 _events_lock = threading.Lock()
 
-# Per-camera rolling pre-event frame buffers (last PRE_BUFFER_S seconds of full frames)
-_pre_buffers: dict[str, deque] = {}   # cam_id → deque of (ts: float, jpeg: bytes)
-_last_clip_frame: dict[str, float] = {}  # rate-limit pre-buffer + session writes to CLIP_FPS
+# ── Segment ring buffer (disk-based rolling segments from ffmpeg) ─────────────
+# Populated by _segment_watcher_loop polling clips/<cam>/segs/ every 5s.
+_seg_ring:      dict[str, deque] = {}   # cam_id → deque[_SegBoundary], maxlen=20
+_seg_ring_lock  = threading.Lock()
 
-# Active clip recording sessions and finalized clip index
-_clip_sessions:       dict[str, _ClipSession] = {}
-_clip_sessions_lock   = threading.Lock()
-_clip_index:          list[dict] = []
-_clip_index_lock      = threading.Lock()
+# Current in-flight segment per camera (not yet in _seg_ring — still being written).
+_current_seg:      dict[str, Optional[dict]] = {}   # cam_id → {path, start_wall} | None
+_current_seg_lock  = threading.Lock()
+
+# Pending clip triggers: each entry represents one detection event window.
+# The clip manager inspects these every second and cuts a clip once POST_BUFFER_S
+# has elapsed since the last detection.
+_clip_triggers:      dict[str, list] = {}   # cam_id → list of trigger-dicts
+_clip_triggers_lock  = threading.Lock()
+
+# Finalised clip index
+_clip_index:      list[dict] = []
+_clip_index_lock  = threading.Lock()
+
 _clip_manager_stop    = threading.Event()
 _clip_manager_thread: Optional[threading.Thread] = None
 
@@ -238,6 +260,320 @@ _threshold:      float = 0.3
 _debug_overlay:  bool  = False
 
 _query_update_lock  = threading.Lock()   # serialises concurrent add/remove calls
+
+
+# ── Savant RTSP adapter management (Docker SDK) ───────────────────────────────
+
+_docker_client = None
+
+
+def _safe_name(cam_id: str) -> str:
+    """Sanitize cam_id for use in Docker container names (only [a-zA-Z0-9_.-] allowed)."""
+    import re
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", cam_id)
+
+
+def _get_docker():
+    global _docker_client
+    if _docker_client is None:
+        try:
+            import docker
+            _docker_client = docker.DockerClient(base_url="unix://var/run/docker.sock")
+        except Exception as exc:
+            logger.warning("Docker SDK unavailable — adapter management disabled: %s", exc)
+    return _docker_client
+
+
+def _go2rtc_register(cam_id: str, rtsp_url: str) -> bool:
+    """Register a stream with go2rtc via HTTP API.  Returns True on success."""
+    import urllib.parse
+    params = urllib.parse.urlencode({"name": cam_id, "src": rtsp_url})
+    req = urllib.request.Request(
+        f"{GO2RTC_URL}/api/streams?{params}",
+        method="PUT",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5).close()
+        logger.info("Registered stream %s in go2rtc", cam_id)
+        return True
+    except Exception as exc:
+        logger.warning("go2rtc register failed for %s: %s — using direct RTSP", cam_id, exc)
+        return False
+
+
+def _go2rtc_unregister(cam_id: str) -> None:
+    import urllib.parse
+    req = urllib.request.Request(
+        f"{GO2RTC_URL}/api/streams?name={urllib.parse.quote(cam_id)}",
+        method="DELETE",
+    )
+    try:
+        urllib.request.urlopen(req, timeout=5).close()
+    except Exception:
+        pass
+
+
+def _start_rtsp_adapter(cam_id: str, rtsp_url: str) -> None:
+    """Start a Savant RTSP adapter container for this camera.
+
+    Registers the camera with go2rtc first (DTS normalization proxy), then
+    starts the adapter pointing at go2rtc's clean re-stream.  Falls back to
+    direct RTSP if go2rtc is unavailable.
+    """
+    client = _get_docker()
+    if client is None:
+        logger.warning("Docker client unavailable — cannot start RTSP adapter for %s", cam_id)
+        return
+    import docker
+    container_name = f"bianca-rtsp-{_safe_name(cam_id)}"
+
+    # Use go2rtc as RTSP proxy; request video-only to drop problematic audio DTS issues
+    if _go2rtc_register(cam_id, rtsp_url):
+        adapter_rtsp_url = f"rtsp://{GO2RTC_RTSP_HOST}:8554/{cam_id}?video=h264"
+    else:
+        adapter_rtsp_url = rtsp_url
+
+    try:
+        try:
+            old = client.containers.get(container_name)
+            old.stop(timeout=5)
+            old.remove()
+            logger.info("Removed existing RTSP adapter %s", container_name)
+        except docker.errors.NotFound:
+            pass
+        client.containers.run(
+            RTSP_ADAPTER_IMAGE,
+            command="/opt/savant/adapters/gst/sources/rtsp.sh",
+            detach=True,
+            name=container_name,
+            network=DOCKER_NETWORK,
+            environment={
+                "ZMQ_ENDPOINT": f"dealer+connect:tcp://{SAVANT_MODULE_HOST}:5555",
+                "SOURCE_ID": cam_id,
+                "RTSP_URI": adapter_rtsp_url,
+                "RTSP_TRANSPORT": "tcp",
+                "SYNC_OUTPUT": "False",
+                "BUFFER_LEN": "50",
+                "FFMPEG_TIMEOUT_MS": "120000",
+            },
+            restart_policy={"Name": "unless-stopped"},
+        )
+        logger.info("Started RTSP adapter %s → %s", cam_id, rtsp_url)
+    except Exception as exc:
+        logger.error("Failed to start RTSP adapter for %s: %s", cam_id, exc)
+
+
+def _stop_rtsp_adapter(cam_id: str) -> None:
+    """Stop the Savant RTSP adapter container for a camera."""
+    client = _get_docker()
+    if client is None:
+        return
+    import docker
+    container_name = f"bianca-rtsp-{_safe_name(cam_id)}"
+    try:
+        container = client.containers.get(container_name)
+        container.stop(timeout=5)
+        logger.info("Stopped RTSP adapter %s", container_name)
+    except docker.errors.NotFound:
+        pass
+    except Exception as exc:
+        logger.warning("Failed to stop RTSP adapter %s: %s", container_name, exc)
+
+
+def _stop_all_rtsp_adapters() -> None:
+    """Stop all running bianca-rtsp-* adapter containers."""
+    client = _get_docker()
+    if client is None:
+        return
+    try:
+        for container in client.containers.list(filters={"name": "bianca-rtsp-"}):
+            try:
+                container.stop(timeout=5)
+                logger.info("Stopped RTSP adapter %s", container.name)
+            except Exception as exc:
+                logger.warning("Failed to stop adapter %s: %s", container.name, exc)
+    except Exception as exc:
+        logger.warning("Error listing adapter containers: %s", exc)
+
+
+# ── Per-camera Always-On Sink container management ───────────────────────────
+
+def _start_sink_container(cam_id: str) -> None:
+    """Start an always_on_rtsp sink container for one camera.
+
+    The sink subscribes to the Savant module ZMQ pub (port 5556), filters to
+    SOURCE_ID=cam_id, re-encodes H.264, and serves:
+      - HLS   via embedded MediaMTX :888  path /stream/{cam_id}/
+      - RTSP  via embedded MediaMTX :554  path /stream/{cam_id}
+    No host port mapping — access via Docker network by container name.
+    """
+    client = _get_docker()
+    if client is None:
+        logger.warning("Docker client unavailable — cannot start sink for %s", cam_id)
+        return
+    import docker
+    container_name = f"bianca-sink-{_safe_name(cam_id)}"
+    try:
+        try:
+            old = client.containers.get(container_name)
+            old.stop(timeout=5)
+            old.remove()
+            logger.info("Removed existing sink %s", container_name)
+        except docker.errors.NotFound:
+            pass
+        client.containers.run(
+            SINK_IMAGE,
+            command="python -m adapters.ds.sinks.always_on_rtsp",
+            detach=True,
+            name=container_name,
+            network=DOCKER_NETWORK,
+            volumes={STUB_FILE_HOST_PATH: {"bind": "/stub.jpg", "mode": "ro"}},
+            environment={
+                "ZMQ_ENDPOINT": f"sub+connect:tcp://{SAVANT_MODULE_HOST}:5556",
+                "SOURCE_ID": cam_id,
+                "DEV_MODE": "True",
+                "STUB_FILE_LOCATION": "/stub.jpg",
+                "FRAMERATE": "25/1",
+                "ENCODER_PROFILE": "High",
+                "ENCODER_BITRATE": "3000000",
+            },
+            device_requests=[docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])],
+            restart_policy={"Name": "unless-stopped"},
+        )
+        logger.info("Started sink container %s", container_name)
+    except Exception as exc:
+        logger.error("Failed to start sink for %s: %s", cam_id, exc)
+
+
+def _stop_sink_container(cam_id: str) -> None:
+    client = _get_docker()
+    if client is None:
+        return
+    import docker
+    container_name = f"bianca-sink-{_safe_name(cam_id)}"
+    try:
+        client.containers.get(container_name).stop(timeout=5)
+        logger.info("Stopped sink %s", container_name)
+    except docker.errors.NotFound:
+        pass
+    except Exception as exc:
+        logger.warning("Failed to stop sink %s: %s", container_name, exc)
+
+
+def _stop_all_sink_containers() -> None:
+    client = _get_docker()
+    if client is None:
+        return
+    try:
+        for c in client.containers.list(filters={"name": "bianca-sink-"}):
+            try:
+                c.stop(timeout=5)
+                logger.info("Stopped sink %s", c.name)
+            except Exception as exc:
+                logger.warning("Failed to stop sink %s: %s", c.name, exc)
+    except Exception as exc:
+        logger.warning("Error listing sink containers: %s", exc)
+
+
+# ── Clip recording via ffmpeg from Always-On Sink RTSP ───────────────────────
+
+def _start_clip_recorder(cam_id: str) -> None:
+    """Start ffmpeg to record rolling 30s segments from the Savant Always-On Sink."""
+    segs_dir = CLIPS_DIR / cam_id / "segs"
+    try:
+        segs_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.error("Cannot create segs dir %s: %s", segs_dir, exc)
+        return
+
+    import imageio_ffmpeg
+    rtsp_url = f"rtsp://bianca-sink-{cam_id}:554/stream/{cam_id}"
+    cmd = [
+        imageio_ffmpeg.get_ffmpeg_exe(), "-y",
+        "-rtsp_transport", "tcp",
+        "-i", rtsp_url,
+        "-c", "copy",
+        "-f", "segment",
+        "-segment_time", str(SEG_DURATION_S),
+        "-segment_wrap", str(MAX_SEG_FILES),
+        "-reset_timestamps", "1",
+        "-segment_format", "mpegts",
+        "-segment_atclocktime", "1",
+        str(segs_dir / "seg_%05d.ts"),
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _ffmpeg_procs[cam_id] = proc
+        logger.info("Started clip recorder for %s (PID=%d) reading %s",
+                    cam_id, proc.pid, rtsp_url)
+    except Exception as exc:
+        logger.error("Failed to start clip recorder for %s: %s", cam_id, exc)
+
+
+def _stop_clip_recorder(cam_id: str) -> None:
+    """Stop the ffmpeg clip recorder for a camera."""
+    proc = _ffmpeg_procs.pop(cam_id, None)
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+    logger.info("Stopped clip recorder for %s", cam_id)
+
+
+def _stop_all_clip_recorders() -> None:
+    for cam_id in list(_ffmpeg_procs):
+        _stop_clip_recorder(cam_id)
+
+
+# ── Segment watcher — polls clips/ directory to update _seg_ring ─────────────
+
+def _segment_watcher_loop() -> None:
+    """Poll each camera's segs/ directory every 5s to detect new completed segments."""
+    while not _seg_watcher_stop.is_set():
+        _seg_watcher_stop.wait(timeout=5)
+        if _seg_watcher_stop.is_set():
+            break
+        _scan_segments()
+
+
+def _scan_segments() -> None:
+    """Scan all active camera segment directories and populate _seg_ring."""
+    for cam_id in list(_streams):
+        segs_dir = CLIPS_DIR / cam_id / "segs"
+        if not segs_dir.exists():
+            continue
+        try:
+            seg_files = sorted(segs_dir.glob("seg_*.ts"), key=lambda p: p.stat().st_mtime)
+        except Exception:
+            continue
+        with _seg_ring_lock:
+            ring = _seg_ring.setdefault(cam_id, deque(maxlen=MAX_SEG_FILES))
+            known = {s.path for s in ring}
+        new_segs = []
+        for seg_path in seg_files:
+            path_str = str(seg_path)
+            if path_str in known:
+                continue
+            try:
+                mtime = seg_path.stat().st_mtime
+                size  = seg_path.stat().st_size
+            except OSError:
+                continue
+            if size < 1024:
+                continue  # skip empty/incomplete segments
+            new_segs.append(_SegBoundary(
+                path=path_str,
+                start_wall=mtime - SEG_DURATION_S,
+                end_wall=mtime,
+            ))
+        if new_segs:
+            with _seg_ring_lock:
+                for seg in new_segs:
+                    ring.append(seg)
+            logger.debug("Segment watcher: %d new segments for %s", len(new_segs), cam_id)
 
 
 # ── Queries / meta.json ───────────────────────────────────────────────────────
@@ -316,86 +652,137 @@ def _save_cameras(streams: dict[str, str], rois: dict[str, Optional[dict]]) -> N
         logger.warning("Failed to save cameras.json: %s", exc)
 
 
-# ── Clip recording helpers ────────────────────────────────────────────────────
+# ── Clip recording helpers (Phase 2: disk-based segment recording) ────────────
 
-def _update_clip_session(cam_id: str, query: str, now: float) -> None:
-    """Start a new clip session or extend the existing one for this camera."""
-    with _clip_sessions_lock:
-        if cam_id in _clip_sessions:
-            _clip_sessions[cam_id].last_detection = now
-            _clip_sessions[cam_id].detection_count += 1
-        else:
-            # Snapshot the current pre-buffer as the pre-event footage
-            pre_frames = list(_pre_buffers.get(cam_id, []))
-            _clip_sessions[cam_id] = _ClipSession(
-                cam_id=cam_id,
-                query=query,
-                pre_frames=pre_frames,
-                live_frames=[],
-                first_detection=now,
-                last_detection=now,
-                wall_start=time.time(),
-                detection_count=1,
-            )
-            logger.info("Clip session started: cam=%s query=%r pre_frames=%d",
-                        cam_id, query, len(pre_frames))
+def _trigger_clip_on_detection(cam_id: str, query: str, wall_now: float) -> None:
+    """Start or extend a clip trigger for this camera.
+
+    Called from the inference loop whenever a detection fires above threshold.
+    wall_now must be time.time() so it correlates with segment boundary timestamps.
+    Multiple detections within MAX_CLIP_DURATION_S extend the same trigger window.
+    """
+    with _clip_triggers_lock:
+        triggers = _clip_triggers.setdefault(cam_id, [])
+        # Extend the most recent active trigger if it's within the hard cap window
+        if triggers:
+            t = triggers[-1]
+            if wall_now - t["first_detect_wall"] <= MAX_CLIP_DURATION_S:
+                t["last_detect_wall"] = wall_now
+                t["detection_count"] += 1
+                return
+        # New trigger
+        triggers.append({
+            "query":             query,
+            "first_detect_wall": wall_now,
+            "last_detect_wall":  wall_now,
+            "detection_count":   1,
+        })
+        logger.info("Clip trigger started: cam=%s query=%r", cam_id, query)
 
 
-def _encode_clip(session: _ClipSession) -> Optional[Path]:
-    """Encode all frames into an H.264 MP4 using imageio-ffmpeg's bundled static binary.
-    Produces browser-playable H.264 with faststart (moov atom at front)."""
+def _extract_and_save_clip(cam_id: str, trigger: dict) -> Optional[Path]:
+    """Cut a clip from rolling segment files using ffmpeg stream-copy (zero re-encode).
+
+    Segments are H.264 MP4 files written by splitmuxsink.  We use either:
+      - Single segment: ffmpeg -ss {offset} -i {seg} -t {dur} -c copy
+      - Multiple segments: ffmpeg -f concat -safe 0 -i {list} -ss {offset} -t {dur} -c copy
+    """
     import imageio_ffmpeg
-    all_frames = session.pre_frames + session.live_frames
-    if not all_frames:
+
+    query           = trigger["query"]
+    first_wall      = trigger["first_detect_wall"]
+    last_wall       = trigger["last_detect_wall"]
+    clip_start_wall = first_wall - PRE_BUFFER_S
+    clip_end_wall   = last_wall  + POST_BUFFER_S
+
+    with _seg_ring_lock:
+        segs = [s for s in _seg_ring.get(cam_id, [])
+                if s.end_wall > clip_start_wall and s.start_wall < clip_end_wall]
+    segs.sort(key=lambda s: s.start_wall)
+
+    # Filter to files that actually exist on disk (splitmuxsink max-files may have pruned)
+    segs = [s for s in segs if Path(s.path).exists()]
+
+    if not segs:
+        logger.warning("Clip cut skipped: no segment files available for cam=%s query=%r",
+                       cam_id, query)
         return None
-    out_dir = CLIPS_DIR / session.cam_id
+
+    # Clamp the clip window to actual segment coverage
+    actual_start = max(clip_start_wall, segs[0].start_wall)
+    actual_end   = min(clip_end_wall,   segs[-1].end_wall)
+    if actual_end <= actual_start:
+        logger.warning("Clip cut skipped: empty time window for cam=%s", cam_id)
+        return None
+
+    out_dir = CLIPS_DIR / cam_id
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
         logger.error("Cannot create clips dir %s: %s", out_dir, exc)
         return None
-    ts_str   = datetime.fromtimestamp(session.wall_start).strftime("%Y%m%d_%H%M%S")
-    safe_q   = "".join(c if c.isalnum() or c in "-_" else "_" for c in session.query)
+
+    ts_str   = datetime.fromtimestamp(first_wall).strftime("%Y%m%d_%H%M%S")
+    safe_q   = "".join(c if c.isalnum() or c in "-_" else "_" for c in query)
     out_path = out_dir / f"{ts_str}_{safe_q}.mp4"
 
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    concat_file: Optional[Path] = None
+
     try:
-        proc = subprocess.Popen(
-            [
-                ffmpeg_exe, "-y",
-                "-f", "image2pipe", "-framerate", str(CLIP_FPS),
-                "-i", "pipe:",
-                "-c:v", "libx264", "-crf", "23", "-preset", "fast",
-                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                str(out_path),
-            ],
-            stdin=subprocess.PIPE,
+        if len(segs) == 1:
+            seg    = segs[0]
+            ss     = max(0.0, actual_start - seg.start_wall)
+            dur    = actual_end - actual_start
+            cmd = [ffmpeg_exe, "-y",
+                   "-ss", f"{ss:.3f}", "-i", seg.path,
+                   "-t", f"{dur:.3f}",
+                   "-c", "copy", "-movflags", "+faststart",
+                   str(out_path)]
+        else:
+            # Concat all relevant segments, then seek/trim
+            concat_file = out_dir / f".concat_{ts_str}.txt"
+            with open(concat_file, "w") as cf:
+                for seg in segs:
+                    cf.write(f"file '{seg.path}'\n")
+            ss  = max(0.0, actual_start - segs[0].start_wall)
+            dur = actual_end - actual_start
+            cmd = [ffmpeg_exe, "-y",
+                   "-f", "concat", "-safe", "0", "-i", str(concat_file),
+                   "-ss", f"{ss:.3f}", "-t", f"{dur:.3f}",
+                   "-c", "copy", "-movflags", "+faststart",
+                   str(out_path)]
+
+        result = subprocess.run(
+            cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=120,
         )
-        written = 0
-        for _, jpeg in all_frames:
-            proc.stdin.write(jpeg)
-            written += 1
-        proc.stdin.close()
-        proc.wait(timeout=120)
-        if proc.returncode != 0:
-            logger.error("ffmpeg failed for clip %s (rc=%d)", out_path, proc.returncode)
+        if result.returncode != 0:
+            logger.error("ffmpeg clip cut failed for cam=%s (rc=%d): %s",
+                         cam_id, result.returncode,
+                         result.stderr.decode(errors="replace")[-300:])
             return None
+
     except Exception as exc:
-        logger.error("Clip encoding error for %s: %s", out_path, exc)
+        logger.error("Clip cut error for cam=%s: %s", cam_id, exc)
         return None
+    finally:
+        if concat_file and concat_file.exists():
+            concat_file.unlink(missing_ok=True)
 
     if not out_path.exists() or out_path.stat().st_size == 0:
-        logger.error("Clip file empty after encoding: %s", out_path)
+        logger.error("Clip file empty after cut: %s", out_path)
         return None
 
-    logger.info("Clip saved: %s (%d frames, %.1fs)", out_path, written, written / CLIP_FPS)
+    logger.info("Clip saved (stream-copy): cam=%s query=%r path=%s segs=%d dur=%.1fs",
+                cam_id, query, out_path.name, len(segs), actual_end - actual_start)
     return out_path
 
 
 def _prune_clips(cam_id: str) -> None:
-    """Delete oldest clips when per-camera limit is exceeded."""
+    """Delete oldest extracted clips when per-camera limit is exceeded."""
     cam_dir = CLIPS_DIR / cam_id
     try:
         clips = sorted(cam_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime)
@@ -407,54 +794,82 @@ def _prune_clips(cam_id: str) -> None:
         logger.warning("Clip prune error for %s: %s", cam_id, exc)
 
 
-def _finalize_session(session: _ClipSession) -> None:
-    """Encode session frames, update clip index, prune old clips."""
-    if session.detection_count < MIN_CLIP_DETECTIONS:
-        logger.info("Clip discarded: cam=%s query=%r detections=%d < min=%d",
-                    session.cam_id, session.query, session.detection_count, MIN_CLIP_DETECTIONS)
-        return
-    out_path = _encode_clip(session)
-    if out_path is None:
-        return
+def _register_clip(cam_id: str, out_path: Path, trigger: dict) -> None:
+    """Add a newly saved clip to the in-memory index and prune old ones."""
     entry = {
-        "cam_id":    session.cam_id,
+        "cam_id":    cam_id,
         "filename":  out_path.name,
         "path":      str(out_path),
-        "timestamp": datetime.fromtimestamp(session.wall_start, tz=timezone.utc).isoformat(timespec="seconds"),
-        "query":     session.query,
-        "url":       f"/cameras/clips/file/{session.cam_id}/{out_path.name}",
+        "timestamp": datetime.fromtimestamp(
+            trigger["first_detect_wall"], tz=timezone.utc
+        ).isoformat(timespec="seconds"),
+        "query":     trigger["query"],
+        "url":       f"/cameras/clips/file/{cam_id}/{out_path.name}",
     }
     with _clip_index_lock:
         _clip_index.append(entry)
-    _prune_clips(session.cam_id)
+    _prune_clips(cam_id)
+
+
+def _process_trigger(cam_id: str, trigger: dict) -> None:
+    """Worker function run in a daemon thread to cut one clip from segments."""
+    if trigger["detection_count"] < MIN_CLIP_DETECTIONS:
+        logger.info("Clip discarded: cam=%s query=%r detections=%d < min=%d",
+                    cam_id, trigger["query"],
+                    trigger["detection_count"], MIN_CLIP_DETECTIONS)
+        return
+
+    clip_end_wall = trigger["last_detect_wall"] + POST_BUFFER_S
+
+    # Check whether we already have segment coverage up to clip_end_wall.
+    # If not, force a segment cut and wait up to SEG_DURATION + 5 s for the
+    # boundary event to arrive.
+    deadline = clip_end_wall + SEG_DURATION_S + 5.0
+
+    while time.time() < deadline:
+        with _seg_ring_lock:
+            segs = list(_seg_ring.get(cam_id, []))
+        if any(s.end_wall >= clip_end_wall for s in segs):
+            break
+        time.sleep(2.0)
+
+    out_path = _extract_and_save_clip(cam_id, trigger)
+    if out_path:
+        _register_clip(cam_id, out_path, trigger)
 
 
 def _clip_manager() -> None:
-    """Background thread: finalize clip sessions whose POST_BUFFER_S window has elapsed."""
+    """Background thread: watch for expired trigger windows and cut clips."""
     while not _clip_manager_stop.is_set():
         _clip_manager_stop.wait(timeout=1.0)
         if _clip_manager_stop.is_set():
             break
-        now = time.monotonic()
-        expired = []
-        with _clip_sessions_lock:
-            for cam_id in list(_clip_sessions):
-                session = _clip_sessions[cam_id]
-                if now - session.last_detection > POST_BUFFER_S:
-                    expired.append(_clip_sessions.pop(cam_id))
-                elif now - session.first_detection > MAX_CLIP_DURATION_S:
-                    # Hard duration cap: finalize this chunk; inference will start a new session
-                    expired.append(_clip_sessions.pop(cam_id))
-                    logger.info("Clip duration cap reached for cam=%s — finalizing chunk", cam_id)
-        for session in expired:
-            logger.info("Clip session ended: cam=%s query=%r live_frames=%d",
-                        session.cam_id, session.query, len(session.live_frames))
+
+        now_wall = time.time()
+        ready: list[tuple[str, dict]] = []
+
+        with _clip_triggers_lock:
+            for cam_id in list(_clip_triggers):
+                active = []
+                for t in _clip_triggers[cam_id]:
+                    if now_wall - t["last_detect_wall"] >= POST_BUFFER_S:
+                        ready.append((cam_id, t))
+                    else:
+                        active.append(t)
+                _clip_triggers[cam_id] = active
+                if not active:
+                    del _clip_triggers[cam_id]
+
+        for cam_id, trigger in ready:
+            logger.info("Clip trigger expired: cam=%s query=%r detections=%d — cutting clip",
+                        cam_id, trigger["query"], trigger["detection_count"])
             threading.Thread(
-                target=_finalize_session,
-                args=(session,),
+                target=_process_trigger,
+                args=(cam_id, trigger),
                 daemon=True,
-                name=f"ds-clip-encode-{session.cam_id}",
+                name=f"ds-clip-cut-{cam_id}",
             ).start()
+
     logger.info("Clip manager stopped")
 
 
@@ -499,171 +914,6 @@ def _init_clip_index() -> None:
     except Exception as exc:
         logger.warning("Failed to scan clips dir: %s", exc)
     logger.info("Clip index loaded: %d clips", len(_clip_index))
-
-
-# ── Frame-reader helpers (subprocess stdout → broadcast + inference) ──────────
-
-def _read_exactly(buf, n: int) -> Optional[bytes]:
-    """Read exactly n bytes from a binary file-like object. Returns None on EOF."""
-    data = b""
-    while len(data) < n:
-        chunk = buf.read(n - len(data))
-        if not chunk:
-            return None
-        data += chunk
-    return data
-
-
-def _apply_debug_overlay(cam_id: str, jpeg_bytes: bytes) -> bytes:
-    """Decode JPEG, draw detection boxes, re-encode. Used when debug overlay is on."""
-    frame = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if frame is None:
-        return jpeg_bytes
-    with _det_lock:
-        dets = list(_detections.get(cam_id, []))
-    for det in dets:
-        x1, y1, x2, y2 = det.box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(
-            frame, f"{det.label} #{det.track_id}",
-            (x1, max(0, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
-        )
-    ok_jpg, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-    return buf.tobytes() if ok_jpg else jpeg_bytes
-
-
-def _frame_reader(proc: subprocess.Popen, streams_snapshot: dict) -> None:
-    """
-    Read JPEG frames from the pipeline subprocess stdout.
-    Each frame: [4B cam_id len][cam_id][4B jpeg len][jpeg]
-    EOS marker:  [4B = 0]
-
-    On subprocess exit (including EOS), trigger a pipeline restart so that
-    file sources loop and RTSP sources reconnect.
-    """
-    src = proc.stdout
-    try:
-        while True:
-            hdr = _read_exactly(src, 4)
-            if hdr is None:
-                break
-            cam_id_len = struct.unpack(">I", hdr)[0]
-            if cam_id_len == 0:
-                logger.info("Pipeline worker sent EOS")
-                break
-
-            cam_id_bytes = _read_exactly(src, cam_id_len)
-            if cam_id_bytes is None:
-                break
-            cam_id = cam_id_bytes.decode("utf-8")
-
-            # frame_type byte: 0 = display, 1 = inference (ROI-cropped)
-            ft_hdr = _read_exactly(src, 1)
-            if ft_hdr is None:
-                break
-            frame_type = struct.unpack(">B", ft_hdr)[0]
-
-            jpeg_len_hdr = _read_exactly(src, 4)
-            if jpeg_len_hdr is None:
-                break
-            jpeg_len = struct.unpack(">I", jpeg_len_hdr)[0]
-
-            jpeg_bytes = _read_exactly(src, jpeg_len)
-            if jpeg_bytes is None or len(jpeg_bytes) != jpeg_len:
-                break
-
-            if frame_type == 1:
-                # Inference frame: ROI-cropped JPEG from GStreamer videocrop branch.
-                # Route directly to inference slot — never broadcast or clip-record.
-                # Throttling is already applied in pipeline_worker appsink callback (INFER_FPS).
-                now = time.monotonic()
-                _last_infer[cam_id] = now
-                with _infer_slots_lock:
-                    _infer_slots[cam_id] = (jpeg_bytes, now)
-                _infer_event.set()
-                continue
-
-            # frame_type == 0: display frame.
-            # Live WebSocket: apply debug overlay only for display — never bake boxes into
-            # stored frames so clips and inference slots always use clean raw frames.
-            display_jpeg = _apply_debug_overlay(cam_id, jpeg_bytes) if _debug_overlay else jpeg_bytes
-            _broadcast(cam_id, display_jpeg)
-
-            # Pre-event buffer + clip session feed — rate-limited to CLIP_FPS to bound RAM/disk.
-            # At CLIP_FPS=10: pre-buffer holds 50 frames (5s), a 60s clip uses ≤600 frames (~30MB JPEG).
-            ts_frame = time.monotonic()
-            if ts_frame - _last_clip_frame.get(cam_id, 0.0) >= 1.0 / CLIP_FPS:
-                _last_clip_frame[cam_id] = ts_frame
-                if cam_id not in _pre_buffers:
-                    _pre_buffers[cam_id] = deque(maxlen=PRE_BUFFER_S * CLIP_FPS)
-                _pre_buffers[cam_id].append((ts_frame, jpeg_bytes))
-
-                # Feed active clip session
-                with _clip_sessions_lock:
-                    active_session = _clip_sessions.get(cam_id)
-                if active_session is not None:
-                    active_session.live_frames.append((ts_frame, jpeg_bytes))
-
-            # Inference slot: only when this camera has no ROI branch.
-            # When ROI is configured, the dedicated frame_type=1 branch above feeds inference.
-            if _rois.get(cam_id) is None:
-                now = time.monotonic()
-                if now - _last_infer.get(cam_id, 0.0) >= 1.0 / INFER_FPS:
-                    _last_infer[cam_id] = now
-                    with _infer_slots_lock:
-                        _infer_slots[cam_id] = (jpeg_bytes, now)
-                    _infer_event.set()
-
-    except Exception as exc:
-        logger.error("Frame reader error: %s", exc)
-    finally:
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-
-    # Restart if this is still the active worker (not a superseded one).
-    # Sleep before restart to prevent a tight loop when the camera is unreachable
-    # (e.g. IP change, network outage) — without backoff the loop hammers
-    # subprocess.Popen thousands of times and eventually crashes with RecursionError.
-    global _worker_proc
-    if _worker_proc is proc and streams_snapshot:
-        logger.info("Pipeline worker exited — restarting in 5s (RTSP reconnect backoff)")
-        def _delayed_rebuild():
-            time.sleep(5)
-            _rebuild(streams_snapshot)
-        threading.Thread(target=_delayed_rebuild, daemon=True, name="ds-eos-restart").start()
-
-
-# ── Subscriber management ─────────────────────────────────────────────────────
-
-def _broadcast(cam_id: str, jpeg_bytes: bytes) -> None:
-    with _subscribers_lock:
-        subs = set(_subscribers.get(cam_id, set()))
-        subs |= set(_subscribers.get("*", set()))   # wildcard "any camera"
-    for q in subs:
-        try:
-            q.put_nowait(jpeg_bytes)
-        except queue.Full:
-            pass
-
-
-def subscribe_frames(cam_id: str = "cam0") -> queue.Queue:
-    q: queue.Queue = queue.Queue(maxsize=4)
-    with _subscribers_lock:
-        _subscribers.setdefault(cam_id, set()).add(q)
-    return q
-
-
-def unsubscribe_frames(q: queue.Queue, cam_id: str = "cam0") -> None:
-    with _subscribers_lock:
-        _subscribers.get(cam_id, set()).discard(q)
-        _subscribers.get("*", set()).discard(q)
-    try:
-        q.put_nowait(None)
-    except queue.Full:
-        pass
 
 
 # ── Inference loop ────────────────────────────────────────────────────────────
@@ -789,7 +1039,8 @@ def _inference_loop() -> None:
             if frame is None:
                 continue
             h, w = frame.shape[:2]
-            now  = time.monotonic()
+            now      = time.monotonic()
+            wall_now = time.time()    # wall clock for segment correlation
             dets: list[Detection] = []
 
             # ROI offset: boxes from Triton are in ROI-crop coordinate space.
@@ -814,10 +1065,11 @@ def _inference_loop() -> None:
 
                 key = (cam_id, track_id, q_idx)
 
-                # Clip session: start/extend whenever detection is above threshold,
+                # Clip trigger: start/extend whenever detection is above threshold,
                 # independent of the event-firing cooldown (RECHECK_INTERVAL_S).
+                # wall_now is used so timestamps match pipeline segment boundaries.
                 if label and conf >= _threshold:
-                    _update_clip_session(cam_id, label, now)
+                    _trigger_clip_on_detection(cam_id, label, wall_now)
 
                 # Translate box from inference-frame coords to full-frame coords
                 fx1 = x1 + roi_ox; fy1 = y1 + roi_oy
@@ -877,70 +1129,21 @@ def _inference_loop() -> None:
     logger.info("Inference loop stopped")
 
 
-# ── Pipeline subprocess management ───────────────────────────────────────────
-
-# Path to pipeline_worker.py — same directory as this service file
-_WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "pipeline_worker.py")
-
-
-def _start_pipeline_worker(stream_map: dict[str, str]) -> None:
-    """Spawn pipeline_worker.py as a subprocess, start the frame-reader thread."""
-    global _worker_proc, _frame_reader_thread
-
-    if not stream_map:
-        return
-
-    # Pass ROI info per camera: {"cam": {"url": uri, "roi": {x,y,w,h}|null}}
-    worker_map = {
-        cam_id: {"url": uri, "roi": _rois.get(cam_id)}
-        for cam_id, uri in stream_map.items()
-    }
-    cmd = [sys.executable, _WORKER_SCRIPT, json.dumps(worker_map)]
-    logger.info("Spawning pipeline worker: %s", cmd)
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stdin=subprocess.PIPE,
-        # stderr inherits — logs appear in `docker logs bianca-deepstream`
+def _start_seg_watcher() -> None:
+    global _seg_watcher_thread
+    _seg_watcher_stop.clear()
+    _seg_watcher_thread = threading.Thread(
+        target=_segment_watcher_loop, daemon=True, name="ds-seg-watcher"
     )
-    _worker_proc = proc
-    logger.info("Pipeline worker started PID=%d", proc.pid)
-
-    _frame_reader_thread = threading.Thread(
-        target=_frame_reader,
-        args=(proc, dict(stream_map)),
-        daemon=True,
-        name="ds-frame-reader",
-    )
-    _frame_reader_thread.start()
+    _seg_watcher_thread.start()
 
 
-def _stop_pipeline() -> None:
-    global _worker_proc, _frame_reader_thread
-
-    if _worker_proc is not None:
-        proc = _worker_proc
-        _worker_proc = None   # clear first so frame_reader doesn't restart
-        try:
-            if proc.stdin:
-                proc.stdin.write(b"STOP\n")
-                proc.stdin.flush()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
-            try:
-                proc.wait(timeout=2)
-            except Exception:
-                pass
-        logger.info("Pipeline worker stopped")
-
-    if _frame_reader_thread and _frame_reader_thread.is_alive():
-        _frame_reader_thread.join(timeout=3)
-    _frame_reader_thread = None
+def _stop_seg_watcher() -> None:
+    global _seg_watcher_thread
+    _seg_watcher_stop.set()
+    if _seg_watcher_thread and _seg_watcher_thread.is_alive():
+        _seg_watcher_thread.join(timeout=8)
+    _seg_watcher_thread = None
 
 
 def _stop_inference() -> None:
@@ -965,7 +1168,6 @@ def _rebuild(new_streams: dict[str, str]) -> None:
     """Stop everything, update state, restart with new stream set."""
     global _streams
 
-    # Prevent concurrent rebuilds (e.g. EOS restart racing with add_stream)
     if not _rebuild_lock.acquire(blocking=False):
         logger.debug("_rebuild: already in progress, skipping concurrent call")
         return
@@ -973,30 +1175,39 @@ def _rebuild(new_streams: dict[str, str]) -> None:
     try:
         _stop_clip_manager()
         _stop_inference()
-        _stop_pipeline()
+        _stop_seg_watcher()
+        _stop_all_clip_recorders()
+        _stop_all_rtsp_adapters()
+        _stop_all_sink_containers()
 
         removed = set(_streams) - set(new_streams)
 
         with _infer_slots_lock:
             _infer_slots.clear()
-        _last_display.clear()
         _last_infer.clear()
 
         for cam_id in removed:
+            _go2rtc_unregister(cam_id)
             _trackers.pop(cam_id, None)
             with _det_lock:
                 _detections.pop(cam_id, None)
-            _pre_buffers.pop(cam_id, None)
-            _last_clip_frame.pop(cam_id, None)
             _motion_prev.pop(cam_id, None)
             _rois.pop(cam_id, None)
-            with _clip_sessions_lock:
-                _clip_sessions.pop(cam_id, None)
+            with _seg_ring_lock:
+                _seg_ring.pop(cam_id, None)
+            with _current_seg_lock:
+                _current_seg.pop(cam_id, None)
+            with _clip_triggers_lock:
+                _clip_triggers.pop(cam_id, None)
 
         _streams = dict(new_streams)
 
         if _streams:
-            _start_pipeline_worker(_streams)
+            for cam_id, uri in _streams.items():
+                _start_rtsp_adapter(cam_id, uri)
+                _start_sink_container(cam_id)
+                _start_clip_recorder(cam_id)
+            _start_seg_watcher()
             _start_inference()
             _start_clip_manager()
             logger.info("DeepStream service running: %s", list(_streams.keys()))
@@ -1025,14 +1236,12 @@ def remove_stream(cam_id: str) -> None:
 
 def set_roi(cam_id: str, roi: Optional[dict]) -> None:
     """Set or clear the inference ROI for a camera.
-    Triggers pipeline rebuild: the tee + videocrop branch is added/removed in GStreamer
-    based on whether roi is set, so the pipeline topology must change."""
+    ROI is applied dynamically in the Savant pyfunc — no pipeline rebuild needed."""
     with _pipeline_lock:
         if cam_id not in _streams:
             raise KeyError(cam_id)
         _rois[cam_id] = roi
         _save_cameras(_streams, _rois)
-        _rebuild(dict(_streams))
 
 
 def get_streams() -> dict[str, dict]:
@@ -1155,43 +1364,6 @@ def set_pad_factor(_: float) -> None:
     pass
 
 
-# ── Frame generators (consumed by FastAPI routes) ─────────────────────────────
-
-async def ws_frame_generator(cam_id: str = "cam0"):
-    """Async generator yielding raw JPEG bytes for WebSocket streaming."""
-    q = subscribe_frames(cam_id)
-    try:
-        while True:
-            try:
-                chunk = q.get_nowait()
-            except queue.Empty:
-                await asyncio.sleep(0.02)
-                continue
-            if chunk is None:
-                break
-            yield chunk
-    finally:
-        unsubscribe_frames(q, cam_id)
-
-
-async def mjpeg_generator(rtsp_url: str, cam_id: str = "cam0"):
-    """Async generator yielding MJPEG multipart chunks."""
-    q = subscribe_frames(cam_id)
-    try:
-        while True:
-            try:
-                chunk = q.get_nowait()
-            except queue.Empty:
-                await asyncio.sleep(0.02)
-                continue
-            if chunk is None:
-                break
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + chunk + b"\r\n"
-            )
-    finally:
-        unsubscribe_frames(q, cam_id)
 
 
 # ── Startup: load persisted queries, cameras, and clip index ─────────────────
@@ -1219,8 +1391,9 @@ _init_cameras()
 
 # ── FastAPI app (served by the deepstream container on port 8090) ─────────────
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect  # noqa: E402
-from fastapi.responses import FileResponse, JSONResponse as _JSONResponse  # noqa: E402
+import httpx  # noqa: E402
+from fastapi import FastAPI, Request  # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse as _JSONResponse, StreamingResponse  # noqa: E402
 
 app = FastAPI(title="DeepStream Service")
 
@@ -1228,6 +1401,61 @@ app = FastAPI(title="DeepStream Service")
 @app.get("/health")
 async def _health():
     return {"ok": True}
+
+
+@app.post("/internal/frame")
+async def _internal_frame(request: Request):
+    """Receive a JPEG frame from the Savant pyfunc for Triton inference."""
+    from starlette.requests import ClientDisconnect
+    cam_id = request.headers.get("X-Cam-Id", "cam0")
+    try:
+        jpeg_bytes = await request.body()
+    except ClientDisconnect:
+        return _JSONResponse({"ok": True})
+    if not jpeg_bytes:
+        return _JSONResponse({"error": "empty body"}, status_code=400)
+    now = time.monotonic()
+    with _infer_slots_lock:
+        _infer_slots[cam_id] = (jpeg_bytes, now)
+    _infer_event.set()
+    return _JSONResponse({"ok": True})
+
+
+@app.get("/hls/{cam_id}/{path:path}")
+async def _hls_proxy(request: Request, cam_id: str, path: str):
+    """Proxy HLS/RTSP segment requests to the per-camera always_on_rtsp sink container."""
+    if ".." in cam_id or "/" in cam_id:
+        return _JSONResponse({"error": "invalid cam_id"}, status_code=400)
+    target = f"http://bianca-sink-{_safe_name(cam_id)}:888/stream/{cam_id}/{path}"
+    # LL-HLS blocking playlist requests carry _HLS_msn/_HLS_part — must forward.
+    params = dict(request.query_params)
+    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=30.0))
+    try:
+        req = client.build_request("GET", target, params=params)
+        r = await client.send(req, stream=True)
+    except Exception as exc:
+        await client.aclose()
+        logger.debug("HLS proxy error for %s/%s: %s", cam_id, path, exc)
+        return _JSONResponse({"error": "sink unavailable"}, status_code=503)
+
+    async def _stream():
+        try:
+            async for chunk in r.aiter_bytes(65536):
+                yield chunk
+        finally:
+            await r.aclose()
+            await client.aclose()
+
+    passthrough_headers = {
+        k: v for k, v in r.headers.items()
+        if k.lower() not in ("content-encoding", "transfer-encoding", "content-length")
+    }
+    return StreamingResponse(
+        _stream(),
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "application/octet-stream"),
+        headers=passthrough_headers,
+    )
 
 
 @app.get("/streams")
@@ -1348,25 +1576,6 @@ async def _set_stream(payload: dict):
     set_stream_url(url)
     return _JSONResponse({"ok": True})
 
-
-@app.websocket("/ws/{cam_id}")
-async def _ws_cam(websocket: WebSocket, cam_id: str):
-    await websocket.accept()
-    try:
-        async for jpeg_bytes in ws_frame_generator(cam_id):
-            await websocket.send_bytes(jpeg_bytes)
-    except WebSocketDisconnect:
-        pass
-
-
-@app.websocket("/ws")
-async def _ws_default(websocket: WebSocket):
-    await websocket.accept()
-    try:
-        async for jpeg_bytes in ws_frame_generator("cam0"):
-            await websocket.send_bytes(jpeg_bytes)
-    except WebSocketDisconnect:
-        pass
 
 
 @app.get("/clips")

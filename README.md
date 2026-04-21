@@ -129,13 +129,15 @@ PHONE_TO_NAME={"+447911123456": "Alice", "+447911987654": "Bob"}
 docker compose up -d --build
 ```
 
-This builds five images and starts them in dependency order:
+This builds five static images and starts them in dependency order. Two additional per-camera containers (`bianca-rtsp-{cam_id}`, `bianca-sink-{cam_id}`) are started dynamically when you add a camera.
 
 ```mermaid
 flowchart LR
+    G["bianca-go2rtc\nRTSP normalizing proxy\n~5s start"]
     W["bianca-whisper\nfaster-whisper large-v3 on GPU\n~30-90s first start"]
     T["bianca-triton\nYOLO-World M TRT on GPU\n~60-120s first start"]
     DS["bianca-deepstream\nDeepStream 7.0 NVDEC\n~30s first start"]
+    SM["bianca-savant-module\nSavant pyfunc pipeline\n~15s start"]
     O["bianca-ollama\nQwen 2.5:14b pulled if not cached\n~5 min first start · 9GB"]
     A["bianca-app\nstarts after all four\nare healthy"]
 
@@ -143,6 +145,8 @@ flowchart LR
     T -->|healthy| DS
     DS -->|healthy| A
     O -->|healthy| A
+    G -.->|used by| DS
+    SM -.->|ZMQ| DS
 ```
 
 On subsequent starts all models are already cached — startup takes ~30s total.

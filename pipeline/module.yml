@@ -1,0 +1,17 @@
+name: bianca-inference
+parameters:
+  output_frame:
+    codec: h264
+  batch_size: 1
+  buffer_queues:
+    length: 20
+
+pipeline:
+  elements:
+    - element: pyfunc
+      name: frame-forwarder
+      module: pipeline.pyfunc
+      class_name: BiancaFrameForwarder
+      kwargs:
+        deepstream_url: "${oc.env:DEEPSTREAM_URL,http://bianca-deepstream:8090}"
+        infer_fps: "${oc.env:INFER_FPS,10}"

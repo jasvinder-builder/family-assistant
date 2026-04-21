@@ -652,6 +652,63 @@ Removed dead code accumulated since the GDINO → YOLO-World / camera_service �
 
 ---
 
+### 2026-04-19 — Migrate from raw GStreamer + go2rtc to Savant framework
+
+**Why:** go2rtc's fMP4 MSE endpoint (`GET /api/stream.mp4`) returned 0 bytes — confirmed for this camera/go2rtc 1.9.14 combination. HLS (`/api/stream.m3u8`) worked but the broader pipeline had several compounding issues: 60s RTSP session drops due to `do-rtcp=False` workaround, complex binary stdout wire protocol between deepstream_service and pipeline_worker, and go2rtc API format mismatch (HTTP 400 on stream registration).
+
+**Decision:** Replace go2rtc + raw GStreamer pipeline_worker with Savant — an open-source DeepStream framework — which solves all three issues in one migration: resilient RTSP reconnect (no `do-rtcp` hack needed), declarative YAML pipeline, and LL-HLS/WebRTC display from the Always-On Sink.
+
+**Architecture change:**
+- **Before:** Camera → go2rtc (RTSP proxy) → pipeline_worker.py (GStreamer subprocess, binary stdout) → deepstream_service (frame reader) → Triton
+- **After:** Camera → bianca-rtsp-{cam_id} (Savant RTSP adapter, started dynamically via Docker SDK) → ZeroMQ → bianca-savant-module (Savant pyfunc, extracts JPEG from NVMM) → HTTP POST deepstream_service `/internal/frame` → Triton; browser video via bianca-savant-sink LL-HLS port 888
+
+**Key technical decisions:**
+- **Split-B pyfunc pattern**: pyfunc is a thin frame-extraction bridge only — no inference logic. All inference, tracking, events, and clips stay in `deepstream_service.py` unchanged. Minimises migration risk.
+- **Docker-outside-Docker for RTSP adapters**: deepstream container mounts `/var/run/docker.sock`; `_start_rtsp_adapter()` calls Docker SDK to start/stop `bianca-rtsp-{cam_id}` containers dynamically alongside `add_stream`/`remove_stream`.
+- **ffmpeg rolling segments from Savant RTSP**: `_start_clip_recorder()` runs ffmpeg reading `rtsp://savant-sink:554/stream/{cam_id}`, writing 30s `.ts` segments. `_segment_watcher_loop` polls filesystem every 5s instead of relying on pipeline_worker boundary events.
+- **ROI applied in pyfunc, not GStreamer**: pyfunc polls `/streams` every 10s; no pipeline rebuild needed when ROI changes. `set_roi()` in deepstream_service simplified to save + return (no `_rebuild`).
+- **HLS browser display**: `cameras.html` switched from fMP4 MSE + port 1984 to hls.js + Savant Always-On Sink port 888. Safari falls back to native HLS.
+
+**Changed files:**
+- `pipeline/module.yml` — new: Savant pipeline YAML (pyfunc-only)
+- `pipeline/pyfunc.py` — new: `BiancaFrameForwarder` (`NvDsPyFuncPlugin` subclass)
+- `Dockerfile.savant` — new: extends `savant-deepstream`, adds opencv + numpy
+- `docker-compose.yml` — removed go2rtc; added savant-module, savant-sink; updated deepstream env vars + volume mounts
+- `Dockerfile.deepstream` — added `docker>=7.0` pip dependency
+- `services/deepstream_service.py` — removed pipeline_worker subprocess management, binary frame reader, go2rtc watchdog; added Docker SDK RTSP adapter management, ffmpeg clip recorders, segment watcher, `POST /internal/frame` endpoint
+- `templates/cameras.html` — hls.js CDN; replaced MSE player with HLS player; GO2RTC_BASE → SAVANT_HLS_BASE port 888
+
+---
+
+### 2026-04-21 — go2rtc RTSP proxy + LL-HLS plumbing
+
+**What was fixed:**
+
+**go2rtc as RTSP normalizing proxy (DTS discontinuity fix)**
+- Root cause: the Thingino camera generates DTS discontinuities on its audio tracks. The Savant RTSP adapter's `ffmpeg_src` plugin stalls when it encounters these, timing out after `FFMPEG_TIMEOUT_MS` (30s) and restarting the pipeline. The result was ~5s of real video followed by ~30s of stub ("CONNECTING...") in a loop.
+- Fix: added `bianca-go2rtc` container (alexxit/go2rtc:1.9.14) to docker-compose.yml. Deepstream service registers each camera with go2rtc via `PUT /api/streams?name={cam_id}&src={rtsp_url}` on `_start_rtsp_adapter()`. The RTSP adapter connects to `rtsp://bianca-go2rtc:8554/{cam_id}?video=h264` instead of the camera directly.
+- The `?video=h264` consumer-side filter tells go2rtc to forward only the H.264 video track — all four problematic audio tracks are dropped before they reach the adapter.
+- `FFMPEG_TIMEOUT_MS` raised from 30s to 120s as a secondary defence.
+- `_go2rtc_unregister()` called in `_rebuild()` for removed cameras to clean up go2rtc state.
+
+**go2rtc API format fix**
+- The JSON body format (`PUT /api/streams?name=X` + `{"url": "..."}` body) returns 200 but does not create an in-memory stream entry. The correct format is `PUT /api/streams?name=X&src=Y` (query params). `_go2rtc_register()` updated accordingly.
+- `go2rtc.yaml`: changed `streams: {}` to `streams:` (bare key) so go2rtc can write stream entries back without a yaml parse error.
+
+**LL-HLS query param forwarding**
+- Root cause: hls.js in `lowLatencyMode: true` uses blocking playlist requests — appends `?_HLS_msn=X&_HLS_part=Y`; the server holds the HTTP connection until that segment/part is ready. Both the `app` proxy (`/cameras/hls/`) and the `deepstream` proxy (`/hls/`) were not forwarding `request.query_params`. Without forwarding, every playlist request returned immediately with no blocking, causing hls.js to stall between segment boundaries.
+- Fix: added `params=dict(request.query_params)` to both proxy `client.build_request()` calls.
+
+**Changed files:**
+- `docker-compose.yml` — added `go2rtc` service; added `stub.jpg` volume + env vars to deepstream
+- `go2rtc.yaml` — removed comment; `streams: {}` → `streams:`
+- `services/deepstream_service.py` — go2rtc config constants; `_go2rtc_register/unregister()`; `?video=h264` on adapter URL; `FFMPEG_TIMEOUT_MS` 30s→120s; `_hls_proxy` forwards query params
+- `main.py` — `cameras_hls_proxy` forwards query params
+
+**Status:** Video shows in browser; periodic stub (~5-10s) still visible due to a remaining pipeline stability issue under investigation.
+
+---
+
 ## Open Questions / Future Ideas
 - Add a "complete todo" voice command ("mark buy groceries as done")
 - Scheduled reminders: outbound WhatsApp at event time
