@@ -269,6 +269,72 @@ services:
       start_period: 30s
       retries: 3
 
+  # ── Phase 1 ingress: MediaMTX (replaces go2rtc + Savant sinks) ──────────────
+  # Idle on first deploy; populated at runtime by services/deepstream_service.py
+  # (or its successor) via MediaMTX HTTP API.  See mediamtx.yml for config.
+  mediamtx:
+    image: bluenviron/mediamtx:latest-ffmpeg
+    container_name: bianca-mediamtx
+    restart: unless-stopped
+    networks:
+      - bianca-net
+    ports:
+      - "8888:8888"   # LL-HLS (proxied through bianca-app:/cameras/hls/*)
+      - "8889:8889"   # WebRTC (Phase 5 escape hatch)
+      # 8554 (RTSP) and 9997 (HTTP API) stay docker-network-only.
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    healthcheck:
+      test: ["CMD", "/mediamtx", "--version"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # ── Phase 1 inference: FastAPI control plane + subprocess-per-camera ────────
+  # Replaces, architecturally: bianca-savant-module + per-camera bianca-rtsp-*
+  # + per-camera bianca-sink-* + the inference loop in bianca-deepstream.
+  # Idle on first deploy; populated by add_stream/remove_stream calls.
+  inference:
+    build:
+      context: .
+      dockerfile: Dockerfile.inference
+    image: bianca-inference:latest
+    container_name: bianca-inference
+    restart: unless-stopped
+    networks:
+      - bianca-net
+    ports:
+      - "8091:8091"   # FastAPI control plane (deepstream_service proxies to this)
+    volumes:
+      - ./services:/app/services:ro
+      - ./models:/app/models:ro
+      - ./clips:/app/clips
+    environment:
+      WORKER_SCRIPT: /app/services/inference_worker.py
+      PROTOTYPE_TRITON_URL: triton:8002
+      PROTOTYPE_META: /app/models/yoloworld.meta.json
+      PROTOTYPE_RTSP: rtsp://mediamtx:8554/{cam_id}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      triton:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8091/').read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
 networks:
   bianca-net:
     driver: bridge

@@ -1,0 +1,39 @@
+# Phase 1 inference container for Bianca.
+#
+# Single FastAPI control plane on :8091; spawns one inference subprocess per
+# camera (services/inference_worker.py).  Replaces, at the architectural
+# level: bianca-savant-module + per-camera bianca-rtsp-{cam_id}
+# + per-camera bianca-sink-{cam_id} + the inference loop inside
+# bianca-deepstream.
+#
+# Inherits Savant-DeepStream's base because it ships:
+#   - CUDA + nvv4l2decoder + the GStreamer plugins (kept available as a
+#     fallback decoder if PyAV cuvid ever needs to be swapped out per
+#     BENCH_RESULTS.md)
+#   - System ffmpeg with cuvid + libx264 (used by the per-camera clip
+#     recorder; the imageio-ffmpeg static binary segfaults on this host).
+#
+# Adds:
+#   - PyAV (av) for h264_cuvid decode (the recommended Phase 1 path)
+#   - tritonclient[http] for the inference call
+#   - fastapi/uvicorn for the control plane
+
+FROM ghcr.io/insight-platform/savant-deepstream:latest
+
+RUN pip install --no-cache-dir \
+        'av>=12.0' \
+        'tritonclient[http]>=2.40' \
+        'fastapi>=0.115' \
+        'uvicorn[standard]>=0.30' \
+        'numpy<2.0'
+
+# Service code is bind-mounted from ./services at /app/services so a
+# rebuild isn't needed on every code change.  The CMD picks up whatever
+# is in the mount at start.
+WORKDIR /app
+ENV PYTHONPATH=/app
+
+# Override the savant base image's `python -m savant.entrypoint` ENTRYPOINT.
+# We're not running a Savant pipeline; we're running our own FastAPI.
+ENTRYPOINT []
+CMD ["python3", "/app/services/inference_service.py"]

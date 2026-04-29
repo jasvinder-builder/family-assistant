@@ -1,0 +1,57 @@
+# Phase 1 MediaMTX config — production.
+#
+# Single RTSP/HLS hub.  Replaces the role of: go2rtc proxy + savant-module
+# RTSP adapters + per-camera Savant Always-On Sink containers.
+#
+# Path lifecycle (Phase 1 commit step B):
+#   - cameras.json is the source of truth for the camera registry
+#   - services/deepstream_service.py rewrites paths at startup AND on
+#     add_stream/remove_stream by talking to the MediaMTX HTTP API
+#     (POST /v3/config/paths/add/{name}, POST /v3/config/paths/delete/{name})
+#   - This file declares only the API config; paths are added at runtime.
+
+api: yes
+apiAddress: :9997
+
+# Default auth restricts API to 127.0.0.1.  bianca-inference reaches us via
+# bianca-net (172.18.x.x), so add an internal-network rule that allows API
+# operations from any container on the bridge network.  Public RTSP/HLS/WebRTC
+# actions are still wide open (read/publish without credentials), matching
+# the prototype config and the project's home-network deployment model.
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+      - action: metrics
+      - action: pprof
+
+# LL-HLS — hls.js consumes blocking playlist requests with _HLS_msn / _HLS_part
+# query params; MediaMTX handles them natively (this is the bug class go2rtc
+# hit on 2026-04-21).
+hls: yes
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsAlwaysRemux: yes
+hlsAllowOrigin: '*'
+
+# WebRTC reserved for the Phase 5 sub-second-display path.  Cheap to leave on.
+webrtc: yes
+webrtcAddress: :8889
+
+# RTSP re-stream — one viewer per camera (the inference subprocess).
+# The browser uses LL-HLS, not RTSP, so RTSP doesn't need to be exposed
+# to the host.
+rtsp: yes
+rtspAddress: :8554
+
+# No paths declared here.  cameras.json + the deepstream/inference
+# service together populate them via the HTTP API at startup.
+paths: {}
