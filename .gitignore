@@ -41,3 +41,13 @@ logs/
 .vscode/
 .idea/
 *.swp
+
+# Clip recordings — per-camera MP4 + .ts segments, never commit
+clips/
+
+# Backup files
+*.bak
+
+# pytest
+.pytest_cache/
+.cache/

@@ -709,6 +709,42 @@ Removed dead code accumulated since the GDINO → YOLO-World / camera_service �
 
 ---
 
+### 2026-04-27 — Architecture review + Phase 0 harness + Phase 1 prototypes + step A
+
+Stepped back to look at the surveillance-pipeline complexity (9 containers, 5 hops, 1,598-line `deepstream_service.py`, T0.7 broken since 2026-04-21). Decided on a phased rebuild plan and started executing.
+
+**Architecture review** — `ARCHITECTURE_REVIEW.md` lays out a dual-case plan (≤4 cameras vs 10+ cameras), six phases per case, test-gated, with concrete checkpoints. Confirmed by user. Both cases recorded; case selection deferred.
+
+**Phase 0 — regression harness (done):**
+- `tests/test_smoke.py` covers T0.1–T0.9 against the public HTTP API only. 8 pass / 1 xfail in 210 s.
+- `docker-compose.test.yml` adds a deterministic `bianca-test-rtsp-source` (mediamtx-ffmpeg looping `test.mp4`) so tests don't depend on a real camera.
+- T0.7 (clip end-to-end) marked `xfail` — surfaced a real bug: the `imageio_ffmpeg` static binary segfaults (rc=139) reading from any RTSP source on this host. Phase 1 fixes by switching to system ffmpeg in the new inference container.
+- `tests/bench_decoder.py` benchmarks PyAV-sw vs PyAV-cuvid vs GStreamer-NVDEC on `test.mp4`. Result in `tests/BENCH_RESULTS.md`. Recommendation: `pyav-cuvid` for Case A (real NVDEC, ~50 LOC, avoids the GStreamer-threading bugs that ate three sessions in WORKLOG).
+
+**Phase 1 prototypes (done — all under `tests/`):**
+- `mediamtx-prototype` (compose service) — proves LL-HLS works without the `_HLS_msn`/`_HLS_part` blocking-proxy bug class.
+- `inference_prototype.py` — single-camera pyav-cuvid → Triton → events. 188 events / 30 s, 0 errors.
+- `clip_recorder_prototype.py` — system ffmpeg pulling MediaMTX RTSP → rolling segments → concat-cut MP4. Valid clip produced; this is what flips T0.7 from xfail.
+- `inference_worker_prototype.py` — multi-camera in-process. Surfaced a real concurrency bug: two h264_cuvid + cv2 + Triton loops in the same Python process starves the second. Conclusion: use **subprocess-per-camera**, not threads. Same pattern the pre-Savant `pipeline_worker.py` used.
+- `inference_service_prototype.py` — FastAPI control plane on :8091, subprocess-per-camera lifecycle. Validated POST/DELETE /cameras + GET /diag against SIGKILL'd subprocess.
+
+**Phase 1 commit step A — production services added (idle, not yet wired):**
+- `Dockerfile.inference` — Savant-Deepstream base + `av` + `tritonclient[http]` + fastapi/uvicorn. Has system ffmpeg + cuvid + libx264 (the imageio-ffmpeg bug doesn't apply).
+- `services/inference_worker.py` — promoted from `tests/inference_prototype.py`, only path/comment changes.
+- `services/inference_service.py` — promoted from `tests/inference_service_prototype.py`, only path/comment changes.
+- `mediamtx.yml` — production config; LL-HLS + WebRTC + RTSP; `authInternalUsers` rule allows API access from anywhere on `bianca-net` (default would 401 cross-container).
+- `docker-compose.yml` — `mediamtx` + `inference` services added. Both depend on `triton`. Healthy on first deploy. **Nothing routes to them yet** — existing `app → deepstream → savant + go2rtc → bianca-rtsp-{cam_id}` path is unchanged.
+
+**Smoke harness still 8 pass / 1 xfail** with new services running idle.
+
+**Pending — Phase 1 step B (next session):**
+- Rewire `services/deepstream_service.py:add_stream`/`remove_stream` to call `mediamtx:9997` HTTP API + `inference:8091 POST /cameras` instead of starting Savant adapters / sinks / go2rtc registration / dynamic containers.
+- Update `main.py:cameras_hls_proxy` to point at `mediamtx:8888` directly (drop the deepstream hop).
+- Verify T0.7 flips xfail → pass.
+- Follow-up commit: delete the now-dead Savant + go2rtc + dynamic-container code and remove their compose entries.
+
+---
+
 ## Open Questions / Future Ideas
 - Add a "complete todo" voice command ("mark buy groceries as done")
 - Scheduled reminders: outbound WhatsApp at event time
