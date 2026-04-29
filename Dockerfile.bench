@@ -1,0 +1,24 @@
+# Phase 0/1 prototype tooling container.
+# Inherits Savant-Deepstream's CUDA + ffmpeg-with-cuvid + GStreamer + nvv4l2decoder
+# stack.  Adds:
+#   - av (PyAV) — for the decoder benchmark and the Phase 1.1 inference prototype
+#   - tritonclient[http] — for the inference prototype
+#   - psutil, nvidia-ml-py — for benchmark sampling
+#
+# Used by:
+#   tests/bench_decoder.py        — Phase 0 decoder benchmark
+#   tests/inference_prototype.py  — Phase 1.1 standalone pyav-cuvid inference worker
+#
+# Built lazily at first `docker compose -f ... run --rm bench` invocation.
+
+FROM bianca-savant-module:latest
+
+# av >=12 is the modern PyAV.  psutil for CPU%.  pynvml for GPU stats.
+# imageio-ffmpeg is NOT used here — we want PyAV bound to the container's
+# system ffmpeg, which has cuvid support (verified on the savant base image).
+RUN pip install --no-cache-dir \
+        'av>=12.0' 'psutil>=5.9' 'nvidia-ml-py>=12.535' \
+        'tritonclient[http]>=2.40' \
+        'fastapi>=0.115' 'uvicorn[standard]>=0.30'
+
+WORKDIR /bench

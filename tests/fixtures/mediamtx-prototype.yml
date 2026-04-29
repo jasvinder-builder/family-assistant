@@ -1,0 +1,34 @@
+# MediaMTX prototype config — Phase 1.0 (do-not-delete-anything stage).
+#
+# Pulls from the existing bianca-test-rtsp-source (which loops test.mp4) and
+# re-serves it as LL-HLS for browser playback.  Lives entirely in
+# docker-compose.test.yml; nothing in the production stack references it.
+
+api: yes
+apiAddress: :9997
+
+# LL-HLS — the main thing we're proving works without the
+# _HLS_msn / _HLS_part proxy gymnastics that go2rtc needed.
+hls: yes
+hlsAddress: :8888
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsAlwaysRemux: yes
+hlsAllowOrigin: '*'
+
+# WebRTC available too — Phase 5 escape hatch, no harm in enabling now.
+webrtc: yes
+webrtcAddress: :8889
+
+# RTSP re-stream so the future inference worker can pull from
+# rtsp://bianca-mediamtx-prototype:8554/test instead of going to the
+# camera directly.
+rtsp: yes
+rtspAddress: :8554
+
+paths:
+  test:
+    source: rtsp://bianca-test-rtsp-source:8554/test
+    sourceOnDemand: no

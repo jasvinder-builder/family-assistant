@@ -1,0 +1,121 @@
+# Phase 0 test infrastructure — additive overlay for the regression harness.
+#
+# Adds a deterministic RTSP source so smoke tests don't depend on a real
+# camera being online.  Use:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait
+#   pytest tests/ -v
+#
+# Nothing in this file affects production behaviour.  No production
+# container's config is overridden.
+
+services:
+
+  # MediaMTX as a tiny RTSP server that loops test.mp4 forever.
+  # Picked over a custom ffmpeg loop because MediaMTX handles client
+  # reconnects gracefully — important for the 3-cycle test (T0.9).
+  # ── Decoder benchmark — invoked manually, never auto-started ────────────────
+  # Run with:
+  #   docker compose -f docker-compose.yml -f docker-compose.test.yml \
+  #     run --rm bench python3 /bench/bench_decoder.py /bench/test.mp4
+  # depends on bianca-savant-module image being built first.
+  bench:
+    build:
+      context: .
+      dockerfile: Dockerfile.bench
+    image: bianca-bench:latest
+    profiles: ["bench"]   # only starts when --profile bench is passed
+    networks:
+      - bianca-net
+    volumes:
+      - ./tests:/bench:ro
+      - ./test.mp4:/data/test.mp4:ro
+      - ./models:/data/models:ro          # for yoloworld.meta.json (query list)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Override the savant base image's `python -m savant.entrypoint` ENTRYPOINT
+    # so we can invoke the bench script directly.
+    entrypoint: ["python3"]
+
+  # ── Phase 1.4 prototype: FastAPI inference control plane ────────────────────
+  # Reuses the bench image (already has fastapi + uvicorn + everything else).
+  # Spawns one inference_prototype.py subprocess per camera.  Phase 1 commit
+  # promotes this code into a real `inference` service in docker-compose.yml.
+  inference-prototype:
+    image: bianca-bench:latest
+    container_name: bianca-inference-prototype
+    profiles: ["inference-proto"]
+    networks:
+      - bianca-net
+    ports:
+      - "18091:8091"
+    volumes:
+      - ./tests:/bench:ro
+      - ./test.mp4:/data/test.mp4:ro
+      - ./models:/data/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    entrypoint: ["python3", "/bench/inference_service_prototype.py"]
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8091/').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 8s
+
+  # ── Phase 1.0 prototype: MediaMTX as the candidate RTSP/HLS hub ──────────────
+  # Runs parallel to go2rtc + Savant sink; nothing in the production stack
+  # references it.  Validates that one MediaMTX container can replace the
+  # whole `go2rtc + savant-module + bianca-sink-{cam_id}` chain.  Delete
+  # when Phase 1 commits to the full swap.
+  mediamtx-prototype:
+    image: bluenviron/mediamtx:latest-ffmpeg
+    container_name: bianca-mediamtx-prototype
+    restart: unless-stopped
+    networks:
+      - bianca-net
+    ports:
+      # Expose only the HLS port to the host — RTSP/WebRTC stay
+      # docker-network-only for now (inference worker reaches them via
+      # the bridge, not the host).
+      - "18888:8888"   # LL-HLS for browser playback during the prototype
+    volumes:
+      - ./tests/fixtures/mediamtx-prototype.yml:/mediamtx.yml:ro
+    depends_on:
+      test-rtsp-source:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/mediamtx", "--version"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  test-rtsp-source:
+    image: bluenviron/mediamtx:latest-ffmpeg
+    container_name: bianca-test-rtsp-source
+    restart: unless-stopped
+    networks:
+      - bianca-net
+    volumes:
+      - ./tests/fixtures/mediamtx-test.yml:/mediamtx.yml:ro
+      - ./test.mp4:/test.mp4:ro
+    # The image is `FROM scratch`-style; no shell, no wget.
+    # Use the API port reachability via the mediamtx binary itself as a proxy.
+    healthcheck:
+      test: ["CMD", "/mediamtx", "--version"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 8s

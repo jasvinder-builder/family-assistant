@@ -1,0 +1,14 @@
+# MediaMTX config for the smoke-test RTSP source.
+# Loops /test.mp4 on rtsp://bianca-test-rtsp-source:8554/test forever.
+
+api: yes
+apiAddress: :9997
+
+paths:
+  test:
+    source: publisher
+    runOnInit: >-
+      ffmpeg -re -stream_loop -1 -i /test.mp4
+      -c:v copy -an
+      -f rtsp rtsp://localhost:8554/test
+    runOnInitRestart: yes
