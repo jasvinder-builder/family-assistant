@@ -8,36 +8,38 @@ Bianca is a family assistant that runs entirely on local hardware. It handles da
 - All AI runs locally on GPU — no cloud AI services, no subscriptions
 - Video decoding and ML inference happen entirely on the GPU (CPU never touches video frames)
 - Surveillance alerts are defined in plain English — no retraining required
-- Nine containers on one machine (five static in Docker Compose + four dynamic per camera), managed by Docker Compose + Docker SDK
+- Seven static containers on one machine; no per-camera dynamic containers (Phase 1 step B, 2026-04-29)
 
 The stack is built on several GPU-capable containers:
 
 | Container | Role | GPU | Key tech |
 |---|---|---|---|
-| `bianca-app` | FastAPI app, all routes, browser UI | No (CPU-only) | FastAPI, uvicorn, Jinja2 |
+| `bianca-app` | FastAPI app, all routes, browser UI, HLS proxy → MediaMTX | No (CPU-only) | FastAPI, uvicorn, Jinja2 |
 | `bianca-whisper` | Speech-to-text | Yes | faster-whisper large-v3 |
-| `bianca-deepstream` | Inference service, REST API, clip management | Yes | DeepStream 7.0, Triton HTTP client, Docker SDK |
-| `bianca-savant-module` | RTSP frame ingestion, rate-limited JPEG forwarding | Yes | Savant DeepStream, pyfunc (NvDsPyFuncPlugin) |
-| `bianca-go2rtc` | RTSP normalizing proxy — single camera connection, re-streams DTS-clean RTSP | No | go2rtc 1.9.14, RTSP :8554, HTTP API :1984 |
-| `bianca-rtsp-{cam_id}` | Per-camera RTSP adapter (dynamic, Docker SDK) | No | Savant GStreamer RTSP adapter |
-| `bianca-sink-{cam_id}` | Per-camera live display (dynamic, Docker SDK) | Yes | Savant Always-On Sink, LL-HLS :888, RTSP :554 |
+| `bianca-mediamtx` | Single RTSP/HLS hub: ingest + LL-HLS :8888 + WebRTC :8889 + RTSP :8554 + HTTP API :9997 | No | MediaMTX (latest-ffmpeg) |
+| `bianca-inference` | Subprocess-per-camera inference + sibling ffmpeg clip recorder | Yes | savant-deepstream base, PyAV (h264_cuvid), Triton HTTP client, system ffmpeg |
+| `bianca-deepstream` | Stream control plane + events deque + clip cutter + REST API | Yes | DeepStream 7.0, imageio-ffmpeg static binary (local-file cuts only) |
 | `bianca-triton` | Object detection inference | Yes | Triton 25.03, YOLO-World M TRT |
 | `bianca-ollama` | LLM for NLU and generation | Yes | Ollama, Qwen 2.5:14b |
+
+Pre-Phase-1 components (`bianca-go2rtc`, `bianca-savant-module`, dynamic `bianca-rtsp-{cam_id}` and `bianca-sink-{cam_id}` containers) have been removed entirely (Phase 1 cleanup, 2026-04-29). `Dockerfile.savant`, `pipeline/`, `go2rtc.yaml`, `stub.jpg`, and `services/pipeline_worker.py` are gone too.
 
 Inter-container communication:
 
 ```
 Browser/Twilio ──HTTPS──► app:8000 ──HTTP──► whisper:8080           (STT)
-                                    ──HTTP──► deepstream:8090        (video frames + events)
+                                    ──HTTP──► deepstream:8090        (events + clips API + stream CRUD)
+                                    ──HTTP──► mediamtx:8888          (LL-HLS playlists/segments — proxied)
                                     ──HTTP──► ollama:11434           (LLM)
                                     ──HTTP──► triton:8002            (Triton model management)
                                     ──HTTP──► triton:8004            (TRT re-export trigger)
-                    deepstream:8090 ──HTTP──► triton:8002            (YOLO inference)
-                    deepstream:8090 ──HTTP──► go2rtc:1984            (stream registration)
-                                             go2rtc:8554 ──RTSP──► rtsp-{cam_id}:*  (normalized stream)
-                     rtsp-{cam_id}  ──ZMQ──► savant-module:5555
-                    savant-module   ──ZMQ──► sink-{cam_id}:*        (encoded frames for display)
-                    savant-module ──HTTP──► deepstream:8090          (JPEG frames for inference)
+                    deepstream:8090 ──HTTP──► mediamtx:9997          (path add/remove on add_stream)
+                    deepstream:8090 ──HTTP──► inference:8091         (subprocess add/remove on add_stream)
+                                             camera ──RTSP──► mediamtx:8554/{cam_id}   (single source connection)
+                                                              mediamtx:8554/{cam_id} ──RTSP──► inference (PyAV cuvid → Triton)
+                                                              mediamtx:8554/{cam_id} ──RTSP──► inference (sibling ffmpeg → rolling segs)
+                    inference (worker) ──HTTP──► deepstream:8090     (per-detection trigger + rate-limited events)
+                    inference (worker) ──HTTP──► triton:8002         (YOLO-World inference)
 ```
 
 ---
@@ -514,44 +516,45 @@ family-assistant/
 
 ---
 
-## Savant Frame Flow
+## Surveillance Frame Flow (Phase 1 step B, 2026-04-29)
 
 ```
-Camera ──RTSP──► bianca-go2rtc          (RTSP normalizing proxy)
-                  │ single connection; re-streams DTS-clean H.264
-                  │ registered via PUT /api/streams?name={cam_id}&src={url}
-                  │ RTSP re-stream at rtsp://bianca-go2rtc:8554/{cam_id}?video=h264
-                  ▼
-         bianca-rtsp-{cam_id}           (Savant RTSP adapter, dynamic)
-                  │ ZeroMQ dealer+connect:tcp://savant-module:5555
-                  ▼
-         bianca-savant-module            (Savant pyfunc pipeline)
-           NvDsPyFuncPlugin.process_frame():
-             get_nvds_buf_surface() → RGBA numpy (NVMM)
-             ROI crop (polled from deepstream /streams every 10s)
-             cv2.imencode JPEG (85% quality)
-             leaky queue → forwarder thread
-             HTTP POST bianca-deepstream:8090/internal/frame
-                  │ ZeroMQ pub+bind:tcp://*:5556
-                  ▼
-         bianca-sink-{cam_id}           (Always-On Sink, dynamic)
-           LL-HLS  :888  /stream/{cam_id}/index.m3u8
-           WebRTC  :8889
-           RTSP    :554  /stream/{cam_id}  (consumed by ffmpeg recorders)
-                  │ HTTP GET (LL-HLS, proxied through app:8000 → deepstream:8090)
-                  ▼
-         Browser (hls.js)
-           /cameras/hls/{cam_id}/index.m3u8
-           LL-HLS blocking playlist requests (_HLS_msn/_HLS_part forwarded end-to-end)
+Camera ──RTSP──► bianca-mediamtx                 (single RTSP/HLS hub)
+                  │ paths added/removed at runtime via HTTP API :9997
+                  │ rtspTransport: tcp; sourceOnDemand: false
+                  │ Re-streams on rtsp://bianca-mediamtx:8554/{cam_id}
+                  ├──► LL-HLS  :8888 /{cam_id}/index.m3u8
+                  │     └──► browser (hls.js, via app:8000/cameras/hls/* proxy → mediamtx:8888 directly)
+                  └──► RTSP    :8554 /{cam_id}
+                        ├──► bianca-inference (per-camera worker subprocess)
+                        │     PyAV h264_cuvid (NVDEC) → motion gate → cv2.imencode JPEG
+                        │     → tritonclient.http call to bianca-triton:8002
+                        │     → _SimpleTracker IoU update → for each detection above threshold:
+                        │       POST bianca-deepstream:8090/internal/trigger  (every frame, extends clip window)
+                        │     → on RECHECK_INTERVAL_S cooldown:
+                        │       POST bianca-deepstream:8090/internal/event   (rate-limited; carries img_b64 crop)
+                        │
+                        └──► bianca-inference (sibling ffmpeg process per camera)
+                             ffmpeg -i rtsp://bianca-mediamtx:8554/{cam_id}
+                               -f segment -segment_time 30 -segment_atclocktime 1
+                               clips/{cam_id}/segs/seg_%05d.ts
 
-         bianca-deepstream:8090          (Inference + clip service)
-           POST /internal/frame → _infer_slots[cam_id]
-           _inference_loop: motion gate → Triton → tracker → events
-           ffmpeg -i rtsp://bianca-sink-{cam_id}:554/stream/{cam_id}
-             -f segment -segment_time 30 clips/{cam_id}/segs/seg_%05d.ts
-           _segment_watcher_loop polls segs/ every 5s → _seg_ring
-           _clip_manager: on trigger expiry → ffmpeg concat stream-copy → .mp4
+         bianca-deepstream:8090          (Stream control plane + events + clip cutter)
+           POST /streams              → _mediamtx_add_path + _inference_add_camera
+           DELETE /streams/{cam_id}   → _inference_remove_camera + _mediamtx_remove_path
+           POST /internal/trigger     → _trigger_clip_on_detection (extends window)
+           POST /internal/event       → _events.append + _trigger_clip_on_detection
+           _segment_watcher_loop polls each cam's segs/ every 5s → _seg_ring
+           _clip_manager: on trigger expiry → _process_trigger
+              waits ≤SEG_DURATION_S+5s for finalized seg covering clip_end_wall
+              (checks both _seg_ring and disk fallback)
+              imageio_ffmpeg static binary stream-copies concat → clips/{cam_id}/{ts}_{query}.mp4
+              Disk-only ops here, so the deepstream image's broken libavcodec.so.58
+              doesn't matter — RTSP reads happen in the inference container.
+           GET /clips, GET /clips/file/{cam_id}/{filename}  (range-served)
 ```
+
+Why two ffmpegs (and why not one in deepstream): the deepstream image (DeepStream 7.0 base) has a broken apt ffmpeg — `dpkg -L libavcodec58` lists `.so.58.134.100` but the file is missing on disk. The inference image is built on `savant-deepstream` which has a working system ffmpeg with cuvid + libx264. So the rolling-segment recorder lives next to the inference worker. Clip CUTTING (local file → local file) uses the imageio_ffmpeg static binary in deepstream — that binary's known segfault was specific to RTSP reads, which we no longer do there.
 
 ---
 

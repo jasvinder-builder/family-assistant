@@ -14,11 +14,13 @@ Subprocess isolation sidesteps this entirely and matches the pre-Savant
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import sys
 import threading
 import time
+import urllib.request
 from collections import deque
 from dataclasses import dataclass
 
@@ -187,8 +189,53 @@ def _load_queries(meta_path: str) -> list[str]:
     return list(QUERIES_FALLBACK)
 
 
+def _post_json(url: str, payload: dict, timeout_s: float) -> None:
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=timeout_s).close()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[proto] POST {url} failed: {exc}", file=sys.stderr)
+
+
+def _post_trigger(deepstream_url: str, cam_id: str, query: str) -> None:
+    """Per-detection trigger — extends the clip-recording window in
+    deepstream_service.  Called per-detection, every frame."""
+    if not deepstream_url:
+        return
+    _post_json(
+        f"{deepstream_url.rstrip('/')}/internal/trigger",
+        {"cam_id": cam_id, "query": query},
+        timeout_s=2.0,
+    )
+
+
+def _post_event(deepstream_url: str, cam_id: str, query: str,
+                track_id: int, confidence: float, image_b64: str,
+                timestamp: str) -> None:
+    """Best-effort POST of a (rate-limited) detection event."""
+    if not deepstream_url:
+        return
+    _post_json(
+        f"{deepstream_url.rstrip('/')}/internal/event",
+        {
+            "cam_id":     cam_id,
+            "query":      query,
+            "track_id":   track_id,
+            "confidence": confidence,
+            "image_b64":  image_b64,
+            "timestamp":  timestamp,
+        },
+        timeout_s=3.0,
+    )
+
+
 def run(rtsp_url: str, triton_url: str, queries: list[str],
-        duration_s: int, threshold: float) -> _Stats:
+        duration_s: int, threshold: float,
+        cam_id: str = "cam0", deepstream_url: str = "") -> _Stats:
     print(f"[proto] connecting to Triton at {triton_url}", flush=True)
     client = triton_http.InferenceServerClient(triton_url)
     if not _wait_for_triton(client):
@@ -283,6 +330,15 @@ def run(rtsp_url: str, triton_url: str, queries: list[str],
                     if not label:
                         continue
                     conf = float(t_scores[i])
+                    if conf < threshold:
+                        continue
+
+                    # Per-detection clip trigger — fires every frame the box
+                    # is above threshold.  Independent of the event-firing
+                    # cooldown so MIN_CLIP_DETECTIONS gets reached quickly
+                    # even on a single-track scene.
+                    _post_trigger(deepstream_url, cam_id, label)
+
                     key = (track_id, q_idx)
 
                     # Same RECHECK_INTERVAL_S + 3-frame mean as production
@@ -301,6 +357,31 @@ def run(rtsp_url: str, triton_url: str, queries: list[str],
                         f"[event] t={wall:.2f} track={track_id} "
                         f"query={label!r} conf={conf:.3f}",
                         flush=True,
+                    )
+
+                    # Crop the matched box and JPEG-encode for the event preview
+                    img_b64 = ""
+                    try:
+                        x1, y1, x2, y2 = (int(v) for v in t_boxes[i])
+                        h_img, w_img = img.shape[:2]
+                        x1 = max(0, x1); y1 = max(0, y1)
+                        x2 = min(w_img, x2); y2 = min(h_img, y2)
+                        if x2 > x1 and y2 > y1:
+                            crop = img[y1:y2, x1:x2]
+                            ok_j, j_buf = cv2.imencode(
+                                ".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 80]
+                            )
+                            if ok_j:
+                                img_b64 = base64.b64encode(j_buf.tobytes()).decode()
+                    except Exception:
+                        pass
+
+                    ts_iso = time.strftime(
+                        "%Y-%m-%dT%H:%M:%S", time.localtime(wall)
+                    )
+                    _post_event(
+                        deepstream_url, cam_id, label,
+                        track_id, conf, img_b64, ts_iso,
                     )
     finally:
         container.close()
@@ -329,10 +410,24 @@ def main(argv: list[str]) -> int:
     p.add_argument("--threshold", type=float, default=0.3)
     p.add_argument("--duration", type=int, default=60,
                    help="Seconds to run before exiting cleanly")
+    p.add_argument(
+        "--cam-id",
+        default=os.environ.get("PROTOTYPE_CAM_ID", "cam0"),
+        help="Camera id used in event payloads to deepstream_service",
+    )
+    p.add_argument(
+        "--deepstream-url",
+        default=os.environ.get("DEEPSTREAM_URL", ""),
+        help="Base URL for deepstream_service (e.g. http://bianca-deepstream:8090). "
+             "When empty, events are only printed to stdout.",
+    )
     args = p.parse_args(argv)
 
     queries = _load_queries(args.meta)
-    stats = run(args.rtsp, args.triton, queries, args.duration, args.threshold)
+    stats = run(
+        args.rtsp, args.triton, queries, args.duration, args.threshold,
+        cam_id=args.cam_id, deepstream_url=args.deepstream_url,
+    )
 
     # Final summary, machine-friendly JSON line at the end
     motion_pct = (

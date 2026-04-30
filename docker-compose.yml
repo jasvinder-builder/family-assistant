@@ -1,75 +1,5 @@
 services:
 
-  # ── Savant inference module ──────────────────────────────────────────────────
-  # Receives RTSP frames from per-camera adapter containers via ZeroMQ, runs the
-  # pyfunc that extracts JPEGs and forwards them to deepstream_service for Triton
-  # inference, then outputs encoded frames to the Always-On Sink for browser display.
-  savant-module:
-    build:
-      context: .
-      dockerfile: Dockerfile.savant
-    image: bianca-savant-module:latest
-    container_name: bianca-savant-module
-    restart: unless-stopped
-    command: /opt/savant/pipeline/module.yml
-    networks:
-      - bianca-net
-    ports:
-      - "5555:5555"   # ZMQ ROUTER — RTSP adapters connect here
-      - "5556:5556"   # ZMQ PUB — Always-On Sink subscribes here
-    volumes:
-      - ./pipeline:/opt/savant/pipeline:ro
-    environment:
-      MODULE_CONFIG: /opt/savant/pipeline/module.yml
-      ZMQ_SRC_ENDPOINT: "router+bind:tcp://*:5555"
-      ZMQ_SINK_ENDPOINT: "pub+bind:tcp://*:5556"
-      DEEPSTREAM_URL: "http://bianca-deepstream:8090"
-      INFER_FPS: "10"
-      PYTHONPATH: "/opt/savant"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    depends_on:
-      - deepstream
-    healthcheck:
-      test: ["CMD", "python3", "-c",
-             "import socket; s=socket.socket(); s.connect(('localhost',5555)); s.close()"]
-      interval: 15s
-      timeout: 5s
-      start_period: 30s
-      retries: 5
-
-  # ── Savant Always-On Sink — started dynamically per camera by deepstream ───────
-  # One bianca-sink-{cam_id} container per camera, started via Docker SDK
-  # alongside the RTSP adapter.  See deepstream_service._start_sink_container().
-  # HLS is served by each sink's embedded MediaMTX on port 888 (Docker-network-only).
-  # deepstream_service proxies /hls/{cam_id}/* to bianca-sink-{cam_id}:888.
-
-  # ── go2rtc RTSP normalizing proxy ────────────────────────────────────────────
-  # Single connection per camera to the real device; re-streams a DTS-clean copy
-  # on RTSP port 8554.  Savant RTSP adapter connects here instead of the camera.
-  go2rtc:
-    image: alexxit/go2rtc:latest
-    container_name: bianca-go2rtc
-    restart: unless-stopped
-    networks:
-      - bianca-net
-    ports:
-      - "1984:1984"   # HTTP API (stream registration + debug UI)
-      - "8554:8554"   # RTSP re-streams for Savant adapters
-    volumes:
-      - ./go2rtc.yaml:/config/go2rtc.yaml
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:1984/api/streams"]
-      interval: 15s
-      timeout: 5s
-      start_period: 10s
-      retries: 3
-
   # ── Whisper STT ─────────────────────────────────────────────────────────────
   whisper:
     build:
@@ -164,17 +94,15 @@ services:
       - ${HOME}/.cache/ultralytics:/root/.cache/ultralytics
       - ./cameras.json:/app/cameras.json
       - ./clips:/app/clips
-      - ./stub.jpg:/app/stub.jpg:ro                 # placeholder image for always_on_rtsp sink containers
-      - /var/run/docker.sock:/var/run/docker.sock   # Docker-outside-Docker for RTSP adapter mgmt
     environment:
       TRITON_URL: "triton:8001"
       CAMERAS_JSON_PATH: /app/cameras.json
       CLIPS_DIR: /app/clips
       PYTHONUNBUFFERED: "1"
-      SAVANT_MODULE_HOST: "bianca-savant-module"
-      SAVANT_SINK_HOST: "bianca-savant-sink"
-      STUB_FILE_HOST_PATH: "${PWD}/stub.jpg"
-      DOCKER_NETWORK: "family-assistant_bianca-net"
+      # Phase 1 step B — control plane targets for stream + inference lifecycle
+      MEDIAMTX_API_URL:  "http://bianca-mediamtx:9997"
+      MEDIAMTX_RTSP_URL: "rtsp://bianca-mediamtx:8554"
+      INFERENCE_URL:     "http://bianca-inference:8091"
       SEG_DURATION_S: "30"
       MAX_SEG_FILES: "25"
     deploy:
@@ -186,6 +114,10 @@ services:
               capabilities: [gpu]
     depends_on:
       triton:
+        condition: service_healthy
+      mediamtx:
+        condition: service_healthy
+      inference:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python3", "-c",
@@ -250,6 +182,7 @@ services:
       WHISPER_URL: http://whisper:8080
       TRITON_URL: triton:8001
       DEEPSTREAM_URL: http://deepstream:8090
+      MEDIAMTX_HLS_URL: http://mediamtx:8888
       OLLAMA_BASE_URL: http://ollama:11434
       FAMILY_MD_PATH: /data/family.md
     # App intentionally has NO GPU reservation — it must be CUDA-free.
@@ -315,6 +248,9 @@ services:
       PROTOTYPE_TRITON_URL: triton:8002
       PROTOTYPE_META: /app/models/yoloworld.meta.json
       PROTOTYPE_RTSP: rtsp://mediamtx:8554/{cam_id}
+      # Worker subprocesses POST detection events here.  deepstream_service
+      # owns the events deque and clip-trigger logic in Phase 1.
+      DEEPSTREAM_URL: http://bianca-deepstream:8090
     deploy:
       resources:
         reservations:

@@ -5,7 +5,7 @@ import logging.handlers
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
-from fastapi import FastAPI, Form, Response, Request, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Form, Response, Request, UploadFile, File
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from pathlib import Path
 from fastapi.templating import Jinja2Templates
@@ -23,6 +23,7 @@ from services.qwen import _chat
 from models.schemas import TodoItem, EventItem
 
 DEEPSTREAM_URL  = os.environ.get("DEEPSTREAM_URL",  "http://localhost:8090").rstrip("/")
+MEDIAMTX_HLS_URL = os.environ.get("MEDIAMTX_HLS_URL", "http://localhost:8888").rstrip("/")
 _triton_host    = os.environ.get("TRITON_URL",      "localhost:8001").split(":")[0]
 TRITON_HTTP_URL = f"http://{_triton_host}:8002"
 TRITON_MGMT_URL = f"http://{_triton_host}:8004"
@@ -109,38 +110,6 @@ async def _ds_proxy(method: str, path: str, payload: dict | None = None):
         else:
             r = await client.request(method, url, json=payload)
     return JSONResponse(r.json(), status_code=r.status_code)
-
-
-async def _ds_ws_proxy(websocket: WebSocket, ds_path: str):
-    """Forward a WebSocket connection to the deepstream service."""
-    import websockets as _ws_lib
-    await websocket.accept()
-    ds_url = DEEPSTREAM_URL.replace("http://", "ws://").replace("https://", "wss://") + ds_path
-    try:
-        async with _ws_lib.connect(ds_url) as ds_ws:
-            async def _to_client():
-                async for msg in ds_ws:
-                    if isinstance(msg, bytes):
-                        await websocket.send_bytes(msg)
-                    else:
-                        await websocket.send_text(msg)
-
-            async def _to_ds():
-                while True:
-                    try:
-                        data = await websocket.receive_bytes()
-                        await ds_ws.send(data)
-                    except Exception:
-                        break
-
-            done, pending = await asyncio.wait(
-                [asyncio.ensure_future(_to_client()), asyncio.ensure_future(_to_ds())],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for t in pending:
-                t.cancel()
-    except Exception as exc:
-        logger.debug("WS proxy closed: %s", exc)
 
 
 # ── Re-export orchestration ───────────────────────────────────────────────────
@@ -360,10 +329,12 @@ DEEPSTREAM_URL = os.environ.get("DEEPSTREAM_URL", "http://deepstream:8090")
 
 @app.get("/cameras/hls/{cam_id}/{path:path}")
 async def cameras_hls_proxy(request: Request, cam_id: str, path: str):
-    """Stream-proxy HLS segments/playlists from the per-camera always_on_rtsp sink."""
+    """Stream-proxy LL-HLS segments/playlists from MediaMTX directly.
+    Phase 1 step B: drop the deepstream → sink-container hop entirely; MediaMTX
+    serves LL-HLS at :8888/{cam_id}/* natively."""
     if ".." in cam_id or "/" in cam_id:
         return JSONResponse({"error": "invalid cam_id"}, status_code=400)
-    target = f"{DEEPSTREAM_URL}/hls/{cam_id}/{path}"
+    target = f"{MEDIAMTX_HLS_URL}/{cam_id}/{path}"
     # LL-HLS blocking playlist requests carry _HLS_msn/_HLS_part query params — must forward.
     params = dict(request.query_params)
     client = httpx.AsyncClient(timeout=httpx.Timeout(10.0, read=30.0))

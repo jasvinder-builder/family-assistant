@@ -11,7 +11,7 @@
 #
 # Built lazily at first `docker compose -f ... run --rm bench` invocation.
 
-FROM bianca-savant-module:latest
+FROM ghcr.io/insight-platform/savant-deepstream:latest
 
 # av >=12 is the modern PyAV.  psutil for CPU%.  pynvml for GPU stats.
 # imageio-ffmpeg is NOT used here — we want PyAV bound to the container's

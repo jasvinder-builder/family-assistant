@@ -24,14 +24,17 @@ starves all but the first decoder.
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -49,6 +52,66 @@ META_PATH = os.environ.get(
 )
 # A sentinel "very long" duration — the parent owns lifecycle, not the child.
 WORKER_DURATION_S = int(os.environ.get("WORKER_DURATION_S", "86400"))
+# Where each worker subprocess POSTs detection events.  Empty disables posting
+# (events still print to the worker's stdout for debugging).
+DEEPSTREAM_URL = os.environ.get("DEEPSTREAM_URL", "").rstrip("/")
+
+# Clip recorder: spawns an ffmpeg sibling subprocess per camera that writes
+# rolling N-second segments from the same MediaMTX RTSP re-stream the worker
+# uses.  Lives here (not in bianca-deepstream) because the savant-deepstream
+# base image has a working system ffmpeg with cuvid + libx264 — the deepstream
+# base image's apt ffmpeg is broken (libavcodec.so.58 missing).
+CLIPS_DIR        = Path(os.environ.get("CLIPS_DIR", "/app/clips"))
+SEG_DURATION_S   = int(os.environ.get("SEG_DURATION_S", "30"))
+MAX_SEG_FILES    = int(os.environ.get("MAX_SEG_FILES", "25"))
+
+
+# ── Clip recorder (ffmpeg sibling subprocess) ────────────────────────────────
+
+
+def _spawn_clip_recorder(cam_id: str, rtsp_url: str) -> Optional[subprocess.Popen]:
+    """Best-effort ffmpeg recorder writing rolling .ts segments under
+    {CLIPS_DIR}/{cam_id}/segs/.  Returns None if system ffmpeg is unavailable.
+    Failures don't block inference — clip cutting is degraded, not disabled."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        print("[svc] system ffmpeg missing — clip recorder disabled "
+              f"for {cam_id}", flush=True)
+        return None
+
+    segs_dir = CLIPS_DIR / cam_id / "segs"
+    try:
+        segs_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print(f"[svc] cannot create segs dir {segs_dir}: {exc}", flush=True)
+        return None
+
+    cmd = [
+        ffmpeg, "-y",
+        "-rtsp_transport", "tcp",
+        "-i", rtsp_url,
+        "-c", "copy",
+        "-f", "segment",
+        "-segment_time", str(SEG_DURATION_S),
+        "-segment_wrap", str(MAX_SEG_FILES),
+        "-reset_timestamps", "1",
+        "-segment_format", "mpegts",
+        "-segment_atclocktime", "1",
+        str(segs_dir / "seg_%05d.ts"),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"[svc] clip recorder for {cam_id} pid={proc.pid} "
+              f"src={rtsp_url}", flush=True)
+        return proc
+    except Exception as exc:
+        print(f"[svc] failed to start clip recorder for {cam_id}: {exc}",
+              flush=True)
+        return None
 
 
 # ── Per-camera registry entry ────────────────────────────────────────────────
@@ -62,6 +125,9 @@ class _CameraProc:
     started_at: float
     stderr_buf: deque = field(default_factory=lambda: deque(maxlen=20))
     stderr_thread: Optional[threading.Thread] = None
+    # Sibling ffmpeg subprocess that records rolling segments for clip cutting.
+    # None when system ffmpeg is unavailable (recorder is best-effort).
+    ffmpeg_proc: Optional[subprocess.Popen] = None
 
     def alive(self) -> bool:
         return self.proc.poll() is None
@@ -100,7 +166,10 @@ class _Registry:
             "--triton", TRITON_URL,
             "--meta", META_PATH,
             "--duration", str(WORKER_DURATION_S),
+            "--cam-id", cam_id,
         ]
+        if DEEPSTREAM_URL:
+            cmd += ["--deepstream-url", DEEPSTREAM_URL]
         # Tag stdout/stderr with cam_id so the parent's logs are readable
         env = dict(os.environ)
         env["PROTOTYPE_CAM_ID"] = cam_id
@@ -114,6 +183,7 @@ class _Registry:
         cp = _CameraProc(
             cam_id=cam_id, rtsp_url=rtsp_url,
             proc=proc, started_at=time.time(),
+            ffmpeg_proc=_spawn_clip_recorder(cam_id, rtsp_url),
         )
 
         def _drain_stderr():
@@ -150,6 +220,19 @@ class _Registry:
 
     @staticmethod
     def _terminate(cp: _CameraProc, timeout_s: int = 5) -> None:
+        # Kill the sibling ffmpeg recorder first so its segments stop growing
+        # before the worker is gone.
+        ff = cp.ffmpeg_proc
+        if ff is not None and ff.poll() is None:
+            try:
+                ff.terminate()
+                ff.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                ff.kill()
+                ff.wait(timeout=2)
+            except Exception:
+                pass
+
         if cp.proc.poll() is not None:
             return
         try:
@@ -243,6 +326,11 @@ def diag(cam_id: str):
     cp = _registry.get(cam_id)
     if cp is None:
         raise HTTPException(status_code=404, detail="cam_id not found")
+    ffmpeg_alive: Optional[bool] = None
+    ffmpeg_pid:   Optional[int]  = None
+    if cp.ffmpeg_proc is not None:
+        ffmpeg_pid   = cp.ffmpeg_proc.pid
+        ffmpeg_alive = cp.ffmpeg_proc.poll() is None
     return {
         "cam_id": cam_id,
         "pid": cp.proc.pid,
@@ -251,6 +339,8 @@ def diag(cam_id: str):
         "started_at": cp.started_at,
         "rtsp_url": cp.rtsp_url,
         "stderr_tail": list(cp.stderr_buf),
+        "ffmpeg_pid":   ffmpeg_pid,
+        "ffmpeg_alive": ffmpeg_alive,
     }
 
 

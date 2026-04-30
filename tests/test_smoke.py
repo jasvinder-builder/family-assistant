@@ -193,24 +193,18 @@ def test_T0_6_event_within_45s(
 
 # ── T0.7 — at least one clip exists and is range-served ──────────────────────
 #
-# Known broken on current HEAD: the bundled imageio-ffmpeg static binary
-# segfaults (rc=139) when reading from the Savant Always-On Sink's RTSP
-# output, so the rolling .ts segments are never written and `_extract_and_save_clip`
-# logs "no segment files available".  This is the same instability hinted at
-# by the 2026-04-21 WORKLOG entry ("periodic stub still visible due to a
-# remaining pipeline stability issue under investigation").
+# Phase 1 step B made this work end-to-end: MediaMTX pulls from the source,
+# the inference container's system ffmpeg writes rolling segments, deepstream
+# cuts the clip via concat-stream-copy.
 #
-# Phase 1 (MediaMTX replaces the Savant sink + per-camera dynamic containers)
-# eliminates this code path entirely — the clip recorder will read directly
-# from MediaMTX's normalized re-stream.  At that point this xfail flips back
-# to a passing regression test.
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "Clip recording is broken on current HEAD: bundled ffmpeg segfaults "
-        "reading the Savant sink RTSP.  Tracked for Phase 1 (MediaMTX swap)."
-    ),
-)
+# Timing budget for a continuous-detection source (test.mp4):
+#   - Trigger is extended on every per-detection POST, so it only expires
+#     once MAX_CLIP_DURATION_S (60 s) elapses since first detect and a new
+#     trigger displaces it, then POST_BUFFER_S (5 s) of no extension.
+#   - Then _process_trigger waits up to SEG_DURATION_S (30 s) for a segment
+#     boundary that covers clip_end_wall.
+#   - 150 s gives headroom for stack warmup + Triton first-call + segment
+#     clock-alignment.
 def test_T0_7_clip_and_range_within_60s(
     app_url: str, clean_smoke_cam: str, smoke_source: str
 ) -> None:
@@ -220,10 +214,7 @@ def test_T0_7_clip_and_range_within_60s(
         timeout=10.0,
     ).raise_for_status()
 
-    # MIN_CLIP_DETECTIONS=5 + POST_BUFFER_S=5; so first clip is finalized at
-    # earliest around 10 s after the 5th detection.  90 s gives headroom for
-    # detection rate and dynamic-container startup.
-    deadline = time.monotonic() + 90
+    deadline = time.monotonic() + 150
     clip = None
     while time.monotonic() < deadline:
         clips = httpx.get(

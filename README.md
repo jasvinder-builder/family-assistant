@@ -54,7 +54,7 @@ graph TD
 - **Bulls and Cows** — crack Bianca's secret 4-digit code; say each digit aloud; bulls = right digit right place, cows = right digit wrong place
 - **Word Ladder** — change one letter at a time to climb from the start word to the target; BFS-powered hints; Qwen generates kid-friendly puzzles
 - **20 Questions** — think of an animal, food, object, or place; Bianca asks up to 20 yes/no questions and tries to guess it using Qwen
-- **Cameras** — live view of RTSP streams or local video files via DeepStream NVDEC hardware decode; software motion gate (frame differencing) skips inference when the scene is static; YOLO-World M TRT engine on Triton Inference Server detects objects matching user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa") at ~8ms per frame; _SimpleTracker assigns persistent track IDs; matched detections trigger H.264 video clip recording (5s pre-event buffer + detection duration + 5s post-event) playable in the browser; camera registrations persist across restarts via `cameras.json`; changing queries triggers a ~90s TRT re-export (Qwen temporarily paused to free VRAM) after which the new classes are active
+- **Cameras** — live view of RTSP streams or local video files via MediaMTX LL-HLS; one inference subprocess per camera (PyAV `h264_cuvid` NVDEC decode → motion gate → YOLO-World M TRT on Triton at ~8ms/frame → IoU tracker → events); user-defined natural-language queries (e.g. "small child", "person in red", "cat on sofa"); matched detections trigger H.264 video clip recording (5s pre + detection duration + 5s post) cut from rolling segments via ffmpeg stream-copy; camera registrations persist across restarts via `cameras.json`; changing queries triggers a ~90s TRT re-export (Qwen temporarily paused to free VRAM) after which the new classes are active
 
 **Proactive:**
 - **Event reminders** — WhatsApp reminders sent to all family members 24h and 4h before events
@@ -129,24 +129,26 @@ PHONE_TO_NAME={"+447911123456": "Alice", "+447911987654": "Bob"}
 docker compose up -d --build
 ```
 
-This builds five static images and starts them in dependency order. Two additional per-camera containers (`bianca-rtsp-{cam_id}`, `bianca-sink-{cam_id}`) are started dynamically when you add a camera.
+This builds seven static images and starts them in dependency order. No dynamic per-camera containers — adding a camera just registers a path in MediaMTX and spawns an inference worker subprocess inside `bianca-inference`.
 
 ```mermaid
 flowchart LR
-    G["bianca-go2rtc\nRTSP normalizing proxy\n~5s start"]
     W["bianca-whisper\nfaster-whisper large-v3 on GPU\n~30-90s first start"]
     T["bianca-triton\nYOLO-World M TRT on GPU\n~60-120s first start"]
-    DS["bianca-deepstream\nDeepStream 7.0 NVDEC\n~30s first start"]
-    SM["bianca-savant-module\nSavant pyfunc pipeline\n~15s start"]
+    M["bianca-mediamtx\nRTSP/HLS hub\n~5s start"]
+    I["bianca-inference\nper-camera worker subprocess\n+ sibling ffmpeg recorder\n~10s start"]
+    DS["bianca-deepstream\nstream control plane\n+ events + clip cutter\n~30s start"]
     O["bianca-ollama\nQwen 2.5:14b pulled if not cached\n~5 min first start · 9GB"]
-    A["bianca-app\nstarts after all four\nare healthy"]
+    A["bianca-app\nstarts after deepstream/whisper/ollama\nare healthy"]
 
     W -->|healthy| A
+    T -->|healthy| I
     T -->|healthy| DS
+    M -->|healthy| I
+    M -->|healthy| DS
+    I -->|healthy| DS
     DS -->|healthy| A
     O -->|healthy| A
-    G -.->|used by| DS
-    SM -.->|ZMQ| DS
 ```
 
 On subsequent starts all models are already cached — startup takes ~30s total.

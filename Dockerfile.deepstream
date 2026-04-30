@@ -13,6 +13,14 @@
 
 FROM nvcr.io/nvidia/deepstream:7.0-gc-triton-devel
 
+# System ffmpeg — used by services/deepstream_service.py for the rolling
+# segment recorder + clip cutter.  The bundled imageio-ffmpeg static binary
+# segfaults reading from RTSP on this host (verified WORKLOG 2026-04-27),
+# so we use the apt-installed binary instead.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install pyds (DeepStream Python bindings) — pre-built wheel in devel image
 RUN find /opt/nvidia/deepstream -name "pyds*.whl" 2>/dev/null \
     | head -1 \

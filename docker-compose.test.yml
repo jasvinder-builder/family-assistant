@@ -18,7 +18,6 @@ services:
   # Run with:
   #   docker compose -f docker-compose.yml -f docker-compose.test.yml \
   #     run --rm bench python3 /bench/bench_decoder.py /bench/test.mp4
-  # depends on bianca-savant-module image being built first.
   bench:
     build:
       context: .
@@ -74,11 +73,10 @@ services:
       retries: 5
       start_period: 8s
 
-  # ── Phase 1.0 prototype: MediaMTX as the candidate RTSP/HLS hub ──────────────
-  # Runs parallel to go2rtc + Savant sink; nothing in the production stack
-  # references it.  Validates that one MediaMTX container can replace the
-  # whole `go2rtc + savant-module + bianca-sink-{cam_id}` chain.  Delete
-  # when Phase 1 commits to the full swap.
+  # ── MediaMTX prototype — used only by tests/*_prototype.py scripts ──────────
+  # The production `mediamtx` service in docker-compose.yml is what real
+  # cameras flow through; this one stays as a deterministic ad-hoc source for
+  # bench scripts (--profile bench / inference-proto), keyed off test.mp4.
   mediamtx-prototype:
     image: bluenviron/mediamtx:latest-ffmpeg
     container_name: bianca-mediamtx-prototype
