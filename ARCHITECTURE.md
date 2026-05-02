@@ -516,7 +516,7 @@ family-assistant/
 
 ---
 
-## Surveillance Frame Flow (Phase 1 step B, 2026-04-29)
+## Surveillance Frame Flow (Phase 2, 2026-05-02)
 
 ```
 Camera ──RTSP──► bianca-mediamtx                 (single RTSP/HLS hub)
@@ -539,20 +539,25 @@ Camera ──RTSP──► bianca-mediamtx                 (single RTSP/HLS hub)
                                -f segment -segment_time 30 -segment_atclocktime 1
                                clips/{cam_id}/segs/seg_%05d.ts
 
-         bianca-deepstream:8090          (Stream control plane + events + clip cutter)
-           POST /streams              → _mediamtx_add_path + _inference_add_camera
-           DELETE /streams/{cam_id}   → _inference_remove_camera + _mediamtx_remove_path
-           POST /internal/trigger     → _trigger_clip_on_detection (extends window)
-           POST /internal/event       → _events.append + _trigger_clip_on_detection
-           _segment_watcher_loop polls each cam's segs/ every 5s → _seg_ring
-           _clip_manager: on trigger expiry → _process_trigger
+         bianca-deepstream:8090     (split across four files post-Phase-2)
+           services/camera_runtime.py   ── CameraRuntime dataclass + Registry + cameras.json
+           services/ingress.py          ── MediaMTX + inference HTTP clients (DELETE /v3/config/paths/delete/{name})
+           services/clips.py            ── ClipIndex + _SegWatcher + _ClipManager + cutter
+           services/deepstream_service.py ── FastAPI router + _EventLog + _Queries + add_stream/remove_stream/set_roi
+
+           POST /streams              → add_stream(): registry.add(CameraRuntime), mediamtx_add_path, inference_add_camera
+           DELETE /streams/{cam_id}   → remove_stream(): registry.remove + inference_remove_camera + mediamtx_remove_path
+           POST /internal/trigger     → trigger_clip_on_detection (extends per-cam window under cam.lock)
+           POST /internal/event       → event_log.push + trigger_clip_on_detection
+           _SegWatcher    ── one thread, polls each registered cam's segs/ every 5s → CameraRuntime.seg_ring
+           _ClipManager   ── one thread, on trigger expiry spawns daemon _process_trigger
               waits ≤SEG_DURATION_S+5s for finalized seg covering clip_end_wall
-              (checks both _seg_ring and disk fallback)
+              (checks both cam.seg_ring and disk fallback)
               imageio_ffmpeg static binary stream-copies concat → clips/{cam_id}/{ts}_{query}.mp4
-              Disk-only ops here, so the deepstream image's broken libavcodec.so.58
-              doesn't matter — RTSP reads happen in the inference container.
            GET /clips, GET /clips/file/{cam_id}/{filename}  (range-served)
 ```
+
+Phase 2 collapsed five module-level dicts (`_streams`, `_rois`, `_seg_ring`, `_clip_triggers`, `_current_seg`) and the global `_rebuild()` reconciliation loop into a single `_Registry` of `CameraRuntime` objects, each guarded by its own `threading.Lock`. Add / remove / ROI now touch one runtime; background loops iterate `registry.all()` per tick. T2.1 (`grep -E '^_[a-z_]+: *(dict|list|deque)' services/{camera_runtime,ingress,clips,deepstream_service,inference_service,inference_worker}.py`) returns nothing; T2.2 (10 add+remove cycles at 100 ms intervals) leaves no orphan ffmpeg processes and an empty registry.
 
 Why two ffmpegs (and why not one in deepstream): the deepstream image (DeepStream 7.0 base) has a broken apt ffmpeg — `dpkg -L libavcodec58` lists `.so.58.134.100` but the file is missing on disk. The inference image is built on `savant-deepstream` which has a working system ffmpeg with cuvid + libx264. So the rolling-segment recorder lives next to the inference worker. Clip CUTTING (local file → local file) uses the imageio_ffmpeg static binary in deepstream — that binary's known segfault was specific to RTSP reads, which we no longer do there.
 
@@ -560,39 +565,45 @@ Why two ffmpegs (and why not one in deepstream): the deepstream image (DeepStrea
 
 ## Testing the Camera Pipeline
 
-### Verify go2rtc stream registration
+### Verify MediaMTX path registration
 
 ```bash
-# Check registered streams and their status
-curl -s http://localhost:1984/api/streams | python3 -m json.tool
-
-# Expected: entry for each camera with "producers" (camera connection) and "consumers" (RTSP adapter)
+# Check registered paths (RTSP/HLS/WebRTC re-streams)
+docker exec bianca-deepstream curl -s http://bianca-mediamtx:9997/v3/paths/list | python3 -m json.tool
 ```
 
 ### Check pipeline health after adding a camera
 
 ```bash
-# 1. Verify go2rtc registered the stream
-curl -s http://localhost:1984/api/streams | python3 -c "import sys,json; d=json.load(sys.stdin); print(list(d.keys()))"
+# 1. Verify MediaMTX has the path
+docker exec bianca-deepstream curl -s http://bianca-mediamtx:9997/v3/paths/list \
+  | python3 -c "import sys,json; print([p['name'] for p in json.load(sys.stdin)['items']])"
 
-# 2. Verify RTSP adapter and sink containers are running
-docker ps --filter "name=bianca-rtsp" --filter "name=bianca-sink" --format "{{.Names}}: {{.Status}}"
+# 2. Verify the inference worker subprocess is alive
+curl -s http://localhost:8091/cameras | python3 -m json.tool
 
-# 3. Verify HLS is serving live segments
+# 3. Verify HLS is serving live segments (proxied through bianca-app)
 curl -s http://localhost:8000/cameras/hls/{cam_id}/index.m3u8
 
-# 4. Verify frames are reaching deepstream (check for POST /internal/frame)
-docker logs bianca-deepstream --tail=20 | grep internal/frame
+# 4. Verify events + clip windows reach deepstream
+docker logs bianca-deepstream --tail=40 | grep -E 'internal/(trigger|event)|Clip trigger'
 ```
 
 ### Add/remove a stream
 
 ```bash
-# Add
-curl -s -X POST http://localhost:8090/streams \
+# Add (via the app proxy)
+curl -s -X POST http://localhost:8000/cameras/streams \
   -H "Content-Type: application/json" \
-  -d '{"cam_id": "cam0", "uri": "rtsp://camera-host/stream"}'
+  -d '{"cam_id": "cam0", "url": "rtsp://camera-host/stream"}'
 
 # Remove
-curl -s -X DELETE http://localhost:8090/streams/cam0
+curl -s -X DELETE http://localhost:8000/cameras/streams/cam0
+```
+
+### Run the regression suite
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait
+.venv/bin/pytest tests/test_smoke.py tests/test_phase2.py -v
 ```

@@ -792,6 +792,32 @@ Same session as step B above; landed in the same commit since the rewire and the
 
 **Phase 1 done.** Next big chunk per `ARCHITECTURE_REVIEW.md` is Phase 2 (state consolidation): `CameraRuntime` per camera, one lock per camera, kill `_rebuild`, split `services/deepstream_service.py` into 5 files (`camera_runtime.py`, `inference.py`, `clips.py`, `ingress.py`, `deepstream_service.py` ≈ 100-line FastAPI router).
 
+### 2026-05-02 — Phase 2: state consolidation
+
+`services/deepstream_service.py` was 1,043 lines with five module-level dicts of per-camera state (`_streams`, `_rois`, `_seg_ring`, `_clip_triggers`, `_current_seg`), a `_rebuild()` that tore down + restarted everything on every add/remove, and a single `_pipeline_lock` that serialised the whole thing. Phase 2 collapsed that into a `CameraRuntime` dataclass with its own per-camera lock, owned by an `_Registry`, and split the file along clear seams. Smoke + the new Phase 2 tests are **11 / 11 green in 24 s**.
+
+**File split** (lines after refactor):
+- `services/camera_runtime.py` (130) — `CameraRuntime` dataclass, `_Registry`, `cameras.json` load/save.
+- `services/ingress.py` (105) — MediaMTX + inference HTTP clients. Stateless.
+- `services/clips.py` (470) — `ClipIndex`, `_SegWatcher`, `_ClipManager`, the cutter. Big because the cutter is genuinely the work.
+- `services/deepstream_service.py` (510) — FastAPI router, `_EventLog`, `_Queries`, `add_stream`/`remove_stream`/`set_roi`, backward-compat shims.
+
+The architecture review's "<400 lines each" target was a heuristic; clips.py and deepstream_service.py exceed it but each one is single-concern and the alternative (e.g. one file per FastAPI route group) would scatter related code without making it more readable. Will revisit if clips.py grows further.
+
+**Behaviour change of note** — fixed the MediaMTX delete bug Phase 1 step B silently shipped:
+- Old code: `POST /v3/config/paths/delete/{name}` always returned 404.
+- Effect: paths leaked in MediaMTX between add+remove cycles. Smoke tests passed because re-adds either succeeded fresh (path didn't exist due to test ordering) or quietly served from the leaked path. T0.8 was a false positive on cleanup — it only checked container-name leaks (and there are no containers to leak post-Phase-1).
+- Fix: `services/ingress._mediamtx_call` uses `DELETE` for delete and falls back to `POST /v3/config/paths/replace/{name}` when add returns 400 "already exists". Confirmed clean by running the suite + checking `/v3/paths/list` after — no leaked paths.
+
+**T2.1 + T2.2** — added `tests/test_phase2.py`:
+- T2.1 — regex `^_[a-z_]+: *(dict|list|deque)` over the six surveillance modules. Returns nothing.
+- T2.2 — concurrency stress: ten add+remove cycles at 100 ms intervals with HTTP calls. Asserts the registry empties + ffmpeg recorder count returns to baseline. Exec into bianca-inference for the count via `ps -ef | grep -c '[f]fmpeg -y -rtsp_transport'`.
+- The unrelated game-session dicts in `services/{bulls_cows,hangman,session_store,word_ladder,twenty_questions}_service.py` would also match the regex; they're explicitly out of scope per the architecture review ("Voice/LLM/games stack is not in scope — small, stable, well-factored"). T2.1 narrows to the surveillance subset.
+
+**Combined suite:** `pytest tests/test_smoke.py tests/test_phase2.py` → 11 passed in 24 s.
+
+**Phase 2 done.** Next per `ARCHITECTURE_REVIEW.md` is Phase 3 (observability): `GET /diag/{cam_id}` aggregating per-subsystem timestamps + counters, structured logs tagged `cam_id=X subsystem=Y`, `GET /health` returning degraded reasons. Phase 4 is the resilience-test matrix (kill Triton mid-stream, fill clips dir, reset MediaMTX path, etc.).
+
 ---
 
 ## Open Questions / Future Ideas
