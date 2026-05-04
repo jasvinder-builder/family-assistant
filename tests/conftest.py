@@ -43,6 +43,11 @@ def app_url() -> str:
     return APP_URL
 
 
+@pytest.fixture(scope="session")
+def deepstream_url() -> str:
+    return DEEPSTREAM_URL
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _stack_up() -> Iterator[None]:
     """Verify the stack is reachable; otherwise skip everything with a clear msg."""

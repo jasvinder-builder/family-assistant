@@ -21,6 +21,8 @@ import logging
 import os
 import threading
 import time
+import urllib.parse
+import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -28,6 +30,8 @@ from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse as _JSONResponse
+
+from services.ingress import INFERENCE_URL
 
 from services.camera_runtime import (
     CameraRuntime,
@@ -57,6 +61,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 META_JSON_PATH = os.environ.get("META_JSON_PATH", "/app/models/yoloworld.meta.json")
+
+# Phase 3 observability — tunables for /diag and /health.
+HEARTBEAT_STALE_S       = float(os.environ.get("HEARTBEAT_STALE_S",       "15"))
+DECODE_STALE_S          = float(os.environ.get("DECODE_STALE_S",          "10"))
+INFERENCE_DIAG_TIMEOUT  = float(os.environ.get("INFERENCE_DIAG_TIMEOUT",  "2"))
+STARTUP_GRACE_S         = float(os.environ.get("STARTUP_GRACE_S",         "30"))
 
 
 # ── Events feed (global, not per-camera) ─────────────────────────────────────
@@ -327,6 +337,147 @@ def _startup() -> None:
 _startup()
 
 
+# ── Phase 3 observability ────────────────────────────────────────────────────
+
+
+def _inference_diag(cam_id: str) -> Optional[dict]:
+    """Fetch the inference container's per-cam diag (worker pid + ffmpeg pid).
+    Returns None on transport error so the caller can degrade gracefully."""
+    url = f"{INFERENCE_URL}/diag/{urllib.parse.quote(cam_id, safe='')}"
+    try:
+        with urllib.request.urlopen(url, timeout=INFERENCE_DIAG_TIMEOUT) as resp:
+            if resp.status != 200:
+                return None
+            return json.loads(resp.read().decode())
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("inference /diag/%s failed: %s", cam_id, exc)
+        return None
+
+
+def _diag_for_cam(cam_id: str) -> Optional[dict]:
+    """Aggregate per-camera diag JSON. Returns None if the camera isn't registered.
+
+    health = ok | degraded | down, with `reasons` listing every failed check
+    so that a single GET shows which subsystem is sick without grepping logs."""
+    cam = registry.get(cam_id)
+    if cam is None:
+        return None
+
+    now = time.time()
+    with cam.lock:
+        hb            = cam.last_heartbeat or {}
+        hb_wall       = cam.last_heartbeat_wall
+        rtsp_url      = cam.rtsp_url
+        triggers      = list(cam.clip_triggers)
+        ring_size     = len(cam.seg_ring)
+        registered_at = cam.registered_at
+
+    in_grace    = (now - registered_at) < STARTUP_GRACE_S
+    inf_diag    = _inference_diag(cam_id)
+    worker_alive = bool(inf_diag.get("alive")) if inf_diag else None
+    worker_pid   = inf_diag.get("pid") if inf_diag else None
+    ffmpeg_alive = inf_diag.get("ffmpeg_alive") if inf_diag else None
+    ffmpeg_pid   = inf_diag.get("ffmpeg_pid")   if inf_diag else None
+
+    last_decode  = float(hb.get("last_decode_wall", 0) or 0)
+    last_triton  = float(hb.get("last_triton_wall", 0) or 0)
+    last_event   = float(hb.get("last_event_wall",  0) or 0)
+    decoded      = int(hb.get("decoded", 0) or 0)
+    skipped      = int(hb.get("motion_skipped", 0) or 0)
+    motion_pct   = round(100.0 * skipped / decoded, 1) if decoded else 0.0
+
+    cam_clips = [c for c in clip_index.list_all() if c["cam_id"] == cam_id]
+    clips_total   = len(cam_clips)
+    last_clip_ts  = cam_clips[0]["timestamp"] if cam_clips else None
+
+    reasons: list[str] = []
+    if hb_wall == 0:
+        if not in_grace:
+            reasons.append("no heartbeat received yet")
+    elif now - hb_wall > HEARTBEAT_STALE_S:
+        reasons.append(f"heartbeat stale ({now - hb_wall:.1f}s)")
+    if last_decode and now - last_decode > DECODE_STALE_S:
+        reasons.append(f"no decoded frames for {now - last_decode:.1f}s")
+    if worker_alive is False:
+        reasons.append("inference worker subprocess dead")
+    if ffmpeg_alive is False:
+        reasons.append("ffmpeg clip recorder dead")
+
+    if not hb_wall and worker_alive is None:
+        # No signal yet from either the heartbeat thread or inference container.
+        # Suppress "down" during the startup grace window — worker may still be
+        # connecting to Triton and MediaMTX.
+        health = "ok" if in_grace else "down"
+    elif reasons:
+        health = "degraded"
+    else:
+        health = "ok"
+
+    return {
+        "cam_id": cam_id,
+        "ingress": {
+            "rtsp_url":         rtsp_url,
+            "last_frame_ts":    last_decode or None,
+            "last_frame_age_s": (now - last_decode) if last_decode else None,
+            "reconnect_count":  int(hb.get("reconnect_count", 0) or 0),
+            "bytes_total":      int(hb.get("bytes_total", 0) or 0),
+            "ffmpeg_alive":     ffmpeg_alive,
+            "ffmpeg_pid":       ffmpeg_pid,
+        },
+        "inference": {
+            "worker_alive":         worker_alive,
+            "worker_pid":           worker_pid,
+            "last_triton_ts":       last_triton or None,
+            "last_triton_age_s":    (now - last_triton) if last_triton else None,
+            "last_event_ts":        last_event or None,
+            "last_event_age_s":     (now - last_event) if last_event else None,
+            "triton_ms_p50":        float(hb.get("triton_ms_p50", 0.0) or 0.0),
+            "triton_ms_p99":        float(hb.get("triton_ms_p99", 0.0) or 0.0),
+            "motion_gate_skip_pct": motion_pct,
+            "triton_errors":        int(hb.get("triton_errors", 0) or 0),
+            "decoded":              decoded,
+            "inferred":             int(hb.get("inferred", 0) or 0),
+        },
+        "clips": {
+            "active_sessions": len(triggers),
+            "last_clip_ts":    last_clip_ts,
+            "clips_total":     clips_total,
+            "seg_ring_size":   ring_size,
+        },
+        "heartbeat_age_s": (now - hb_wall) if hb_wall else None,
+        "health":          health,
+        "reasons":         reasons,
+        "startup_grace":   in_grace,
+        "registered_at":   registered_at,
+    }
+
+
+def _compute_health() -> tuple[str, list[str]]:
+    """Aggregate per-camera health into a single status. Returns (status, reasons).
+
+    `down` only if every registered camera is down. `degraded` if any camera is
+    not ok. `ok` otherwise (including when no cameras are registered)."""
+    cam_ids = registry.list_ids()
+    if not cam_ids:
+        return "ok", []
+
+    reasons: list[str] = []
+    statuses: list[str] = []
+    for cid in cam_ids:
+        diag = _diag_for_cam(cid)
+        if diag is None:
+            continue
+        statuses.append(diag["health"])
+        for r in diag["reasons"]:
+            reasons.append(f"{cid}: {r}")
+
+    if statuses and all(s == "down" for s in statuses):
+        return "down", reasons
+    if any(s != "ok" for s in statuses):
+        return "degraded", reasons
+    return "ok", []
+
+
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 
 
@@ -335,7 +486,39 @@ app = FastAPI(title="DeepStream Service")
 
 @app.get("/health")
 async def _health():
-    return {"ok": True}
+    """Aggregate health across all registered cameras + Triton + MediaMTX.
+    Returns 200 when ok, 503 when degraded/down, with named reasons."""
+    status, reasons = await asyncio.to_thread(_compute_health)
+    body = {"status": status, "reasons": reasons}
+    if status == "ok":
+        return _JSONResponse(body)
+    return _JSONResponse(body, status_code=503)
+
+
+@app.get("/diag/{cam_id}")
+async def _diag(cam_id: str):
+    diag = await asyncio.to_thread(_diag_for_cam, cam_id)
+    if diag is None:
+        return _JSONResponse({"error": f"cam_id '{cam_id}' not found"}, status_code=404)
+    return _JSONResponse(diag)
+
+
+@app.post("/internal/heartbeat")
+async def _internal_heartbeat(payload: dict):
+    """Inference worker stats heartbeat (every ~5s).  Stored on the camera's
+    runtime for /diag aggregation; never appended to events."""
+    cam_id = (payload.get("cam_id") or "").strip()
+    if not cam_id:
+        return _JSONResponse({"error": "cam_id required"}, status_code=400)
+    cam = registry.get(cam_id)
+    if cam is None:
+        # Worker may briefly outlive its DELETE — accept silently to avoid
+        # spamming worker logs with 404s during teardown.
+        return _JSONResponse({"ok": True, "registered": False})
+    with cam.lock:
+        cam.last_heartbeat      = payload
+        cam.last_heartbeat_wall = time.time()
+    return _JSONResponse({"ok": True, "registered": True})
 
 
 @app.post("/internal/trigger")

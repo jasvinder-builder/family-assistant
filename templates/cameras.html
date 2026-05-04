@@ -167,7 +167,7 @@
     if (tile && !tile.querySelector('.cam-error')) {
       const d = document.createElement('div');
       d.className = 'cam-error';
-      d.textContent = '⚠ Stream unavailable — check Savant Always-On Sink';
+      d.textContent = '⚠ Stream unavailable — check MediaMTX and camera connection';
       d.style = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(15,23,42,0.85);color:#f87171;font-size:0.85rem;text-align:center;padding:1rem;';
       tile.appendChild(d);
     }
@@ -184,7 +184,7 @@
     video.muted = true;
 
     if (Hls.isSupported()) {
-      const hls = new Hls({ maxBufferLength: 4, maxMaxBufferLength: 8, lowLatencyMode: true });
+      const hls = new Hls({ maxBufferLength: 30, maxMaxBufferLength: 60, lowLatencyMode: false });
       hls.on(Hls.Events.ERROR, (_, data) => { if (data.fatal) _showStreamError(camId); });
       hls.loadSource(hlsUrl);
       hls.attachMedia(video);

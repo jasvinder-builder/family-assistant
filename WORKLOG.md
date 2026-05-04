@@ -818,6 +818,31 @@ The architecture review's "<400 lines each" target was a heuristic; clips.py and
 
 **Phase 2 done.** Next per `ARCHITECTURE_REVIEW.md` is Phase 3 (observability): `GET /diag/{cam_id}` aggregating per-subsystem timestamps + counters, structured logs tagged `cam_id=X subsystem=Y`, `GET /health` returning degraded reasons. Phase 4 is the resilience-test matrix (kill Triton mid-stream, fill clips dir, reset MediaMTX path, etc.).
 
+### 2026-05-02 — Phase 3: observability
+
+**Heartbeat infrastructure** — `services/inference_worker.py` got a `_Heartbeat` daemon thread (inside the per-camera worker subprocess). It POSTs a stats snapshot (`decoded`, `motion_skipped`, `inferred`, `events`, `triton_errors`, `reconnect_count`, `bytes_total`, `last_decode_wall`, `last_triton_wall`, `last_event_wall`, `triton_ms_p50`, `triton_ms_p99`) to `bianca-deepstream:8090/internal/heartbeat` every 5 s. The first beat fires immediately on startup so `/diag` has data within one cycle.
+
+**State** — `CameraRuntime` got two new fields: `last_heartbeat: Optional[dict]` (the latest wire-format dict), `last_heartbeat_wall: float` (wall time it arrived), and `registered_at: float` (stamped at construction, used by the startup grace period).
+
+**New endpoints** on `services/deepstream_service.py`:
+- `POST /internal/heartbeat` — stores snapshot on the camera's runtime; silently accepts heartbeats for unregistered cams (worker may outlive its DELETE).
+- `POST /internal/trigger` — per-detection trigger extending the clip window (was already there, confirmed wired).
+- `POST /internal/event` — rate-limited event with `img_b64` crop (was already there, confirmed wired).
+- `GET /diag/{cam_id}` — full aggregated snapshot: ingress + inference + clips + health + reasons + `startup_grace` + `registered_at`. Calls `inference:8091/diag/{cam_id}` with a 2 s timeout for worker PID / ffmpeg PID info.
+- `GET /health` — aggregates all cameras: `{"status": "ok"/"degraded"/"down", "reasons": [...]}`. HTTP 200 when ok, 503 when not.
+
+**Startup grace period** — `STARTUP_GRACE_S` (default 30 s). During the grace window, `/diag` suppresses "no heartbeat received yet" and returns `health=ok` instead of `down` when neither heartbeat nor inference container has responded yet. Needed because the worker waits for Triton to become ready (~10–20 s) before its first beat. Without grace, every camera appears "down" for the first 30 s after stack startup.
+
+**Health logic**: `down` only when no heartbeat AND inference unreachable AND outside grace. `degraded` on stale heartbeat, stale frames, dead worker, or dead ffmpeg. `ok` otherwise. Aggregate: `down` only if ALL cameras are down.
+
+**Tests** — `tests/test_phase3.py` with six tests (T3.1–T3.6): 404 for unknown cam, 400 for missing cam_id, silent accept for ghost cam, heartbeat reflected in /diag with health=ok, startup grace suppresses "down" for fresh cam, /health returns correct structure and HTTP status.
+
+**`deepstream_url` fixture** — added to `tests/conftest.py` so Phase 3 tests can talk directly to port 8090 for internal/diag/health endpoints.
+
+**Tunables** (all env vars, all have sane defaults): `HEARTBEAT_STALE_S=15`, `DECODE_STALE_S=10`, `INFERENCE_DIAG_TIMEOUT=2`, `STARTUP_GRACE_S=30`.
+
+**Phase 3 done.** Next: Phase 4 — resilience matrix (kill Triton mid-stream, fill clips dir, reset MediaMTX path while camera is streaming, double-register same cam_id, inference container crash + auto-restart).
+
 ---
 
 ## Open Questions / Future Ideas

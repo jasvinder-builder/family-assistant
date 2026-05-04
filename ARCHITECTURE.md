@@ -559,6 +559,72 @@ Camera ──RTSP──► bianca-mediamtx                 (single RTSP/HLS hub)
 
 Phase 2 collapsed five module-level dicts (`_streams`, `_rois`, `_seg_ring`, `_clip_triggers`, `_current_seg`) and the global `_rebuild()` reconciliation loop into a single `_Registry` of `CameraRuntime` objects, each guarded by its own `threading.Lock`. Add / remove / ROI now touch one runtime; background loops iterate `registry.all()` per tick. T2.1 (`grep -E '^_[a-z_]+: *(dict|list|deque)' services/{camera_runtime,ingress,clips,deepstream_service,inference_service,inference_worker}.py`) returns nothing; T2.2 (10 add+remove cycles at 100 ms intervals) leaves no orphan ffmpeg processes and an empty registry.
 
+---
+
+## Observability (Phase 3, 2026-05-02)
+
+### Heartbeat flow
+
+The inference worker (`services/inference_worker.py`) runs a `_Heartbeat` daemon thread that POSTs stats to deepstream every 5 seconds:
+
+```
+inference worker (per-camera subprocess)
+  → POST bianca-deepstream:8090/internal/heartbeat
+    {cam_id, decoded, motion_skipped, inferred, events,
+     triton_errors, reconnect_count, bytes_total,
+     last_decode_wall, last_triton_wall, last_event_wall,
+     triton_ms_p50, triton_ms_p99}
+  → stored on CameraRuntime.last_heartbeat + last_heartbeat_wall (under cam.lock)
+```
+
+The first beat fires immediately on worker startup so `/diag` has data within one 5-second cycle rather than waiting a full interval.
+
+### Diagnostics endpoints
+
+| Endpoint | What it returns |
+|---|---|
+| `GET /diag/{cam_id}` | Full per-camera snapshot: ingress stats (rtsp_url, last_frame_ts, reconnect_count, bytes_total, ffmpeg_alive/pid), inference stats (worker_alive/pid, last_triton_ts, triton_ms_p50/p99, motion_gate_skip_pct, triton_errors), clip stats (active_sessions, clips_total, seg_ring_size), heartbeat_age_s, health, reasons, startup_grace, registered_at |
+| `GET /health` | Aggregate across all cameras: `{"status": "ok"/"degraded"/"down", "reasons": [...]}` |
+| `POST /internal/heartbeat` | Internal — called by the inference worker only. Accepted silently even if cam_id is not registered (worker may briefly outlive its DELETE). |
+
+HTTP status: `/health` returns **200** when `status=ok`, **503** when `status=degraded` or `status=down`.
+
+### Health calculation
+
+For each camera:
+
+```
+in_grace = (now - registered_at) < STARTUP_GRACE_S   # default 30s
+
+reasons = []
+if heartbeat never received and not in_grace  → "no heartbeat received yet"
+if heartbeat received but stale (> 15s)       → "heartbeat stale (Xs)"
+if last decoded frame stale (> 10s)           → "no decoded frames for Xs"
+if inference worker subprocess dead           → "inference worker subprocess dead"
+if ffmpeg clip recorder dead                  → "ffmpeg clip recorder dead"
+
+health:
+  no heartbeat AND inference unreachable AND in_grace → "ok"   (startup grace)
+  no heartbeat AND inference unreachable              → "down"
+  any reason                                          → "degraded"
+  otherwise                                           → "ok"
+```
+
+Aggregate: `down` only when ALL cameras are down; `degraded` if any is not ok.
+
+### Tunables (env vars on bianca-deepstream)
+
+| Var | Default | Effect |
+|---|---|---|
+| `HEARTBEAT_STALE_S` | `15` | Seconds after which a received heartbeat is flagged stale |
+| `DECODE_STALE_S` | `10` | Seconds after which the last decoded frame is flagged stale |
+| `INFERENCE_DIAG_TIMEOUT` | `2` | HTTP timeout when deepstream fetches `/diag/{cam_id}` from inference |
+| `STARTUP_GRACE_S` | `30` | Grace window for newly registered cameras to suppress false "down" |
+
+### Startup grace
+
+When a camera is first registered (or loaded from cameras.json at startup), `CameraRuntime.registered_at` is stamped. During the first `STARTUP_GRACE_S` seconds, `/diag` suppresses both the "no heartbeat received yet" reason and the "down" health state — the worker may still be waiting for Triton to become ready before its first heartbeat fires. After the window, missing heartbeats degrade health normally.
+
 Why two ffmpegs (and why not one in deepstream): the deepstream image (DeepStream 7.0 base) has a broken apt ffmpeg — `dpkg -L libavcodec58` lists `.so.58.134.100` but the file is missing on disk. The inference image is built on `savant-deepstream` which has a working system ffmpeg with cuvid + libx264. So the rolling-segment recorder lives next to the inference worker. Clip CUTTING (local file → local file) uses the imageio_ffmpeg static binary in deepstream — that binary's known segfault was specific to RTSP reads, which we no longer do there.
 
 ---

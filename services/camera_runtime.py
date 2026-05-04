@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
@@ -32,8 +33,10 @@ class CameraRuntime:
     """All per-camera state owned by the deepstream service.
 
     What lives here vs. elsewhere:
-      - here: cam_id, rtsp_url, roi, rolling-segment ring, pending clip triggers
-      - inference container: tracker, motion_prev, last_event_ts, detections
+      - here: cam_id, rtsp_url, roi, rolling-segment ring, pending clip
+        triggers, latest worker heartbeat (Phase 3)
+      - inference container: tracker, motion_prev, detections, raw frame counters
+        (heartbeated here every ~5s)
       - global (singletons in deepstream_service): event log, clip index, queries
 
     The lock guards mutation of fields on this dataclass. It is a regular
@@ -46,6 +49,16 @@ class CameraRuntime:
     seg_ring:      deque            = field(default_factory=lambda: deque(maxlen=SEG_RING_MAXLEN))
     clip_triggers: list[dict]       = field(default_factory=list)
     lock:          threading.Lock   = field(default_factory=threading.Lock)
+    # Phase 3 (observability): last heartbeat snapshot from inference worker.
+    # Wire-format dict (decoded, motion_skipped, inferred, events, triton_errors,
+    # last_decode_wall, last_triton_wall, last_event_wall, triton_ms_p50,
+    # triton_ms_p99, reconnect_count, bytes_total).  Updated by
+    # POST /internal/heartbeat; read by GET /diag/{cam_id} and /health.
+    last_heartbeat:      Optional[dict] = None
+    last_heartbeat_wall: float          = 0.0
+    # Timestamp of first registration — used by /diag to suppress "down" during
+    # the startup grace window (STARTUP_GRACE_S) while the worker connects.
+    registered_at:       float          = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
         """Serialise for /streams API and cameras.json persistence."""

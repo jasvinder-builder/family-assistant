@@ -22,7 +22,7 @@ import threading
 import time
 import urllib.request
 from collections import deque
-from dataclasses import dataclass
+from typing import Optional
 
 import av  # type: ignore[import-not-found]
 import cv2
@@ -135,14 +135,72 @@ class _SimpleTracker:
 # ── Worker ───────────────────────────────────────────────────────────────────
 
 
-@dataclass
 class _Stats:
-    decoded: int = 0
-    motion_skipped: int = 0
-    inferred: int = 0
-    events: int = 0
-    triton_errors: int = 0
-    last_event_ts: float = 0.0
+    """Live counters + timestamps + Triton-latency ring.  Read by the heartbeat
+    thread under self.lock; written by the main inference loop without the
+    lock (single writer, atomic int/float updates are safe enough at this scale).
+
+    Phase 3 wire-format: snapshot() returns the dict that gets POSTed to
+    deepstream's /internal/heartbeat.
+    """
+
+    def __init__(self) -> None:
+        self.decoded:        int   = 0
+        self.motion_skipped: int   = 0
+        self.inferred:       int   = 0
+        self.events:         int   = 0
+        self.triton_errors:  int   = 0
+        self.reconnect_count: int  = 0
+        self.bytes_total:    int   = 0
+        self.last_decode_wall: float = 0.0
+        self.last_triton_wall: float = 0.0
+        self.last_event_wall:  float = 0.0
+        # Last 50 Triton inference latencies (ms) — used for p50/p99
+        self._triton_ms: deque[float] = deque(maxlen=50)
+        self.lock = threading.Lock()
+
+    # Backwards-compat for the old summary print
+    @property
+    def last_event_ts(self) -> float:
+        return self.last_event_wall
+
+    def record_triton(self, ms: float, wall_now: float) -> None:
+        with self.lock:
+            self._triton_ms.append(ms)
+            self.last_triton_wall = wall_now
+
+    def percentiles(self) -> tuple[float, float]:
+        """Return (p50, p99) in ms over the recent ring buffer.  0.0 when empty."""
+        with self.lock:
+            samples = sorted(self._triton_ms)
+        if not samples:
+            return 0.0, 0.0
+        n = len(samples)
+
+        def _pct(p: float) -> float:
+            idx = min(n - 1, max(0, int(round((p / 100.0) * (n - 1)))))
+            return float(samples[idx])
+
+        return _pct(50), _pct(99)
+
+    def snapshot(self, cam_id: str, rtsp_url: str) -> dict:
+        p50, p99 = self.percentiles()
+        return {
+            "cam_id":            cam_id,
+            "rtsp_url":          rtsp_url,
+            "decoded":           self.decoded,
+            "motion_skipped":    self.motion_skipped,
+            "inferred":          self.inferred,
+            "events":            self.events,
+            "triton_errors":     self.triton_errors,
+            "reconnect_count":   self.reconnect_count,
+            "bytes_total":       self.bytes_total,
+            "last_decode_wall":  self.last_decode_wall,
+            "last_triton_wall":  self.last_triton_wall,
+            "last_event_wall":   self.last_event_wall,
+            "triton_ms_p50":     p50,
+            "triton_ms_p99":     p99,
+        }
 
 
 def _open_pyav_cuvid(rtsp_url: str) -> tuple:
@@ -233,6 +291,49 @@ def _post_event(deepstream_url: str, cam_id: str, query: str,
     )
 
 
+class _Heartbeat:
+    """Daemon thread that POSTs a stats snapshot to deepstream's
+    /internal/heartbeat every `interval_s` seconds. Phase 3 observability."""
+
+    def __init__(
+        self,
+        deepstream_url: str,
+        cam_id: str,
+        rtsp_url: str,
+        stats: "_Stats",
+        interval_s: float = 5.0,
+    ) -> None:
+        self.deepstream_url = deepstream_url.rstrip("/")
+        self.cam_id         = cam_id
+        self.rtsp_url       = rtsp_url
+        self.stats          = stats
+        self.interval_s     = interval_s
+        self._stop          = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if not self.deepstream_url:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name=f"hb-{self.cam_id}",
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def _loop(self) -> None:
+        url = f"{self.deepstream_url}/internal/heartbeat"
+        while not self._stop.is_set():
+            # Send first beat immediately so /diag has data within ~1 cycle
+            payload = self.stats.snapshot(self.cam_id, self.rtsp_url)
+            _post_json(url, payload, timeout_s=2.0)
+            self._stop.wait(timeout=self.interval_s)
+
+
 def run(rtsp_url: str, triton_url: str, queries: list[str],
         duration_s: int, threshold: float,
         cam_id: str = "cam0", deepstream_url: str = "") -> _Stats:
@@ -255,6 +356,8 @@ def run(rtsp_url: str, triton_url: str, queries: list[str],
     motion_prev: np.ndarray | None = None
     last_send_ts = 0.0
     stats = _Stats()
+    heartbeat = _Heartbeat(deepstream_url, cam_id, rtsp_url, stats)
+    heartbeat.start()
     deadline = time.monotonic() + duration_s
 
     try:
@@ -264,6 +367,7 @@ def run(rtsp_url: str, triton_url: str, queries: list[str],
 
             for frame in cuvid.decode(packet):
                 stats.decoded += 1
+                stats.last_decode_wall = time.time()
 
                 # FPS gate — match production INFER_FPS so we don't out-run Triton
                 now = time.monotonic()
@@ -302,12 +406,14 @@ def run(rtsp_url: str, triton_url: str, queries: list[str],
                 thr_in = triton_http.InferInput("THRESHOLD", [1], "FP32")
                 thr_in.set_data_from_numpy(np.array([threshold], dtype=np.float32))
 
+                t0 = time.monotonic()
                 try:
                     resp = client.infer("yoloworld", inputs=[img_in, thr_in])
                 except Exception as exc:
                     stats.triton_errors += 1
                     print(f"[proto] Triton infer error: {exc}", file=sys.stderr)
                     continue
+                stats.record_triton((time.monotonic() - t0) * 1000.0, time.time())
                 stats.inferred += 1
 
                 boxes = resp.as_numpy("BOXES")
@@ -352,7 +458,7 @@ def run(rtsp_url: str, triton_url: str, queries: list[str],
                     score_buf.pop(key, None)
 
                     stats.events += 1
-                    stats.last_event_ts = wall
+                    stats.last_event_wall = wall
                     print(
                         f"[event] t={wall:.2f} track={track_id} "
                         f"query={label!r} conf={conf:.3f}",
@@ -384,6 +490,7 @@ def run(rtsp_url: str, triton_url: str, queries: list[str],
                         track_id, conf, img_b64, ts_iso,
                     )
     finally:
+        heartbeat.stop()
         container.close()
 
     return stats
